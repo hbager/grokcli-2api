@@ -130,9 +130,13 @@ def test_messages_hash_short_vs_full() -> None:
     fp_full2 = aff.messages_content_fingerprint(m3)
     ok(fp_full2 == fp_full, "system churn does not change full messages hash")
 
-    # conversation_fingerprint falls through to messages hash when no cid/pck/user.
+    # conversation_fingerprint prefers root (cross-turn stable) over messages hash.
     fp_via = aff.conversation_fingerprint(m2)
-    ok(fp_via == fp_full, "conversation_fingerprint uses messages hash fallback")
+    expected_root_fp = aff.conversation_fingerprint(
+        [{"role": "user", "content": "hello world unique-A"}]
+    )
+    ok(fp_via == expected_root_fp, "conversation_fingerprint uses root across turns")
+    ok(fp_via != fp_full, "root path is not the growing full messages hash")
 
 
 def test_model_scoped_fingerprint() -> None:
@@ -181,7 +185,7 @@ def test_clear_affinity_for_account() -> None:
 
 
 def test_resolve_responses_messages_hash_source() -> None:
-    print("[resolve_responses source=messages_hash]")
+    print("[resolve_responses source=root (cross-turn)]")
     _reset()
     msgs = [
         {"role": "user", "content": "r1"},
@@ -191,11 +195,40 @@ def test_resolve_responses_messages_hash_source() -> None:
     fp, prefer, source = aff.resolve_responses_affinity(msgs, model="grok-x")
     ok(fp is not None, f"fp={fp}")
     ok(prefer is None, "first turn no prefer")
-    ok(source in ("messages_hash_new", "root_new"), f"source={source}")
+    ok(source in ("root_new", "messages_hash_new"), f"source={source}")
     aff.bind_affinity(fp, "acct-1")
-    fp2, prefer2, source2 = aff.resolve_responses_affinity(msgs, model="grok-x")
+    msgs_t2 = msgs + [
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "r3"},
+    ]
+    fp2, prefer2, source2 = aff.resolve_responses_affinity(msgs_t2, model="grok-x")
+    ok(fp2 == fp, "root fingerprint stable across turns")
     ok(prefer2 == "acct-1", "sticky hit")
-    ok(source2 in ("messages_hash", "root"), f"hit source={source2}")
+    ok(source2 in ("root", "messages_hash"), f"hit source={source2}")
+
+
+def test_mint_prompt_cache_key_deterministic_from_root() -> None:
+    print("[mint pck deterministic from conversation root]")
+    _reset()
+    m1 = [{"role": "user", "content": "sticky-root-xyz"}]
+    m2 = [
+        {"role": "user", "content": "sticky-root-xyz"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "next"},
+    ]
+    k1 = aff.mint_prompt_cache_key(api_key_id="k1", messages=m1)
+    k2 = aff.mint_prompt_cache_key(api_key_id="k1", messages=m2)
+    ok(k1 == k2, f"mint stable across turns: {k1} vs {k2}")
+    k_other = aff.mint_prompt_cache_key(
+        api_key_id="k1", messages=[{"role": "user", "content": "different-chat"}]
+    )
+    ok(k1 != k_other, "different root → different pck")
+
+    fp1 = aff.conversation_fingerprint(m1, api_key_id="k1", model="m", prompt_cache_key=k1)
+    fp2 = aff.conversation_fingerprint(m2, api_key_id="k1", model="m", prompt_cache_key=k2)
+    aff.bind_affinity(fp1, "acct-sticky")
+    ok(fp1 == fp2, "minted-pck fingerprints match across turns")
+    ok(aff.get_affinity(fp2) == "acct-sticky", "affinity hit without client echo")
 
 
 def main() -> int:
@@ -207,6 +240,7 @@ def main() -> int:
         test_model_scoped_fingerprint,
         test_clear_affinity_for_account,
         test_resolve_responses_messages_hash_source,
+        test_mint_prompt_cache_key_deterministic_from_root,
     ]
     failed = 0
     for t in tests:

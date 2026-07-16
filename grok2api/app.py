@@ -1707,12 +1707,13 @@ def _ensure_prompt_cache_key(
     previous_response_id: str | None = None,
     user: str | None = None,
     seed: str | None = None,
+    messages: list[Any] | None = None,
 ) -> tuple[str | None, bool]:
     """Return ``(prompt_cache_key, minted)``.
 
     Prefer client-provided key (body / metadata / headers). When missing, mint a
-    stable key from conversation / previous_response_id / user so multi-turn
-    stickiness works for sub2api/Claude Code even without an explicit cache key.
+    stable key from conversation / previous_response_id / user / message root so
+    multi-turn stickiness works even when clients never echo the synthetic key.
     The minted key is written onto ``body`` for later echo in responses.
     """
     pck = None
@@ -1735,6 +1736,7 @@ def _ensure_prompt_cache_key(
         previous_response_id=previous_response_id,
         user=user,
         seed=seed,
+        messages=messages,
     )
     if isinstance(body, dict):
         body["prompt_cache_key"] = minted
@@ -4129,6 +4131,7 @@ def _resolve_conversation_affinity(
         api_key_id=api_key_id,
         conversation_id=conv_id,
         user=getattr(req, "user", None),
+        messages=req.messages,
     )
     fp = conversation_affinity.conversation_fingerprint(
         req.messages,
@@ -4345,7 +4348,11 @@ async def chat_completions(
                         pass
                 else:
                     await asyncio.to_thread(
-                        conversation_affinity.bind_affinity, conv_fp, creds.auth_key
+                        conversation_affinity.bind_affinity,
+                        conv_fp,
+                        creds.auth_key,
+                        session_fp=conv_fp,
+                        prompt_cache_key=pck,
                     )
             message: dict[str, Any] = {
                 "role": "assistant",
@@ -4706,6 +4713,15 @@ async def _stream_proxy_with_failover_inner(
                                     conversation_affinity.bind_affinity,
                                     conversation_fp,
                                     creds.auth_key,
+                                    session_fp=conversation_fp,
+                                    prompt_cache_key=(
+                                        (
+                                            body.get("_prompt_cache_key")
+                                            or body.get("prompt_cache_key")
+                                        )
+                                        if isinstance(body, dict)
+                                        else None
+                                    ),
                                 )
                             )
 
@@ -5555,6 +5571,7 @@ def _resolve_anthropic_affinity(
             api_key_id=api_key_id,
             conversation_id=conv_id,
             user=anth.metadata_user_id(req),
+            messages=oa_msgs,
         )
     fp = conversation_affinity.conversation_fingerprint(
         oa_msgs,
@@ -5765,7 +5782,11 @@ async def anthropic_messages(
                         pass
                 else:
                     await asyncio.to_thread(
-                        conversation_affinity.bind_affinity, conv_fp, creds.auth_key
+                        conversation_affinity.bind_affinity,
+                        conv_fp,
+                        creds.auth_key,
+                        session_fp=conv_fp,
+                        prompt_cache_key=pck,
                     )
 
             result = anth.openai_completion_to_anthropic(
@@ -5999,6 +6020,7 @@ def _responses_affinity(
         previous_response_id=prev_s or None,
         user=str(user) if user else None,
         seed=seed,
+        messages=messages,
     )
     # Do NOT put previous_response_id into conversation_id — it changes every
     # turn and would shatter stickiness. Resolve it via response-chain binding.
@@ -6203,6 +6225,7 @@ async def openai_responses(
                             conv_fp,
                             creds.auth_key,
                             session_fp=conv_fp,
+                            prompt_cache_key=pck,
                         )
                 # Pin emitted response_id so next turn's previous_response_id
                 # recovers the same multi-turn session_fp (not just the account).
@@ -6419,6 +6442,7 @@ async def openai_responses(
                                                 conv_fp,
                                                 creds.auth_key,
                                                 session_fp=conv_fp,
+                                                prompt_cache_key=pck,
                                             )
                                         )
                                 # Pin emitted response_id for next previous_response_id
@@ -7188,6 +7212,15 @@ async def _stream_anthropic_with_failover_inner(
                                     conversation_affinity.bind_affinity,
                                     conversation_fp,
                                     creds.auth_key,
+                                    session_fp=conversation_fp,
+                                    prompt_cache_key=(
+                                        (
+                                            body.get("_prompt_cache_key")
+                                            or body.get("prompt_cache_key")
+                                        )
+                                        if isinstance(body, dict)
+                                        else None
+                                    ),
                                 )
                             )
 

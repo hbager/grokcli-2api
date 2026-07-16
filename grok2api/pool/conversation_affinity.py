@@ -334,8 +334,8 @@ def conversation_fingerprint(
       1. conversation_id (explicit client session / chat id)
       2. prompt_cache_key (OpenAI / sub2api / Claude Code cache sticky key)
       3. user + conversation root
-      4. messages content hash (CPA short/full fallback)
-      5. conversation root alone
+      4. conversation root alone (first user + weak system salt — stable across turns)
+      5. messages content hash (last resort; short/full is NOT cross-turn stable)
 
     When ``prompt_cache_key`` is present it is used *alone* (plus optional
     api_key_id / model). We intentionally do **not** fold conversation root into
@@ -370,20 +370,22 @@ def conversation_fingerprint(
             parts.append(f"root:{root}")
         return _finalize_fp(parts)
 
-    # CPA-style messages hash before weak root-only. Multi-turn clients that
-    # omit conversation_id / prompt_cache_key still stick when history grows
-    # consistently (full hash). First-turn short hash covers brand-new chats.
+    # Prefer conversation root over CPA short/full messages hash.
+    # short (turn1) → full (turn2+) changes every turn as history grows, so it
+    # cannot keep multi-turn stickiness / prompt-cache locality without a
+    # client session id. Root is anchored on the first user message.
+    root = _conversation_root(messages)
+    if root:
+        parts.append(f"root:{root}")
+        return _finalize_fp(parts)
+
+    # Last resort: CPA-style messages hash (same-turn re-lookup only).
     msg_fp = messages_content_fingerprint(
         messages, api_key_id=api_key_id, model=model
     )
     if msg_fp:
         return msg_fp
-
-    root = _conversation_root(messages)
-    if not root:
-        return None
-    parts.append(f"root:{root}")
-    return _finalize_fp(parts)
+    return None
 
 
 def response_chain_fingerprint(
@@ -954,6 +956,7 @@ def mint_prompt_cache_key(
     previous_response_id: str | None = None,
     user: str | None = None,
     seed: str | None = None,
+    messages: list[Any] | None = None,
 ) -> str:
     """Mint a stable multi-turn prompt_cache_key when the client omitted one.
 
@@ -961,9 +964,12 @@ def mint_prompt_cache_key(
       1. conversation_id / session seed (already stable)
       2. previous_response_id (ties into the Responses chain)
       3. user id
-      4. random uuid (first turn only — subsequent turns should reuse the echo)
+      4. conversation root from messages (first user + weak system salt)
+      5. random uuid (only when nothing stable exists — client must echo)
 
-    The returned key is namespaced so it will not collide with client keys.
+    Prefer deterministic material over random: most OpenAI chat clients never
+    echo ``X-Grok2API-Prompt-Cache-Key``, so a random mint each turn shattered
+    sticky affinity and killed upstream prompt-cache hits.
     """
     import uuid
 
@@ -994,7 +1000,14 @@ def mint_prompt_cache_key(
         parts.append(f"u{hashlib.sha256(user_s.encode('utf-8')).hexdigest()[:12]}")
         return "pck_" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:28]
 
-    # Brand-new session with no sticky material: mint once; caller must echo it.
+    # Deterministic from first-user conversation root so multi-turn chat clients
+    # that never echo our synthetic key still land on the same sticky account.
+    root = _conversation_root(messages) if messages else ""
+    if root:
+        parts.append(f"r{hashlib.sha256(root.encode('utf-8')).hexdigest()[:16]}")
+        return "pck_" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:28]
+
+    # Nothing stable at all (empty messages): mint once; caller must echo it.
     parts.append(f"n{uuid.uuid4().hex[:16]}")
     return "pck_" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:28]
 
@@ -1118,10 +1131,10 @@ def resolve_responses_affinity(
             session = base_fp or response_chain_fingerprint(prev, api_key_id=api_key_id)
             return session, account, "previous_response_id_legacy"
 
-    # 4. msg-hash / root / user fingerprint.
+    # 4. root / msg-hash / user fingerprint.
     if base_fp:
         prefer = get_affinity(base_fp)
-        # Distinguish CPA-style messages hash from weak root for observability.
+        # Root-first is the cross-turn stable path; messages hash is last resort.
         msg_fp = messages_content_fingerprint(
             messages, api_key_id=api_key_id, model=model
         )
