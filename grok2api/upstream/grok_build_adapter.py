@@ -2336,14 +2336,15 @@ def _run_registration(
         import grok2api.pool.accounts as accounts
         from grok2api.config import UPSTREAM_BASE
 
-        update("registering", "visiting signup page")
+        update("registering", "loading signup page")
         _check_cancel()
         client = XConsoleAuthClient(
             debug=True,
             proxy=proxy or "",
             signup_url="https://accounts.x.ai/sign-up?redirect=grok-com",
         )
-        client.visit_home()
+        # Skip visit_home() — load_signup_page() handles CF cookies via curl_cffi.
+        # Saves ~1s per account.
         _check_cancel()
         client.load_signup_page()
 
@@ -2459,62 +2460,33 @@ def _run_registration(
             if provider != "local":
                 return solver.solve_turnstile(**kwargs)
 
-            # Local path: do NOT block the whole worker silently under the lock.
-            # Bulk (>=600) jobs easily queue for minutes; reclaim previously
-            # killed those sessions after ~180s of no heartbeat.
-            wait_started = time.time()
-            last_beat = 0.0
-            while True:
-                _check_cancel()
-                acquired = _local_captcha_lock.acquire(timeout=5.0)
-                if not acquired:
-                    waited = time.time() - wait_started
-                    if waited - last_beat >= 15.0:
-                        last_beat = waited
-                        update(
-                            "solving_turnstile",
-                            f"queued for local Turnstile ({int(waited)}s) "
-                            f"[{ADAPTER_BUILD}]",
-                        )
-                    continue
-                try:
-                    waited = time.time() - wait_started
-                    if waited >= 1.0:
-                        update(
-                            "solving_turnstile",
-                            f"solving Turnstile via {solver_label} "
-                            f"(after {int(waited)}s queue) [{ADAPTER_BUILD}]",
-                        )
-                    else:
-                        update(
-                            "solving_turnstile",
-                            f"solving Turnstile via {solver_label} (before email code)",
-                        )
-                    _check_cancel()
-                    try:
-                        return solver.solve_turnstile(**kwargs)
-                    except Exception as e:
-                        # Camoufox queue meltdown / timeout → brief global pause
-                        msg = str(e).lower()
-                        if any(
-                            k in msg
-                            for k in (
-                                "timeout",
-                                "timed out",
-                                "queue",
-                                "busy",
-                                "no browser",
-                                "target closed",
-                                "crashed",
-                            )
-                        ):
-                            _note_reg_pressure(f"local captcha: {e}")
-                        raise
-                finally:
-                    try:
-                        _local_captcha_lock.release()
-                    except Exception:
-                        pass
+            # Local path: solver has its own browser pool (--thread N) with
+            # internal queue management. No Python-level serialization needed —
+            # concurrent createTask calls are handled natively by the solver.
+            # This allows parallel captcha solving up to solver thread count.
+            _check_cancel()
+            update(
+                "solving_turnstile",
+                f"solving Turnstile via {solver_label} (before email code)",
+            )
+            try:
+                return solver.solve_turnstile(**kwargs)
+            except Exception as e:
+                msg = str(e).lower()
+                if any(
+                    k in msg
+                    for k in (
+                        "timeout",
+                        "timed out",
+                        "queue",
+                        "busy",
+                        "no browser",
+                        "target closed",
+                        "crashed",
+                    )
+                ):
+                    _note_reg_pressure(f"local captcha: {e}")
+                raise
 
         try:
             # Local: Proxyless only. Remote YesCaptcha: premium M1 first.
@@ -2535,8 +2507,9 @@ def _run_registration(
             raise RuntimeError("YesCaptcha returned empty Turnstile token")
         _check_cancel()
 
-        # Password can be validated any time before create; do it while warm.
-        client.validate_password(email, password)
+        # Skip validate_password() — create_account() will reject invalid
+        # passwords. Generated password Aa{hex}9!xZ is always strong enough.
+        # Saves ~0.5s per account.
 
         update("registering", "sending email validation code")
         _check_cancel()

@@ -1648,16 +1648,32 @@ def _run_sso_import_job(
                 item["error"] = "device flow failed or invalid sso"
                 return item
             _key, entry = sso_import.token_to_auth_entry(token, email=email_hint)
+            # Defensive: if email_hint was empty and JWT has no email claim,
+            # try fetching userinfo to fill it.
+            if not entry.get("email") and token.get("access_token"):
+                try:
+                    import requests as _req
+                    _ui = _req.get(
+                        f"{sso_import.OIDC_ISSUER}/oauth2/userinfo",
+                        headers={"Authorization": f"Bearer {token['access_token']}"},
+                        timeout=10,
+                    )
+                    if _ui.ok:
+                        _uid = _ui.json()
+                        if _uid.get("email"):
+                            entry["email"] = _uid["email"]
+                except Exception:
+                    pass
             saved_sso_path = _persist_import_sso_backup(
                 email=str(entry.get("email") or email_hint or ""),
                 sso=sso,
             )
             item["status"] = "converted"
-            item["email"] = entry.get("email", email_hint)
+            item["email"] = entry.get("email") or email_hint
             item["entry"] = {
                 "key": entry["key"],
                 "auth_mode": entry.get("auth_mode", "oidc"),
-                "email": entry.get("email", email_hint),
+                "email": entry.get("email") or email_hint,
                 "refresh_token": entry.get("refresh_token", ""),
                 "expires_at": entry.get("expires_at"),
                 "oidc_issuer": entry.get("oidc_issuer", sso_import.OIDC_ISSUER),
@@ -1681,16 +1697,31 @@ def _run_sso_import_job(
                     item["error"] = "device flow failed or invalid sso"
                     return item
                 _key, entry = sso_import.token_to_auth_entry(token, email=email_hint)
+                # Defensive: try userinfo if email missing
+                if not entry.get("email") and token.get("access_token"):
+                    try:
+                        import requests as _req
+                        _ui = _req.get(
+                            f"{sso_import.OIDC_ISSUER}/oauth2/userinfo",
+                            headers={"Authorization": f"Bearer {token['access_token']}"},
+                            timeout=10,
+                        )
+                        if _ui.ok:
+                            _uid = _ui.json()
+                            if _uid.get("email"):
+                                entry["email"] = _uid["email"]
+                    except Exception:
+                        pass
                 saved_sso_path = _persist_import_sso_backup(
                     email=str(entry.get("email") or email_hint or ""),
                     sso=sso,
                 )
                 item["status"] = "converted"
-                item["email"] = entry.get("email", email_hint)
+                item["email"] = entry.get("email") or email_hint
                 item["entry"] = {
                     "key": entry["key"],
                     "auth_mode": entry.get("auth_mode", "oidc"),
-                    "email": entry.get("email", email_hint),
+                    "email": entry.get("email") or email_hint,
                     "refresh_token": entry.get("refresh_token", ""),
                     "expires_at": entry.get("expires_at"),
                     "oidc_issuer": entry.get("oidc_issuer", sso_import.OIDC_ISSUER),
