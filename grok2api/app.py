@@ -3842,6 +3842,7 @@ def _admin_page(name: str = "index"):
         "login": "login.html",
         "keys": "keys.html",
         "accounts": "accounts.html",
+        "rotation": "rotation.html",
         "models": "models.html",
         "guide": "guide.html",
         "settings": "settings.html",
@@ -3946,6 +3947,12 @@ async def admin_keys_page():
 @app.get("/admin/accounts/")
 async def admin_accounts_page():
     return _admin_or_404("accounts")
+
+
+@app.get("/admin/rotation")
+@app.get("/admin/rotation/")
+async def admin_rotation_page():
+    return _admin_or_404("rotation")
 
 
 @app.get("/admin/logs")
