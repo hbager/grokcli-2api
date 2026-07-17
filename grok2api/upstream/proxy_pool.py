@@ -73,46 +73,36 @@ def _env_proxy_pass() -> str:
     ).strip()
 
 
-def split_proxy_text(text: str | None) -> list[str]:
-    """Split multi-proxy text into raw lines (comma / newline / semicolon)."""
+def split_proxy_text_preserve_duplicates(text: str | None) -> list[str]:
+    """Split proxy text without dropping duplicate lines."""
     raw = (text or "").strip()
     if not raw:
         return []
-    # Normalize common separators while preserving URL schemes (://).
-    # First split on newlines / semicolons; then on commas only when the token
-    # does not look like a single URL with query string.
     chunks: list[str] = []
     for part in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         part = part.strip()
         if not part:
             continue
         if ";" in part:
-            for sub in part.split(";"):
-                sub = sub.strip()
-                if sub:
-                    chunks.append(sub)
+            chunks.extend(sub.strip() for sub in part.split(";") if sub.strip())
             continue
-        # Comma-separated lists: "a,b,c" — but not "http://x?a=1,b=2" (rare).
         if "," in part and "://" not in part.split(",", 1)[0]:
-            for sub in part.split(","):
-                sub = sub.strip()
-                if sub:
-                    chunks.append(sub)
+            chunks.extend(sub.strip() for sub in part.split(",") if sub.strip())
             continue
-        # Also allow "url1,url2" when each segment has a scheme.
         if "," in part:
-            maybe = [s.strip() for s in part.split(",") if s.strip()]
-            if maybe and all("://" in s or s.count(":") >= 1 for s in maybe):
+            maybe = [sub.strip() for sub in part.split(",") if sub.strip()]
+            if maybe and all("://" in sub or sub.count(":") >= 1 for sub in maybe):
                 chunks.extend(maybe)
                 continue
         chunks.append(part)
-    # Drop comments / empty.
+    return [line for line in chunks if line and not line.startswith("#")]
+
+
+def split_proxy_text(text: str | None) -> list[str]:
+    """Split multi-proxy text into unique raw lines."""
     out: list[str] = []
     seen: set[str] = set()
-    for c in chunks:
-        line = c.strip()
-        if not line or line.startswith("#"):
-            continue
+    for line in split_proxy_text_preserve_duplicates(text):
         if line not in seen:
             seen.add(line)
             out.append(line)
@@ -386,6 +376,57 @@ def _mask_proxy_url(url: str) -> str:
         return f"{p.scheme}://{host}{port}"
     except Exception:
         return (url or "")[:48]
+
+
+def mask_proxy_text(text: str | None) -> str:
+    """Return a display-safe proxy list with embedded passwords removed."""
+    masked: list[str] = []
+    for raw in split_proxy_text_preserve_duplicates(text):
+        try:
+            masked.append(_mask_proxy_url(canonicalize_proxy_line(raw)))
+        except Exception:
+            masked.append("****")
+    return "\n".join(masked)
+
+
+def restore_masked_proxy_text(
+    edited: str | None,
+    current: str | None,
+) -> str:
+    """Restore credentials for unchanged masked lines in an edited proxy pool."""
+    current_by_mask: dict[str, list[str]] = {}
+    current_masks: list[str] = []
+    for raw in split_proxy_text_preserve_duplicates(current):
+        masked = mask_proxy_text(raw)
+        current_masks.append(masked)
+        current_by_mask.setdefault(masked, []).append(raw)
+
+    edited_lines = split_proxy_text_preserve_duplicates(edited)
+    ambiguous_masks = {
+        masked
+        for masked, matches in current_by_mask.items()
+        if len(matches) > 1 and (":***@" in masked or masked == "****")
+    }
+    if (
+        edited_lines != current_masks
+        and any(raw in ambiguous_masks for raw in edited_lines)
+    ):
+        raise ValueError(
+            "Duplicate masked proxies are ambiguous after editing; enter full credentials"
+        )
+
+    restored: list[str] = []
+    for raw in edited_lines:
+        if ":***@" not in raw and raw != "****":
+            restored.append(raw)
+            continue
+        matches = current_by_mask.get(raw) or []
+        if not matches:
+            raise ValueError(
+                "Masked proxy no longer matches the saved entry; enter full credentials"
+            )
+        restored.append(matches.pop(0))
+    return "\n".join(restored)
 
 
 def httpx_proxy_arg(proxy_url: str | None) -> str | None:

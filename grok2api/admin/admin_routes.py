@@ -458,19 +458,21 @@ ADMIN_COOKIE = "g2a_admin"
 ADMIN_COOKIE_MAX_AGE = 7 * 24 * 3600  # match redis/file session TTL
 
 
-def _set_admin_cookie(response: Response, token: str) -> None:
-    """Persist admin session in HttpOnly cookie so page navigations keep auth
-    even if localStorage is missing / cleared, until cookie or server session expires.
-    """
+def _set_admin_cookie(response: Response, token: str, request: Request) -> None:
+    """Persist the admin session in an HttpOnly cookie."""
     if not token:
         return
+    forwarded_proto = (
+        request.headers.get("x-forwarded-proto") or ""
+    ).split(",", 1)[0].strip().lower()
+    secure = request.url.scheme == "https" or forwarded_proto == "https"
     response.set_cookie(
         key=ADMIN_COOKIE,
         value=token,
         max_age=ADMIN_COOKIE_MAX_AGE,
         httponly=True,
         samesite="lax",
-        secure=False,  # allow plain http admin deployments
+        secure=secure,
         path="/",
     )
 
@@ -604,110 +606,22 @@ def _public_api_base(request: Request | None = None) -> str:
     return f"http://{display}:{port}/v1"
 
 
-_status_store_cache: dict[str, Any] | None = None
-_status_store_at = 0.0
-_status_reg_cache: dict[str, Any] | None = None
-_status_reg_at = 0.0
-
-
 @router.get("/status")
 async def admin_status(request: Request):
-    """Fast admin heartbeat.
-
-    Avoid account acquire() and full account dumps — those dominate latency with
-    500+ accounts and make UI auto-refresh feel stuck.
-    """
-    global _status_store_cache, _status_store_at, _status_reg_cache, _status_reg_at
-    setup = is_setup_needed()
-    account = accounts.account_status(include_accounts=False)
-    key_stats = apikeys.stats()
-    pool = account_pool.pool_summary(include_accounts=False)
-
-    # Derive credentials snapshot from counts (no acquire/OIDC).
-    creds_ok = int(account.get("active_count") or pool.get("live") or 0) > 0
-    creds_email = None
-
-    host = _config.HOST
-    port = _config.PORT
-    public_origin = _request_public_origin(request)
-    api_base = _public_api_base(request)
-
-    now = time.time()
-    reg_status: dict[str, Any]
-    if _status_reg_cache is not None and now - _status_reg_at < 30:
-        reg_status = dict(_status_reg_cache)
-    else:
-        reg_status = {"available": False}
-        try:
-            if reg_adapter is not None:
-                reg_status = reg_adapter.registration_available()
-            else:
-                reg_status = {"available": False, "error": _REG_IMPORT_ERROR}
-        except Exception as e:  # noqa: BLE001
-            reg_status = {"available": False, "error": str(e)}
-        _status_reg_cache = dict(reg_status)
-        _status_reg_at = now
-
+    """Minimal unauthenticated bootstrap state for the admin login page."""
     try:
         from app import APP_VERSION as _app_ver
     except Exception:
         _app_ver = "unknown"
-
-    if _status_store_cache is not None and now - _status_store_at < 5:
-        store_info = dict(_status_store_cache)
-    else:
-        store_info = {}
-        try:
-            from grok2api.store import store_status
-            store_info = store_status()
-        except Exception as e:  # noqa: BLE001
-            store_info = {"backend": "unknown", "error": str(e)}
-        _status_store_cache = dict(store_info)
-        _status_store_at = now
-
     return {
         "ok": True,
-        "setup_needed": setup,
+        "setup_needed": is_setup_needed(),
         "version": _app_ver,
-        "store": store_info,
-        "cli_version": CLI_VERSION,
-        "host": host,
-        "port": port,
-        "public_origin": public_origin,
-        "upstream": UPSTREAM_BASE,
-        "default_model": DEFAULT_MODEL,
-        "require_api_key_mode": REQUIRE_API_KEY,
-        "api_base": api_base,
-        "credentials_ok": creds_ok,
-        "credentials_email": creds_email,
-        "account_mode": get_account_mode(),
-        "accounts": account,
-        "pool": {
-            "mode": pool.get("mode"),
-            "total": pool.get("total"),
-            "live": pool.get("live"),
-            "rotatable": pool.get("rotatable") if pool.get("rotatable") is not None else pool.get("live"),
-            "enabled": pool.get("enabled"),
-            "in_cooldown": pool.get("in_cooldown"),
-            "quota_disabled": pool.get("quota_disabled"),
-            "model_blocked": pool.get("model_blocked"),
-            "expired": pool.get("expired"),
-            "disabled": pool.get("disabled"),
-            "source": pool.get("source") or "postgres",
-        },
-        "keys": key_stats,
-        "models_count": len(load_models_from_cache()),
-        "settings": get_public_settings(),
-        "token_maintainer": token_maintainer.status(light=True),
-        "model_health": model_health.status(light=True),
-        "conversation_affinity": conversation_affinity.status(),
-        "registration": reg_status,
-        "usage": _usage_light(),
     }
 
 
 @router.post("/setup")
-async def admin_setup(body: SetupBody):
+async def admin_setup(body: SetupBody, request: Request):
     if not is_setup_needed():
         raise HTTPException(status_code=400, detail="Already set up")
     try:
@@ -716,7 +630,7 @@ async def admin_setup(body: SetupBody):
         raise HTTPException(status_code=400, detail=str(e)) from e
     token = create_session_token()
     resp = JSONResponse({"ok": True, "token": token, "message": "Admin password created"})
-    _set_admin_cookie(resp, token)
+    _set_admin_cookie(resp, token, request)
     return resp
 
 
@@ -729,7 +643,7 @@ async def admin_login(body: LoginBody, request: Request):
     token = create_session_token()
     audit_log(request, action="admin.login", summary="管理员登录成功")
     resp = JSONResponse({"ok": True, "token": token})
-    _set_admin_cookie(resp, token)
+    _set_admin_cookie(resp, token, request)
     return resp
 
 
@@ -2074,7 +1988,7 @@ async def get_email_registration_config(
 ):
     """Load protocol registration form config (DB + env defaults)."""
     require_admin(request, x_admin_token)
-    cfg = get_registration_config(include_secrets=True)
+    cfg = get_registration_config(include_secrets=False)
     return {
         "ok": True,
         "config": cfg,
@@ -2099,9 +2013,10 @@ async def put_email_registration_config(
 ):
     """Save protocol registration config to database (and apply to runtime)."""
     require_admin(request, x_admin_token)
+    patch = body.model_dump(exclude_unset=True)
     try:
-        cfg = set_registration_config(
-            body.model_dump(exclude_none=False),
+        set_registration_config(
+            patch,
             replace=False,
         )
     except ValueError as e:
@@ -2113,9 +2028,13 @@ async def put_email_registration_config(
         action="register.config_save",
         summary="保存协议注册配置",
         target_type="registration",
-        detail={"keys": [k for k, v in body.model_dump(exclude_none=False).items() if v not in (None, "")]},
+        detail={"keys": [k for k, v in patch.items() if v not in (None, "")]},
     )
-    return {"ok": True, "config": cfg, "message": "注册配置已保存到数据库"}
+    return {
+        "ok": True,
+        "config": get_registration_config(include_secrets=False),
+        "message": "注册配置已保存到数据库",
+    }
 
 
 @router.post("/accounts/register-email")
@@ -4867,12 +4786,17 @@ async def admin_models(
             meta = models_pg.get_meta() or {}
     except Exception:
         pass
+    public_settings = get_public_settings()
     return {
         "object": "list",
         "data": load_models_from_cache(),
         "default_model": DEFAULT_MODEL,
         "storage": "postgres",
         "meta": meta,
+        "model_health": model_health.status(light=True),
+        "settings": {
+            "model_health_enabled": public_settings.get("model_health_enabled")
+        },
     }
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Local server
 HOST = os.getenv("GROK2API_HOST", "0.0.0.0")
@@ -61,6 +62,43 @@ PUBLIC_BASE_URL = (
     or os.getenv("PUBLIC_BASE_URL")
     or ""
 ).strip().rstrip("/")
+
+# Public diagnostics are disabled unless explicitly enabled.
+ENABLE_DOCS = _env_truthy("GROK2API_ENABLE_DOCS", "0")
+
+
+def _cors_origins() -> list[str]:
+    raw = (os.getenv("GROK2API_CORS_ORIGINS") or "").strip()
+    if not raw:
+        return []
+    origins = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+    if "*" in origins:
+        raise ValueError("GROK2API_CORS_ORIGINS must list explicit origins; '*' is not allowed")
+    for origin in origins:
+        try:
+            parsed = urlsplit(origin)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(
+                "GROK2API_CORS_ORIGINS entries must be valid origins"
+            ) from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.netloc.endswith(":")
+        ):
+            raise ValueError(
+                "GROK2API_CORS_ORIGINS entries must be complete origins without paths"
+            )
+    return list(dict.fromkeys(origins))
+
+
+CORS_ORIGINS = _cors_origins()
 # Legacy single key (still accepted if set). Prefer managed keys in PostgreSQL
 # (or keys.json only when STORE_BACKEND=file).
 API_KEY = os.getenv("GROK2API_API_KEY", "")

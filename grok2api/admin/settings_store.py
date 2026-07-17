@@ -2305,6 +2305,17 @@ def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
         else:
             public[k] = ""
             public[f"{k}_set"] = False
+    proxy_set = bool(cfg.get("proxy"))
+    if proxy_set:
+        try:
+            from grok2api.upstream.proxy_pool import mask_proxy_text
+
+            public["proxy"] = mask_proxy_text(str(cfg.get("proxy") or ""))
+        except Exception:
+            public["proxy"] = "****"
+    else:
+        public["proxy"] = ""
+    public["proxy_set"] = proxy_set
     provider = str(cfg.get("captcha_provider") or "local").strip().lower()
     mail_provider = str(cfg.get("mail_provider") or "moemail").strip().lower()
     has_moemail = bool(cfg.get("moemail_api_key") or (
@@ -2361,6 +2372,11 @@ def _is_masked_secret(value: str | None) -> bool:
     return ("…" in s) or s == "****" or set(s) <= {"*"}
 
 
+def _is_masked_proxy_text(value: str | None) -> bool:
+    s = "" if value is None else str(value).strip()
+    return bool(s and (":***@" in s or _is_masked_secret(s)))
+
+
 def set_registration_config(
     patch: dict[str, Any] | None,
     *,
@@ -2384,6 +2400,9 @@ def set_registration_config(
     current_stored = _get_setting_value("registration_config", None)
     if not isinstance(current_stored, dict):
         current_stored = {}
+    current_effective = _normalize_registration_config(
+        current_stored, merge_env=True
+    )
 
     if replace:
         base: dict[str, Any] = {}
@@ -2410,27 +2429,43 @@ def set_registration_config(
     active_key_slot = _MAIL_PROVIDER_KEY_FIELDS.get(prov, "moemail_api_key")
     active_dom_slot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(prov, "moemail_domain")
     active_base_slot = _MAIL_PROVIDER_BASE_URL_FIELDS.get(prov)
+    captcha_provider = str(
+        patch.get("captcha_provider")
+        or base.get("captcha_provider")
+        or current_effective.get("captcha_provider")
+        or "local"
+    ).strip().lower()
 
     for key in _REG_CONFIG_KEYS:
         if key not in patch:
             continue
         val = patch.get(key)
+        if key == "proxy" and _is_masked_proxy_text(val):
+            from grok2api.upstream.proxy_pool import restore_masked_proxy_text
+
+            base["proxy"] = restore_masked_proxy_text(
+                str(val or ""), str(current_effective.get("proxy") or "")
+            )
+            continue
         if key in _REG_SECRET_KEYS:
             s = "" if val is None else str(val).strip()
             # Masked UI value → keep previous secret.
             if _is_masked_secret(s):
-                if key in current_stored and current_stored.get(key):
-                    base[key] = current_stored[key]
+                if current_effective.get(key):
+                    base[key] = current_effective[key]
                 continue
             # Empty secret:
             # - active provider key / active api_key → clear (user deleted + saved)
             # - inactive provider keys → keep previous (field not shown/edited)
             if not s:
-                is_active_secret = key in {"api_key", active_key_slot}
-                if is_active_secret:
+                provider_key_slots = set(_MAIL_PROVIDER_KEY_FIELDS.values())
+                inactive_provider_secret = (
+                    key in provider_key_slots and key != active_key_slot
+                ) or (key == "yescaptcha_key" and captcha_provider != "yescaptcha")
+                if not inactive_provider_secret:
                     base[key] = ""
-                elif key in current_stored and current_stored.get(key):
-                    base[key] = current_stored[key]
+                elif current_effective.get(key):
+                    base[key] = current_effective[key]
                 else:
                     base[key] = ""
                 continue
@@ -2467,7 +2502,11 @@ def set_registration_config(
     if "api_key" in patch and not _is_masked_secret(patch.get("api_key")):
         active = str(patch.get("api_key") or "").strip()
         base["api_key"] = active
-        if active_key_slot not in patch or not str(patch.get(active_key_slot) or "").strip():
+        if (
+            active_key_slot not in patch
+            or not str(patch.get(active_key_slot) or "").strip()
+            or _is_masked_secret(patch.get(active_key_slot))
+        ):
             # UI edited the visible key field for this provider.
             base[active_key_slot] = active
         elif str(patch.get(active_key_slot) or "").strip():
@@ -2541,6 +2580,7 @@ def set_registration_config(
         "yyds_api_key",
         "gptmail_api_key",
         "cfmail_api_key",
+        "yescaptcha_key",
         "base_url",
         "moemail_base_url",
         "cfmail_base_url",
@@ -2817,12 +2857,19 @@ def resolve_registration_inputs(
         ).strip().lower() or "moemail"
     active_key_slot = _MAIL_PROVIDER_KEY_FIELDS.get(prov, "moemail_api_key")
     active_dom_slot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(prov, "moemail_domain")
+    captcha_provider = str(
+        overrides.get("captcha_provider")
+        or base.get("captcha_provider")
+        or "local"
+    ).strip().lower()
     clearable_empty = {
         "domain",
         active_dom_slot,
         "api_key",
         active_key_slot,
     }
+    if captcha_provider == "yescaptcha":
+        clearable_empty.add("yescaptcha_key")
 
     for key in _REG_CONFIG_KEYS:
         if key not in overrides:
@@ -2835,6 +2882,13 @@ def resolve_registration_inputs(
             # Empty active domain/key: honor clear.
             if key in clearable_empty:
                 merged[key] = ""
+            continue
+        if key == "proxy" and _is_masked_proxy_text(val):
+            from grok2api.upstream.proxy_pool import restore_masked_proxy_text
+
+            merged["proxy"] = restore_masked_proxy_text(
+                str(val or ""), str(base.get("proxy") or "")
+            )
             continue
         if key in _REG_SECRET_KEYS and isinstance(val, str):
             s = val.strip()
@@ -3016,8 +3070,24 @@ def get_outbound_proxy_config(*, include_secrets: bool = True) -> dict[str, Any]
     if include_secrets:
         return cfg
     public = dict(cfg)
-    if public.get("proxy_password"):
-        public["proxy_password"] = _mask_secret(str(public.get("proxy_password") or ""))
+    proxy_set = bool(public.get("proxy"))
+    if proxy_set:
+        try:
+            from grok2api.upstream.proxy_pool import mask_proxy_text
+
+            public["proxy"] = mask_proxy_text(str(public.get("proxy") or ""))
+        except Exception:
+            public["proxy"] = "****"
+    else:
+        public["proxy"] = ""
+    public["proxy_set"] = proxy_set
+    password_set = bool(public.get("proxy_password"))
+    public["proxy_password"] = (
+        _mask_secret(str(public.get("proxy_password") or ""))
+        if password_set
+        else ""
+    )
+    public["proxy_password_set"] = password_set
     return public
 
 
@@ -3033,6 +3103,7 @@ def set_outbound_proxy_config(
     current = _get_setting_value("outbound_proxy_config", None)
     if not isinstance(current, dict):
         current = {}
+    current_effective = _normalize_outbound_proxy_config(current, merge_env=True)
     base: dict[str, Any] = {} if replace else dict(current)
 
     if "enabled" in patch and patch.get("enabled") is not None:
@@ -3045,9 +3116,16 @@ def set_outbound_proxy_config(
         if val is None:
             continue
         s = str(val).strip() if not isinstance(val, bool) else str(val)
+        if key == "proxy" and _is_masked_proxy_text(s):
+            from grok2api.upstream.proxy_pool import restore_masked_proxy_text
+
+            base[key] = restore_masked_proxy_text(
+                s, str(current_effective.get(key) or "")
+            )
+            continue
         if key == "proxy_password" and _is_masked_secret(s):
-            if current.get("proxy_password"):
-                base["proxy_password"] = current["proxy_password"]
+            if current_effective.get(key):
+                base[key] = current_effective[key]
             continue
         # Empty string is intentional clear for proxy text / auth.
         base[key] = s
@@ -3114,10 +3192,8 @@ def apply_outbound_proxy_config_to_runtime(
                 reg_proxy = ""
             if not reg_proxy:
                 os.environ.pop("GROK2API_XAI_PROXY", None)
-    if proxy_user:
-        _set_env("GROK2API_XAI_PROXY_USERNAME", proxy_user)
-    if proxy_pass:
-        _set_env("GROK2API_XAI_PROXY_PASSWORD", proxy_pass)
+    _set_env("GROK2API_XAI_PROXY_USERNAME", proxy_user)
+    _set_env("GROK2API_XAI_PROXY_PASSWORD", proxy_pass)
     _set_env("GROK2API_XAI_PROXY_STRATEGY", strategy)
     _set_env("GROK2API_PROXY_STRATEGY", strategy)
 
@@ -3303,19 +3379,53 @@ def update_runtime_settings(patch: dict[str, Any]) -> dict[str, Any]:
 
 def get_public_settings() -> dict[str, Any]:
     data = _load()
-    # Secrets stay full for admin session API (admin-auth only); UI masks display.
-    reg = get_registration_config(include_secrets=True)
-    outbound = get_outbound_proxy_config(include_secrets=True)
+    reg = get_registration_config(include_secrets=False)
+    outbound = get_outbound_proxy_config(include_secrets=False)
     try:
-        from grok2api.upstream.proxy_pool import outbound_pool_public_summary
+        from grok2api.upstream.proxy_pool import pool_summary
 
-        outbound_summary = outbound_pool_public_summary()
+        outbound_proxy_text = str(outbound.get("proxy") or "")
+        registration_proxy_text = str(reg.get("proxy") or "")
+        summary_text = outbound_proxy_text or registration_proxy_text
+        outbound_summary = pool_summary(
+            summary_text,
+            username=str(outbound.get("proxy_username") or "") or None,
+            password=None,
+            strategy=str(
+                outbound.get("proxy_strategy")
+                or reg.get("proxy_strategy")
+                or "round_robin"
+            ),
+            fallback_env=False,
+        )
+        outbound_summary["source"] = (
+            "settings"
+            if outbound_proxy_text
+            else "registration"
+            if registration_proxy_text
+            else "none"
+        )
+        outbound_summary["enabled"] = bool(
+            outbound.get("enabled", True) and outbound_summary.get("enabled")
+        )
     except Exception:
+        fallback_proxy = str(outbound.get("proxy") or reg.get("proxy") or "")
+        fallback_source = (
+            "settings"
+            if outbound.get("proxy")
+            else "registration"
+            if reg.get("proxy")
+            else "none"
+        )
         outbound_summary = {
-            "enabled": bool(outbound.get("enabled") and outbound.get("proxy")),
+            "enabled": bool(outbound.get("enabled", True) and fallback_proxy),
             "count": 0,
-            "strategy": outbound.get("proxy_strategy") or "round_robin",
-            "source": "settings" if outbound.get("proxy") else "none",
+            "strategy": (
+                outbound.get("proxy_strategy")
+                or reg.get("proxy_strategy")
+                or "round_robin"
+            ),
+            "source": fallback_source,
             "preview": [],
         }
     try:

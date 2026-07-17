@@ -43,6 +43,8 @@ import grok2api.pool.token_maintainer as token_maintainer
 from grok2api.admin.admin_routes import router as admin_router
 from grok2api.pool.auth import AuthError, GrokCredentials, load_credentials, upstream_headers
 from grok2api.config import (
+    CORS_ORIGINS,
+    ENABLE_DOCS,
     FORCE_UPSTREAM_STREAM,
     HOST,
     PORT,
@@ -677,17 +679,21 @@ app = FastAPI(
         "session tokens. High-concurrency multi-worker with Redis + PostgreSQL."
     ),
     version=APP_VERSION,
+    docs_url="/docs" if ENABLE_DOCS else None,
+    redoc_url="/redoc" if ENABLE_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_DOCS else None,
     on_startup=[_on_startup],
     on_shutdown=[_on_shutdown],
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.middleware("http")
@@ -3776,77 +3782,44 @@ def _normalize_stream_finish_reason(
 
 @app.get("/health")
 async def health():
-    """Bounded readiness probe — never triggers OIDC refresh or full account dump."""
-    reg: dict[str, Any] = {"available": False}
-    try:
-        import grok2api.upstream.grok_build_adapter as _reg
-
-        reg = _reg.registration_available()
-    except Exception as e:  # noqa: BLE001
-        reg = {"available": False, "error": str(e)}
-    store_info: dict[str, Any] = {}
-    leader_info: dict[str, Any] = {}
+    """Minimal public readiness response without internal service details."""
     try:
         from grok2api.store import store_status
 
-        store_info = store_status()
-    except Exception as e:  # noqa: BLE001
-        store_info = {"error": str(e)}
-    try:
-        from grok2api.store.leader import status as leader_status
-
-        leader_info = leader_status()
-    except Exception as e:  # noqa: BLE001
-        leader_info = {"error": str(e)}
-    try:
-        # Counts only; omit the hundreds-of-accounts payload.
-        # Offload sync store IO so health never blocks the event loop.
-        pool = await asyncio.to_thread(
-            account_pool.pool_summary, include_accounts=False
+        store_info = await asyncio.to_thread(store_status)
+        file_mode = (
+            not bool(getattr(_config, "REQUIRE_SHARED_STORES", True))
+            and str(getattr(_config, "STORE_BACKEND", "hybrid")) == "file"
+            and int(getattr(_config, "WORKERS", 1) or 1) <= 1
         )
-        # Health must stay a bounded read-only route. Do not make an OIDC
-        # refresh request while resolving the representative account.
-        creds = await asyncio.to_thread(account_pool.acquire, auto_refresh=False)
-        return {
-            "status": "ok",
-            "version": APP_VERSION,
-            "email": creds.email,
-            "expires_at": creds.expires_at,
-            "auth_key": creds.auth_key,
-            "upstream": UPSTREAM_BASE,
-            "auth_required": apikeys.auth_required(),
-            "account_mode": pool.get("mode"),
-            "accounts_live": pool.get("live"),
-            "accounts_enabled": pool.get("enabled"),
-            "accounts_total": pool.get("total"),
-            "accounts_cooldown": pool.get("in_cooldown"),
-            "accounts_expired": pool.get("expired"),
-            "accounts_model_blocked": pool.get("model_blocked"),
-            "accounts_disabled": pool.get("disabled"),
-            "multi_account": (pool.get("total") or 0) > 1,
-            # light=True avoids rescanning auth.json for min_remaining on every poll
-            "token_maintainer": token_maintainer.status(light=True),
-            "model_health": model_health.status(light=True),
-            "conversation_affinity": conversation_affinity.status(),
-            "registration": reg,
-            "store": store_info,
-            "maintainer_leader": leader_info,
-        }
-    except AuthError as e:
+        if not file_mode and not bool(store_info.get("multi_worker_ready")):
+            raise RuntimeError("shared stores unavailable")
+        await asyncio.to_thread(account_pool.acquire, auto_refresh=False)
+        return {"status": "ok", "version": APP_VERSION}
+    except Exception:
         return JSONResponse(
             status_code=503,
-            content={
-                "status": "auth_error",
-                "message": str(e),
-                "version": APP_VERSION,
-                "registration": reg,
-                "store": store_info,
-                "maintainer_leader": leader_info,
-            },
+            content={"status": "unavailable", "version": APP_VERSION},
         )
 
 
-@app.get("/metrics")
+async def require_metrics_api_key(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+) -> apikeys.ApiKeyRecord:
+    """Require a real API key even when the client API is configured open."""
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    elif x_api_key:
+        token = x_api_key.strip()
+    rec = await asyncio.to_thread(apikeys.verify_key, token)
+    if rec is None:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return rec
+
+
+@app.get("/metrics", dependencies=[Depends(require_metrics_api_key)])
 async def metrics():
     """Prometheus text exposition (in-process counters + store gauges)."""
     from fastapi.responses import PlainTextResponse

@@ -433,10 +433,35 @@ API：
 
 ```bash
 curl -fsS http://127.0.0.1:3000/health
-curl -fsS http://127.0.0.1:3000/metrics | head
+curl -fsS -H "Authorization: Bearer $GROK2API_CLIENT_KEY" \
+  http://127.0.0.1:3000/metrics | head
 docker compose logs -f grokcli-2api
 # 时区
 docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
+```
+
+公开探活接口只返回最小信息：
+
+```json
+{"status":"ok","version":"1.9.91"}
+```
+
+管理登录页使用的匿名 `GET /admin/api/status` 也只返回 `ok`、`setup_needed`、`version`。账号池、注册设置、代理、存储与维护状态仅在管理员登录后从受保护接口读取。
+
+诊断接口与浏览器边界：
+
+| 配置 / 接口 | 默认行为 |
+|-------------|----------|
+| `/metrics` | 必须提供有效的 managed API Key 或 `GROK2API_API_KEY`，即使 `/v1` 设为开放也不会匿名放行 |
+| `/docs`、`/redoc`、`/openapi.json` | 默认关闭；仅 `GROK2API_ENABLE_DOCS=1` 时启用 |
+| `GROK2API_CORS_ORIGINS` | 默认空（仅同源）；需要跨源时填完整 origin，多个用逗号分隔，禁止 `*` |
+| 管理 Cookie | HTTPS 或反代传入 `X-Forwarded-Proto: https` 时自动加 `Secure` |
+
+反向代理必须覆盖客户端传入的 `X-Forwarded-Proto`，不要直接透传或附加不可信值。例如公网站点可设置：
+
+```text
+X-Forwarded-Proto: https
+Host: 原始 Host
 ```
 
 - 仅 **leader** worker 跑 Token 续期与模型健康任务（Redis 选主）
@@ -520,6 +545,8 @@ turnstile-solver/                        # 本地过盾（内联）
 
 ## 安全与免责
 
+- **任何曾出现在匿名响应、浏览器截图、日志或对话中的 API Key / Token / 密码都应视为已泄露，必须立即在供应商端撤销并重建。部署代码修复不能让旧密钥恢复安全。**
+- 匿名 `/admin/api/status` 与 `/health` 只应返回文档列出的最小字段；部署后请用无 Cookie、无 Authorization 的外部请求复核。
 - 勿将 `.env`、`data/`、真实 Token / SSO 备份提交到 Git（`data/register_sso/` 已 gitignore）
 - 生产务必修改 Postgres 密码与管理员密码
 - 默认不映射 DB/Redis 端口；调试用本地 override，勿对公网暴露
