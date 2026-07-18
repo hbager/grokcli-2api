@@ -3,10 +3,14 @@ package grok
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestOpenForcesStreamAndCompatibilityHeaders(t *testing.T) {
@@ -37,6 +41,34 @@ func TestOpenForcesStreamAndCompatibilityHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	response.Body.Close()
+}
+
+type countingSSEReader struct {
+	reads atomic.Int32
+}
+
+func (r *countingSSEReader) Read(p []byte) (int, error) {
+	read := r.reads.Add(1)
+	if read > 1 {
+		time.Sleep(200 * time.Millisecond)
+		return 0, io.EOF
+	}
+	return copy(p, "data: {\"x\":1}\n\n"), nil
+}
+
+func TestReadSSEWithIdleStopsProducerWhenEmitReturns(t *testing.T) {
+	reader := &countingSSEReader{}
+	stop := errors.New("stop")
+	err := ReadSSEWithIdle(reader, time.Second, func(Event) error {
+		return stop
+	}, func() error { return nil })
+	if !errors.Is(err, stop) {
+		t.Fatalf("error = %v", err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	if got := reader.reads.Load(); got != 1 {
+		t.Fatalf("producer continued reading after consumer stopped: reads=%d", got)
+	}
 }
 
 func TestReadSSE(t *testing.T) {

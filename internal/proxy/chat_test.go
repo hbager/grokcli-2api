@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -65,9 +66,10 @@ func (f *fakeAffinityStore) BindAffinity(_ context.Context, fingerprint, account
 }
 
 type fakePickObserver struct {
-	penalties map[string]int64
-	marked    []string
-	released  []string
+	penalties  map[string]int64
+	marked     []string
+	released   []string
+	releaseErr []error
 }
 
 func (f *fakePickObserver) LoadPenalty(_ context.Context, accountID string) int64 {
@@ -81,8 +83,9 @@ func (f *fakePickObserver) MarkPick(_ context.Context, accountID string) {
 	f.marked = append(f.marked, accountID)
 }
 
-func (f *fakePickObserver) ReleasePick(_ context.Context, accountID string) {
+func (f *fakePickObserver) ReleasePick(ctx context.Context, accountID string) {
 	f.released = append(f.released, accountID)
+	f.releaseErr = append(f.releaseErr, ctx.Err())
 }
 
 func TestChatFingerprintUsesExplicitConversation(t *testing.T) {
@@ -159,11 +162,65 @@ func TestPrepareAppliesPickObserverPenalty(t *testing.T) {
 	}
 }
 
-func TestReleasePickCallsObserver(t *testing.T) {
+func TestReleasePickUsesLiveContextAfterCancellation(t *testing.T) {
 	observer := &fakePickObserver{}
-	(&ChatService{PickObserver: observer}).releasePick(t.Context(), "acc")
-	if len(observer.released) != 1 || observer.released[0] != "acc" {
-		t.Fatalf("released %#v", observer.released)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	(&ChatService{PickObserver: observer}).releasePick(ctx, "acc")
+	if len(observer.releaseErr) != 1 || observer.releaseErr[0] != nil {
+		t.Fatalf("release context error = %#v", observer.releaseErr)
+	}
+}
+
+type errorAfterReader struct {
+	data []byte
+	err  error
+}
+
+func (r *errorAfterReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	return 0, r.err
+}
+
+func (r *errorAfterReader) Close() error { return nil }
+
+type accountTransport struct {
+	attempts []string
+}
+
+func (t *accountTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	t.attempts = append(t.attempts, token)
+	body := io.ReadCloser(io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")))
+	if token == "bad" {
+		body = &errorAfterReader{data: []byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"), err: io.ErrUnexpectedEOF}
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       body,
+		Request:    r,
+	}, nil
+}
+
+func TestChatServiceCompleteRetriesReadErrorBeforeCommit(t *testing.T) {
+	transport := &accountTransport{}
+	result, err := (&ChatService{
+		Client: &grok.Client{BaseURL: "http://upstream.test/v1", HTTP: &http.Client{Transport: transport}},
+		Now:    func() time.Time { return time.Unix(1000, 0) },
+	}).CompleteWithResult(t.Context(), ChatRequest{Model: "grok", Raw: map[string]any{"model": "grok"}}, []pool.Candidate{
+		{ID: "bad", Token: "bad", Enabled: true, RequestCount: 0},
+		{ID: "ok", Token: "ok", Enabled: true, RequestCount: 1},
+	}, "least_used")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AccountID != "ok" || strings.Join(transport.attempts, ",") != "bad,ok" {
+		t.Fatalf("account=%q attempts=%v", result.AccountID, transport.attempts)
 	}
 }
 
@@ -192,6 +249,7 @@ func TestChatServiceCompleteRetriesEligibleChainBeforeCommit(t *testing.T) {
 	}).CompleteWithResult(t.Context(), ChatRequest{Model: "grok", Raw: map[string]any{"model": "grok", "conversation_id": "conv"}}, []pool.Candidate{
 		{ID: "bad", Token: "bad", Enabled: true, RequestCount: 0},
 		{ID: "ok", Token: "ok", Enabled: true, RequestCount: 1},
+		{ID: "spare", Token: "spare", Enabled: true, RequestCount: 2},
 	}, "least_used")
 	if err != nil {
 		t.Fatal(err)
@@ -434,12 +492,12 @@ func TestParseChatDeltaPreservesSpaces(t *testing.T) {
 	}
 }
 
-func TestPrepareChainCapsFailover(t *testing.T) {
+func TestPrepareChainUsesConfiguredAttemptLimit(t *testing.T) {
 	candidates := make([]pool.Candidate, 0, 20)
 	for i := 0; i < 20; i++ {
 		candidates = append(candidates, pool.Candidate{ID: "a" + strconv.Itoa(i), Token: "t", Enabled: true, RequestCount: int64(i)})
 	}
-	_, chain, _, err := (&ChatService{Now: func() time.Time { return time.Unix(1000, 0) }}).prepareChain(
+	_, chain, _, err := (&ChatService{MaxAttempts: 2, Now: func() time.Time { return time.Unix(1000, 0) }}).prepareChain(
 		t.Context(),
 		ChatRequest{Model: "grok", Raw: map[string]any{"model": "grok"}},
 		candidates,
@@ -448,8 +506,191 @@ func TestPrepareChainCapsFailover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(chain) != defaultFailoverChain {
-		t.Fatalf("chain len=%d want %d", len(chain), defaultFailoverChain)
+	if len(chain) != 2 {
+		t.Fatalf("chain len=%d want 2", len(chain))
+	}
+}
+
+type slowEmptyTransport struct {
+	attempts []string
+}
+
+func (t *slowEmptyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	t.attempts = append(t.attempts, token)
+	var body io.ReadCloser
+	if token == "bad" {
+		pr, pw := io.Pipe()
+		body = pr
+		go func() {
+			time.Sleep(150 * time.Millisecond)
+			_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+			_ = pw.Close()
+		}()
+	} else {
+		body = io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       body,
+		Request:    r,
+	}, nil
+}
+
+func TestChatServiceStreamRetriesSlowEmptyBeforeCommit(t *testing.T) {
+	transport := &slowEmptyTransport{}
+	opened, err := (&ChatService{
+		Client: &grok.Client{BaseURL: "http://upstream.test/v1", HTTP: &http.Client{Transport: transport}},
+		Now:    func() time.Time { return time.Unix(1000, 0) },
+	}).OpenStreamWithResult(t.Context(), ChatRequest{Model: "grok", Stream: true, Raw: map[string]any{"model": "grok"}}, []pool.Candidate{
+		{ID: "bad", Token: "bad", Enabled: true, RequestCount: 0},
+		{ID: "ok", Token: "ok", Enabled: true, RequestCount: 1},
+	}, "least_used")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Body.Close()
+	if opened.AccountID != "ok" || strings.Join(transport.attempts, ",") != "bad,ok" {
+		t.Fatalf("account=%q attempts=%v", opened.AccountID, transport.attempts)
+	}
+}
+
+type stalledFirstBodyTransport struct {
+	attempts []string
+}
+
+func (t *stalledFirstBodyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	t.attempts = append(t.attempts, token)
+	var body io.ReadCloser
+	if token == "stalled" {
+		pr, _ := io.Pipe()
+		body = pr
+	} else {
+		body = io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       body,
+		Request:    r,
+	}, nil
+}
+
+type partialStalledBodyTransport struct {
+	attempts []string
+	writer   *io.PipeWriter
+}
+
+func (t *partialStalledBodyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	t.attempts = append(t.attempts, token)
+	var body io.ReadCloser
+	if token == "partial" {
+		pr, pw := io.Pipe()
+		t.writer = pw
+		body = pr
+		go func() {
+			_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"))
+		}()
+	} else {
+		body = io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       body,
+		Request:    r,
+	}, nil
+}
+
+func TestChatServiceCompleteRetriesStallAfterFirstPayload(t *testing.T) {
+	transport := &partialStalledBodyTransport{}
+	defer func() {
+		if transport.writer != nil {
+			_ = transport.writer.Close()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		result, err := (&ChatService{
+			Client:              &grok.Client{BaseURL: "http://upstream.test/v1", HTTP: &http.Client{Transport: transport}},
+			FirstPayloadTimeout: 25 * time.Millisecond,
+			Now:                 func() time.Time { return time.Unix(1000, 0) },
+		}).CompleteWithResult(t.Context(), ChatRequest{Model: "grok", Raw: map[string]any{"model": "grok"}}, []pool.Candidate{
+			{ID: "partial", Token: "partial", Enabled: true, RequestCount: 0},
+			{ID: "ok", Token: "ok", Enabled: true, RequestCount: 1},
+		}, "least_used")
+		if err == nil && (result.AccountID != "ok" || strings.Join(transport.attempts, ",") != "partial,ok") {
+			err = fmt.Errorf("account=%q attempts=%v", result.AccountID, transport.attempts)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("partial stalled upstream body did not fail over")
+	}
+}
+
+func TestChatServiceCompleteRetriesStalledBody(t *testing.T) {
+	transport := &stalledFirstBodyTransport{}
+	done := make(chan error, 1)
+	go func() {
+		result, err := (&ChatService{
+			Client:              &grok.Client{BaseURL: "http://upstream.test/v1", HTTP: &http.Client{Transport: transport}},
+			FirstPayloadTimeout: 25 * time.Millisecond,
+			Now:                 func() time.Time { return time.Unix(1000, 0) },
+		}).CompleteWithResult(t.Context(), ChatRequest{Model: "grok", Raw: map[string]any{"model": "grok"}}, []pool.Candidate{
+			{ID: "stalled", Token: "stalled", Enabled: true, RequestCount: 0},
+			{ID: "ok", Token: "ok", Enabled: true, RequestCount: 1},
+		}, "least_used")
+		if err == nil && (result.AccountID != "ok" || strings.Join(transport.attempts, ",") != "stalled,ok") {
+			err = fmt.Errorf("account=%q attempts=%v", result.AccountID, transport.attempts)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled upstream body did not fail over")
+	}
+}
+
+func TestChatServiceStreamRetriesStalledBodyBeforeCommit(t *testing.T) {
+	transport := &stalledFirstBodyTransport{}
+	done := make(chan error, 1)
+	go func() {
+		opened, err := (&ChatService{
+			Client:              &grok.Client{BaseURL: "http://upstream.test/v1", HTTP: &http.Client{Transport: transport}},
+			FirstPayloadTimeout: 25 * time.Millisecond,
+			Now:                 func() time.Time { return time.Unix(1000, 0) },
+		}).OpenStreamWithResult(t.Context(), ChatRequest{Model: "grok", Stream: true, Raw: map[string]any{"model": "grok"}}, []pool.Candidate{
+			{ID: "stalled", Token: "stalled", Enabled: true, RequestCount: 0},
+			{ID: "ok", Token: "ok", Enabled: true, RequestCount: 1},
+		}, "least_used")
+		if err == nil {
+			_ = opened.Body.Close()
+			if opened.AccountID != "ok" || strings.Join(transport.attempts, ",") != "stalled,ok" {
+				err = fmt.Errorf("account=%q attempts=%v", opened.AccountID, transport.attempts)
+			}
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled upstream body did not fail over")
 	}
 }
 

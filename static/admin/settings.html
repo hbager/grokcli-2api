@@ -361,8 +361,9 @@
       <input id="set-probe-kick-cd" type="number" class="g2a-input" min="30" max="7200" step="1" />
     </div>
     <div class="g2a-field">
-      <label for="set-max-failover">单次最多故障切换账号数</label>
-      <input id="set-max-failover" type="number" class="g2a-input" min="1" max="64" step="1" />
+      <label for="set-upstream-retry-count">上游报错自动换号重试次数</label>
+      <input id="set-upstream-retry-count" type="number" class="g2a-input" min="0" max="63" step="1" />
+      <div class="g2a-muted" style="margin-top:4px">设为 3 时，最多尝试 4 个不同账号；0 表示不重试</div>
     </div>
   </div>
   <div class="g2a-muted" style="margin-top:10px;line-height:1.55">
@@ -531,6 +532,6 @@
   <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.d65f32a200.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.886dfb65f8.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.720aaf9d28.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

@@ -94,6 +94,7 @@ _PG_SCALAR_KEYS = (
     "probe_fail_kick_streak",
     "probe_fail_disable_streak",
     "probe_kick_cooldown_sec",
+    "upstream_retry_count",
     "max_failover_attempts",
     # Protocol registration (MoeMail / YesCaptcha / proxy) — admin UI config
     "registration_config",
@@ -2951,6 +2952,7 @@ def get_pool_policy() -> dict[str, Any]:
             "probe_fail_kick_streak": int(cd.get("probe_fail_kick_streak") or 2),
             "probe_fail_disable_streak": int(cd.get("probe_fail_disable_streak") or 4),
             "probe_kick_cooldown_sec": cd.get("probe_kick_cooldown_sec", 600.0),
+            "upstream_retry_count": ap.upstream_retry_count(),
             "max_failover_attempts": ap.max_failover_attempts(),
         }
     except Exception:
@@ -2965,7 +2967,8 @@ def get_pool_policy() -> dict[str, Any]:
             "probe_fail_kick_streak": 2,
             "probe_fail_disable_streak": 4,
             "probe_kick_cooldown_sec": 600,
-            "max_failover_attempts": 8,
+            "upstream_retry_count": 3,
+            "max_failover_attempts": 4,
         }
 
 
@@ -2983,7 +2986,7 @@ def set_pool_policy(patch: dict[str, Any]) -> dict[str, Any]:
         "probe_fail_kick_streak": (1.0, 20.0),
         "probe_fail_disable_streak": (2.0, 50.0),
         "probe_kick_cooldown_sec": (30.0, 7200.0),
-        "max_failover_attempts": (1.0, 64.0),
+        "upstream_retry_count": (0.0, 63.0),
     }
     for key, (lo, hi) in mapping.items():
         if key not in patch or patch[key] is None:
@@ -2994,11 +2997,18 @@ def set_pool_policy(patch: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{key} 必须是数字") from e
         val = max(lo, min(hi, val))
         if key in (
-            "max_failover_attempts",
+            "upstream_retry_count",
             "probe_fail_kick_streak",
             "probe_fail_disable_streak",
         ):
             _set_setting_value(key, int(val))
+            if key == "upstream_retry_count":
+                try:
+                    import grok2api.pool.account_pool as ap
+
+                    ap._policy_cache.pop("upstream_retry_count_effective", None)
+                except Exception:
+                    pass
         else:
             _set_setting_value(key, float(val))
     return get_pool_policy()
@@ -3330,7 +3340,7 @@ def update_runtime_settings(patch: dict[str, Any]) -> dict[str, Any]:
         "probe_fail_kick_streak",
         "probe_fail_disable_streak",
         "probe_kick_cooldown_sec",
-        "max_failover_attempts",
+        "upstream_retry_count",
     )
     pool_patch: dict[str, Any] = {}
     nested = patch.get("pool_policy")

@@ -61,15 +61,16 @@ type Options struct {
 	AffinityStore proxy.AffinityStore
 	// Upstream is a shared Grok HTTP client (connection pool). Prefer this over
 	// constructing a new client on every request.
-	Upstream          *grok.Client
-	Redis             *redis.Client
-	Leader            *redis.Leader
-	Maintainer        *maintainer.Service
-	ModelHealth       *modelhealth.Service
-	Quota             *quota.Service
-	Config            config.Config
-	RegistrationURL   string
-	RegistrationToken string
+	Upstream           *grok.Client
+	Redis              *redis.Client
+	Leader             *redis.Leader
+	Maintainer         *maintainer.Service
+	ModelHealth        *modelhealth.Service
+	Quota              *quota.Service
+	Config             config.Config
+	RegistrationURL    string
+	RegistrationToken  string
+	UpstreamRetryCount func(context.Context) int
 }
 
 // NewMigrationMux exposes migration-safe process probes plus low-risk read-only
@@ -485,17 +486,23 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		return
 	}
 	service := proxy.ChatService{
-		Catalog:       modelCatalog(options),
-		Client:        upstreamClient(options),
-		PickObserver:  options.PickObserver,
-		AffinityStore: options.AffinityStore,
+		Catalog:         modelCatalog(options),
+		Client:          upstreamClient(options),
+		MaxAttempts:     upstreamMaxAttempts(r.Context(), options),
+		PickObserver:    options.PickObserver,
+		AffinityStore:   options.AffinityStore,
+		FailureObserver: failedAttemptObserver(options, chatReq.Model),
 	}
 	started := time.Now()
 	if chatReq.Stream {
 		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, "least_used")
 		if err != nil {
 			recordChatUsage(r, options, apiKey, "", chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
-			writeProxyError(w, err)
+			if errors.Is(err, proxy.ErrAllAccountsFailed) {
+				writeChatUpstreamSSEError(w)
+			} else {
+				writeProxyError(w, err)
+			}
 			return
 		}
 		defer opened.Body.Close()
@@ -592,6 +599,56 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 		// Ensure terminal DONE if upstream ended without it (soft disconnect).
 	}
 	return stats, err
+}
+
+func upstreamMaxAttempts(ctx context.Context, options Options) int {
+	retries := 3
+	if options.UpstreamRetryCount != nil {
+		retries = options.UpstreamRetryCount(ctx)
+	} else if options.Store != nil {
+		if value, err := options.Store.UpstreamRetryCount(ctx); err == nil {
+			retries = value
+		}
+	}
+	if retries < 0 {
+		retries = 0
+	}
+	if retries > 63 {
+		retries = 63
+	}
+	return retries + 1
+}
+
+func failedAttemptObserver(options Options, model string) func(context.Context, string, error) {
+	return func(_ context.Context, accountID string, cause error) {
+		if strings.TrimSpace(accountID) == "" || cause == nil {
+			return
+		}
+		status := http.StatusBadGateway
+		summary := "upstream request failed"
+		var upstreamErr *grok.UpstreamError
+		if errors.As(cause, &upstreamErr) {
+			status = upstreamErr.Status
+			summary = fmt.Sprintf("upstream request failed (status %d)", status)
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var cooldown *time.Time
+			if status == http.StatusTooManyRequests || status >= 500 {
+				until := time.Now().Add(15 * time.Minute)
+				cooldown = &until
+			}
+			if options.Store != nil {
+				_ = options.Store.ReportPoolFailure(ctx, postgres.PoolFailure{
+					AccountID: accountID, Error: summary, StatusCode: &status,
+					CooldownUntil: cooldown, CooldownReason: summary,
+					Detail: map[string]any{"source": "go_chat_attempt", "model": model},
+				})
+			}
+			touchRedisPool(options, accountID, false, summary, cooldown, status)
+		}()
+	}
 }
 
 func releaseServerPick(options Options, accountID string) {
@@ -709,6 +766,10 @@ func clientIP(r *http.Request) string {
 }
 
 func writeProxyError(w http.ResponseWriter, err error) {
+	if errors.Is(err, proxy.ErrAllAccountsFailed) {
+		writeOpenAIUpstreamError(w)
+		return
+	}
 	status := http.StatusBadGateway
 	message := err.Error()
 	if errors.Is(err, pool.ErrNoEligibleAccounts) {
@@ -769,10 +830,12 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		return
 	}
 	service := proxy.ChatService{
-		Catalog:       modelCatalog(options),
-		Client:        upstreamClient(options),
-		PickObserver:  options.PickObserver,
-		AffinityStore: options.AffinityStore,
+		Catalog:         modelCatalog(options),
+		Client:          upstreamClient(options),
+		MaxAttempts:     upstreamMaxAttempts(r.Context(), options),
+		PickObserver:    options.PickObserver,
+		AffinityStore:   options.AffinityStore,
+		FailureObserver: failedAttemptObserver(options, model),
 	}
 	started := time.Now()
 	messageID := newAnthropicMessageID()
@@ -794,8 +857,16 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		chatReq.Stream = true
 		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, "least_used")
 		if err != nil {
-			recordAnthropicUsage(r, options, apiKey, "", model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
-			writeAnthropicError(w, http.StatusBadGateway, err.Error(), "api_error")
+			status := http.StatusBadGateway
+			if errors.Is(err, proxy.ErrAllAccountsFailed) {
+				status = http.StatusServiceUnavailable
+			}
+			recordAnthropicUsage(r, options, apiKey, "", model, true, false, status, started, nil, err, 0, raw)
+			if errors.Is(err, proxy.ErrAllAccountsFailed) {
+				writeAnthropicUpstreamSSEError(w)
+			} else {
+				writeAnthropicError(w, status, err.Error(), "api_error")
+			}
 			return
 		}
 		defer opened.Body.Close()
@@ -826,8 +897,16 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		defer releaseServerPick(options, result.AccountID)
 	}
 	if err != nil {
-		recordAnthropicUsage(r, options, apiKey, result.AccountID, model, false, false, http.StatusBadGateway, started, nil, err, 0, raw)
-		writeAnthropicError(w, http.StatusBadGateway, err.Error(), "api_error")
+		status := http.StatusBadGateway
+		if errors.Is(err, proxy.ErrAllAccountsFailed) {
+			status = http.StatusServiceUnavailable
+		}
+		recordAnthropicUsage(r, options, apiKey, result.AccountID, model, false, false, status, started, nil, err, 0, raw)
+		if errors.Is(err, proxy.ErrAllAccountsFailed) {
+			writeAnthropicUpstreamError(w)
+		} else {
+			writeAnthropicError(w, status, err.Error(), "api_error")
+		}
 		return
 	}
 	recordAnthropicUsage(r, options, apiKey, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil, 0, raw)
@@ -973,7 +1052,10 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
-	service := proxy.ChatService{Catalog: modelCatalog(options), Client: upstreamClient(options), PickObserver: options.PickObserver, AffinityStore: options.AffinityStore}
+	service := proxy.ChatService{
+		Catalog: modelCatalog(options), Client: upstreamClient(options), MaxAttempts: upstreamMaxAttempts(r.Context(), options),
+		PickObserver: options.PickObserver, AffinityStore: options.AffinityStore, FailureObserver: failedAttemptObserver(options, model),
+	}
 	started := time.Now()
 	responseID := responses.NewResponseID()
 	respPolicy := historycompact.ResolveOutboundToolPolicy(
@@ -988,8 +1070,16 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	if stream {
 		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, "least_used")
 		if err != nil {
-			recordResponsesUsage(r, options, apiKey, "", model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
-			writeOpenAIError(w, http.StatusBadGateway, err.Error(), "server_error")
+			status := http.StatusBadGateway
+			if errors.Is(err, proxy.ErrAllAccountsFailed) {
+				status = http.StatusServiceUnavailable
+			}
+			recordResponsesUsage(r, options, apiKey, "", model, true, false, status, started, nil, err, 0, raw)
+			if errors.Is(err, proxy.ErrAllAccountsFailed) {
+				writeResponsesUpstreamSSEError(w, responseID, model)
+			} else {
+				writeOpenAIError(w, status, err.Error(), "server_error")
+			}
 			return
 		}
 		defer opened.Body.Close()
@@ -1021,8 +1111,16 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		defer releaseServerPick(options, result.AccountID)
 	}
 	if err != nil {
-		recordResponsesUsage(r, options, apiKey, result.AccountID, model, false, false, http.StatusBadGateway, started, nil, err, 0, raw)
-		writeOpenAIError(w, http.StatusBadGateway, err.Error(), "server_error")
+		status := http.StatusBadGateway
+		if errors.Is(err, proxy.ErrAllAccountsFailed) {
+			status = http.StatusServiceUnavailable
+		}
+		recordResponsesUsage(r, options, apiKey, result.AccountID, model, false, false, status, started, nil, err, 0, raw)
+		if errors.Is(err, proxy.ErrAllAccountsFailed) {
+			writeOpenAIUpstreamError(w)
+		} else {
+			writeOpenAIError(w, status, err.Error(), "server_error")
+		}
 		return
 	}
 	recordResponsesUsage(r, options, apiKey, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil, 0, raw)
@@ -1145,6 +1243,52 @@ func responsesUsageFromOpenAI(usage map[string]any) responses.Usage {
 
 func allowedResponsesToolNames(body map[string]any) []string {
 	return allowedAnthropicToolNames(body)
+}
+
+const allAccountsFailedMessage = "All available upstream accounts failed after automatic retry"
+
+func writeSSEFrames(w http.ResponseWriter, frames []string) {
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	for _, frame := range frames {
+		_, _ = io.WriteString(w, frame)
+	}
+}
+
+func writeChatUpstreamSSEError(w http.ResponseWriter) {
+	payload, _ := json.Marshal(map[string]any{"error": map[string]any{
+		"message": allAccountsFailedMessage, "type": "upstream_error", "code": "all_accounts_failed",
+	}})
+	writeSSEFrames(w, []string{"data: " + string(payload) + "\n\n", "data: [DONE]\n\n"})
+}
+
+func writeAnthropicUpstreamSSEError(w http.ResponseWriter) {
+	frames := anthropic.TerminalError(allAccountsFailedMessage, "upstream_error")
+	payload, _ := json.Marshal(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type": "upstream_error", "message": allAccountsFailedMessage, "code": "all_accounts_failed",
+		},
+	})
+	if len(frames) > 0 {
+		frames[0] = "event: error\ndata: " + string(payload) + "\n\n"
+	}
+	writeSSEFrames(w, frames)
+}
+
+func writeResponsesUpstreamSSEError(w http.ResponseWriter, responseID, model string) {
+	writeSSEFrames(w, responses.Failure(responseID, model, allAccountsFailedMessage+" (all_accounts_failed)", "upstream_error"))
+}
+
+func writeOpenAIUpstreamError(w http.ResponseWriter) {
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{
+		"message": allAccountsFailedMessage,
+		"type":    "upstream_error",
+		"code":    "all_accounts_failed",
+	}})
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, message, errorType string) {
@@ -1672,6 +1816,17 @@ func positiveNumber(value any) bool {
 func stringValue(value any) string {
 	text, _ := value.(string)
 	return strings.TrimSpace(text)
+}
+
+func writeAnthropicUpstreamError(w http.ResponseWriter) {
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "upstream_error",
+			"message": allAccountsFailedMessage,
+			"code":    "all_accounts_failed",
+		},
+	})
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, message, errorType string) {

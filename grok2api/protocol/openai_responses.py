@@ -2126,7 +2126,13 @@ class ResponsesLiveStreamer:
         can_ship_terminal = (
             force_flush_partial_tools and self._any_shipable_tool(terminal=True)
         )
-        if not already and not can_ship_strict and not can_ship_terminal:
+        reasoning_only = bool((reasoning or "").strip())
+        if (
+            not already
+            and not can_ship_strict
+            and not can_ship_terminal
+            and not reasoning_only
+        ):
             # Leave _closed=False so the caller can still emit response.failed
             # via fail(). Closing here made empty turns look like TCP drops to
             # sub2api ("stream usage incomplete: missing terminal event").
@@ -2147,13 +2153,13 @@ class ResponsesLiveStreamer:
 
         frames.extend(self._close_open_text())
 
-        if not self.has_client_payload() and not has_text:
+        if not self.has_client_payload() and not has_text and not reasoning_only:
             # Safety: should be unreachable after the pre-check, but never emit
             # an empty completed envelope. Keep stream reopenable for fail().
             return []
 
         final = self._build_completed_response(usage=usage, reasoning=reasoning or "")
-        if not final.get("output"):
+        if not final.get("output") and not reasoning_only:
             # Built envelope but no output items — treat as empty, allow fail().
             return []
 

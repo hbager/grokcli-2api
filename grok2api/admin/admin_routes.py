@@ -158,7 +158,7 @@ class RuntimeSettingsBody(BaseModel):
     probe_fail_kick_streak: int | None = Field(default=None, ge=1, le=20)
     probe_fail_disable_streak: int | None = Field(default=None, ge=2, le=50)
     probe_kick_cooldown_sec: float | None = Field(default=None, ge=30, le=7200)
-    max_failover_attempts: int | None = Field(default=None, ge=1, le=64)
+    upstream_retry_count: int | None = Field(default=None, ge=0, le=63)
     pool_policy: dict[str, Any] | None = None
     # Outbound proxy pool for account-pool traffic (chat / probe / refresh)
     outbound_proxy_enabled: bool | None = None

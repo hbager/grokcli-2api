@@ -20,6 +20,7 @@ python3 scripts/_test_strict_cooldown_rotation.py
 python3 scripts/_test_rotation_load_spread.py
 python3 scripts/_test_free_usage_hard_kick.py
 python3 scripts/_test_tool_call_parse_fix.py
+python3 scripts/_test_upstream_account_retry.py
 ```
 
 | 路径 | 覆盖 |
@@ -30,6 +31,7 @@ python3 scripts/_test_tool_call_parse_fix.py
 | `_test_rotation_load_spread.py` | pick-time inflight 负载分散 |
 | `_test_free_usage_hard_kick.py` | 没额度立即冷却踢出 |
 | `_test_tool_call_parse_fix.py` | 空 schema / tool_use 解析回归 |
+| `_test_upstream_account_retry.py` | 上游错误换号、重试上限、串流提交边界与耗尽错误 |
 
 > 不要把一次性 release 脚本、第三方安装器、临时研究抓取脚本放进本目录。
 

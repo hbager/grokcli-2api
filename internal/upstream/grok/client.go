@@ -175,14 +175,33 @@ func ReadSSEWithIdle(reader io.Reader, idle time.Duration, emit func(Event) erro
 		event Event
 		err   error
 		done  bool
+		ack   chan struct{}
 	}
-	ch := make(chan result, 1)
+	ch := make(chan result)
+	stop := make(chan struct{})
+	defer close(stop)
 	go func() {
 		err := ReadSSE(reader, func(event Event) error {
-			ch <- result{event: event}
-			return nil
+			ack := make(chan struct{})
+			select {
+			case ch <- result{event: event, ack: ack}:
+			case <-stop:
+				return errStopSSE
+			}
+			select {
+			case <-ack:
+				return nil
+			case <-stop:
+				return errStopSSE
+			}
 		})
-		ch <- result{err: err, done: true}
+		if errors.Is(err, errStopSSE) {
+			return
+		}
+		select {
+		case ch <- result{err: err, done: true}:
+		case <-stop:
+		}
 	}()
 	timer := time.NewTimer(idle)
 	defer timer.Stop()
@@ -199,9 +218,11 @@ func ReadSSEWithIdle(reader io.Reader, idle time.Duration, emit func(Event) erro
 				}
 			}
 			timer.Reset(idle)
-			if err := emit(item.event); err != nil {
+			err := emit(item.event)
+			if err != nil {
 				return err
 			}
+			close(item.ack)
 		case <-timer.C:
 			if err := onIdle(); err != nil {
 				return err
@@ -210,17 +231,14 @@ func ReadSSEWithIdle(reader io.Reader, idle time.Duration, emit func(Event) erro
 		}
 	}
 }
+
+var errStopSSE = errors.New("stop SSE reader")
+
 func Retryable(err error) bool {
-	var upstream *UpstreamError
-	if !errors.As(err, &upstream) {
+	if err == nil {
 		return false
 	}
-	switch upstream.Status {
-	case 401, 403, 429, 500, 502, 503, 504:
-		return true
-	default:
-		return false
-	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func cloneMap(input map[string]any) map[string]any {

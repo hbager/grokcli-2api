@@ -19,11 +19,14 @@ import (
 )
 
 type ChatService struct {
-	Catalog       *models.Catalog
-	Client        *grok.Client
-	Now           func() time.Time
-	PickObserver  PickObserver
-	AffinityStore AffinityStore
+	Catalog             *models.Catalog
+	Client              *grok.Client
+	Now                 func() time.Time
+	MaxAttempts         int
+	FirstPayloadTimeout time.Duration
+	PickObserver        PickObserver
+	AffinityStore       AffinityStore
+	FailureObserver     func(context.Context, string, error)
 }
 
 type PickObserver interface {
@@ -134,44 +137,58 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 	if len(accounts) > 0 {
 		first = accounts[0].ID
 	}
-	var lastEmpty error
-	for i, account := range accounts {
+	var last error
+	attempted := make([]pool.Candidate, 0, len(chain))
+	for _, account := range accounts {
+		attempted = append(attempted, pool.Candidate{ID: account.ID})
 		s.markAttempt(ctx, account.ID)
 		attempt, err := OpenWithFailover(ctx, client, []grok.Account{account}, model, body, &CommitState{})
 		if err != nil {
-			// Retryable/non-retryable both continue within short chain until exhausted.
-			if i == len(accounts)-1 {
-				s.releaseChain(ctx, chain)
-				if lastEmpty != nil {
-					return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep}, lastEmpty
-				}
-				return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep}, err
+			if ctx.Err() != nil {
+				s.releaseChain(ctx, attempted)
+				return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep}, ctx.Err()
 			}
+			s.noteFailure(ctx, account.ID, err)
+			last = err
 			continue
 		}
-		collector := newChatCollector(model)
-		readErr := grok.ReadSSE(attempt.Body, collector.feed)
+		guarded, empty, readErr := guardStreamAgainstEmptyWithTimeout(attempt.Body, s.firstPayloadTimeout())
+		if readErr == nil && !empty {
+			collector := newChatCollector(model)
+			readErr = grok.ReadSSEWithIdle(guarded, s.firstPayloadTimeout(), collector.feed, func() error {
+				_ = guarded.Close()
+				return &grok.UpstreamError{Status: 504, Body: "Upstream timed out before completing model response"}
+			})
+			_ = guarded.Close()
+			if readErr == nil && !collector.emptyModelOutput() {
+				s.releaseChainExcept(ctx, attempted, attempt.Account.ID)
+				s.bindAffinity(ctx, request, attempt.Account.ID)
+				return ChatResult{
+					Payload: collector.response(), AccountID: attempt.Account.ID, Model: collector.model, Usage: collector.usage,
+					PreferAccount: prefer, FirstAccount: first, Failover: first != "" && attempt.Account.ID != first,
+					Fingerprint: fingerprint, Accounts: len(chain), Prep: prep,
+				}, nil
+			}
+		}
 		_ = attempt.Body.Close()
 		if readErr != nil {
-			s.releaseChain(ctx, chain)
-			return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, readErr
+			if ctx.Err() != nil {
+				s.releaseChain(ctx, attempted)
+				return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, ctx.Err()
+			}
+			s.noteFailure(ctx, attempt.Account.ID, readErr)
+			last = readErr
+			continue
 		}
-		if !collector.emptyModelOutput() {
-			s.releaseChainExcept(ctx, chain, attempt.Account.ID)
-			s.bindAffinity(ctx, request, attempt.Account.ID)
-			return ChatResult{
-				Payload: collector.response(), AccountID: attempt.Account.ID, Model: collector.model, Usage: collector.usage,
-				PreferAccount: prefer, FirstAccount: first, Failover: first != "" && attempt.Account.ID != first,
-				Fingerprint: fingerprint, Accounts: len(chain), Prep: prep,
-			}, nil
-		}
-		lastEmpty = &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
+		emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
+		s.noteFailure(ctx, attempt.Account.ID, emptyErr)
+		last = emptyErr
 	}
-	s.releaseChain(ctx, chain)
-	if lastEmpty == nil {
-		lastEmpty = &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
+	s.releaseChain(ctx, attempted)
+	if last == nil {
+		last = errors.New("no eligible accounts")
 	}
-	return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, Failover: true}, lastEmpty
+	return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, Failover: len(accounts) > 1}, &AllAccountsFailedError{Attempts: len(accounts), Last: last}
 }
 
 func (s *ChatService) Stream(ctx context.Context, request ChatRequest, candidates []pool.Candidate, mode string, emit func(StreamFrame) error) error {
@@ -207,32 +224,40 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 	if len(accounts) > 0 {
 		first = accounts[0].ID
 	}
-	var lastEmpty error
-	for i, account := range accounts {
+	var last error
+	attempted := make([]pool.Candidate, 0, len(chain))
+	for _, account := range accounts {
+		attempted = append(attempted, pool.Candidate{ID: account.ID})
 		s.markAttempt(ctx, account.ID)
 		attempt, err := OpenWithFailover(ctx, client, []grok.Account{account}, model, body, &CommitState{})
 		if err != nil {
-			if i == len(accounts)-1 {
-				s.releaseChain(ctx, chain)
-				if lastEmpty != nil {
-					return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep}, lastEmpty
-				}
-				return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep}, err
+			if ctx.Err() != nil {
+				s.releaseChain(ctx, attempted)
+				return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep}, ctx.Err()
 			}
+			s.noteFailure(ctx, account.ID, err)
+			last = err
 			continue
 		}
-		guarded, empty, err := guardStreamAgainstEmpty(attempt.Body)
+		guarded, empty, err := guardStreamAgainstEmptyWithTimeout(attempt.Body, s.firstPayloadTimeout())
 		if err != nil {
 			_ = attempt.Body.Close()
-			s.releaseChain(ctx, chain)
-			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, err
+			if ctx.Err() != nil {
+				s.releaseChain(ctx, attempted)
+				return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, ctx.Err()
+			}
+			s.noteFailure(ctx, attempt.Account.ID, err)
+			last = err
+			continue
 		}
 		if empty {
 			_ = guarded.Close()
-			lastEmpty = &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
+			emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
+			s.noteFailure(ctx, attempt.Account.ID, emptyErr)
+			last = emptyErr
 			continue
 		}
-		s.releaseChainExcept(ctx, chain, attempt.Account.ID)
+		s.releaseChainExcept(ctx, attempted, attempt.Account.ID)
 		s.bindAffinity(ctx, request, attempt.Account.ID)
 		return StreamOpen{
 			Body: guarded, AccountID: attempt.Account.ID, Model: model,
@@ -240,11 +265,11 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 			Fingerprint: fingerprint, Accounts: len(chain), Prep: prep,
 		}, nil
 	}
-	s.releaseChain(ctx, chain)
-	if lastEmpty == nil {
-		lastEmpty = &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
+	s.releaseChain(ctx, attempted)
+	if last == nil {
+		last = errors.New("no eligible accounts")
 	}
-	return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, Failover: true}, lastEmpty
+	return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, Failover: len(accounts) > 1}, &AllAccountsFailedError{Attempts: len(accounts), Last: last}
 }
 
 func ForwardChatStream(reader io.Reader, emit func(StreamFrame) error) error {
@@ -309,7 +334,8 @@ func (s *ChatService) prepare(ctx context.Context, request ChatRequest, candidat
 	return model, picked, client, nil
 }
 
-// defaultFailoverChain matches Python MAX_FAILOVER_ATTEMPTS (short sticky-friendly chain).
+// defaultFailoverChain preserves the historical four-account attempt limit
+// for tests and embedded callers that do not inject runtime settings.
 const defaultFailoverChain = 4
 
 func (s *ChatService) prepareChain(ctx context.Context, request ChatRequest, candidates []pool.Candidate, mode string) (string, []pool.Candidate, *grok.Client, error) {
@@ -326,8 +352,11 @@ func (s *ChatService) prepareChain(ctx context.Context, request ChatRequest, can
 	if s.PickObserver != nil {
 		adjustCandidatesForObserver(ctxOrBackground(ctx), candidates, s.PickObserver)
 	}
-	// Never build a full-pool chain: Python caps failover attempts (default 4).
-	chain := pool.Chain(candidates, model, mode, now, defaultFailoverChain)
+	maxAttempts := s.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultFailoverChain
+	}
+	chain := pool.Chain(candidates, model, mode, now, maxAttempts)
 	if len(chain) == 0 {
 		return "", nil, nil, pool.ErrNoEligibleAccounts
 	}
@@ -361,7 +390,7 @@ func (c *chatCollector) feed(event grok.Event) error {
 	}
 	delta, err := parseChatDelta(event.Data)
 	if err != nil {
-		return nil
+		return err
 	}
 	if delta.ID != "" && c.id == "" {
 		c.id = delta.ID
@@ -620,7 +649,10 @@ func (s *ChatService) releasePick(ctx context.Context, accountID string) {
 	if s.PickObserver == nil || accountID == "" {
 		return
 	}
-	s.PickObserver.ReleasePick(ctxOrBackground(ctx), accountID)
+	if ctx == nil || ctx.Err() != nil {
+		ctx = context.Background()
+	}
+	s.PickObserver.ReleasePick(ctx, accountID)
 }
 
 func (s *ChatService) releaseChain(ctx context.Context, chain []pool.Candidate) {
@@ -786,74 +818,76 @@ func numberToInt64(value any) (int64, bool) {
 	}
 }
 
-// guardStreamAgainstEmpty peeks upstream SSE until the first model payload or
-// stream end. Empty HTTP 200 bodies can then failover before the client envelope
-// is opened. On success, returns a reader that replays peeked frames + remainder.
-//
-// 为了支持首字延迟较长的模型（如某些 newapi 实例），这里使用超时机制：
-// - 如果 1 秒内收到有效内容 → 正常返回
-// - 如果 1 秒内收到 [DONE] → 判定为空
-// - 如果 1 秒内没有收到任何数据 → 放弃检测，直接通过（避免误杀慢启动模型）
+func (s *ChatService) firstPayloadTimeout() time.Duration {
+	if s != nil && s.FirstPayloadTimeout > 0 {
+		return s.FirstPayloadTimeout
+	}
+	return 20 * time.Second
+}
+
+// guardStreamAgainstEmpty reads upstream SSE until the first model payload or
+// stream end. Empty HTTP 200 bodies can then fail over before the client envelope
+// is opened. ChatService bounds this pre-commit read; after the first model payload,
+// the returned replay reader preserves the normal long-lived stream behavior.
 func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
+	return guardStreamAgainstEmptyWithTimeout(body, 0)
+}
+
+func guardStreamAgainstEmptyWithTimeout(body io.ReadCloser, timeout time.Duration) (io.ReadCloser, bool, error) {
 	if body == nil {
 		return nil, true, &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
 	}
 
-	type peekResult struct {
-		sawModel bool
-		sawDone  bool
-		buffered string
-		err      error
+	if timeout > 0 {
+		type guardResult struct {
+			body  io.ReadCloser
+			empty bool
+			err   error
+		}
+		result := make(chan guardResult, 1)
+		go func() {
+			guarded, empty, err := guardStreamAgainstEmptyWithTimeout(body, 0)
+			result <- guardResult{body: guarded, empty: empty, err: err}
+		}()
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case guarded := <-result:
+			return guarded.body, guarded.empty, guarded.err
+		case <-timer.C:
+			_ = body.Close()
+			return nil, false, &grok.UpstreamError{Status: 504, Body: "Upstream timed out before first model payload"}
+		}
 	}
 
-	resultCh := make(chan peekResult, 1)
-	go func() {
-		var buffered strings.Builder
-		sawModel := false
-		sawDone := false
-		err := grok.ReadSSE(io.TeeReader(body, &buffered), func(event grok.Event) error {
-			if event.Done {
-				sawDone = true
-				return errStopPeek
-			}
-			delta, parseErr := parseChatDelta(event.Data)
-			if parseErr != nil {
-				return nil
-			}
-			if strings.TrimSpace(delta.Content) != "" || strings.TrimSpace(delta.Reasoning) != "" || len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
-				sawModel = true
-				return errStopPeek
-			}
-			return nil
-		})
-		if err != nil && !errors.Is(err, errStopPeek) {
-			resultCh <- peekResult{err: err}
-			return
+	var buffered strings.Builder
+	sawModel := false
+	sawDone := false
+	err := grok.ReadSSE(io.TeeReader(body, &buffered), func(event grok.Event) error {
+		if event.Done {
+			sawDone = true
+			return errStopPeek
 		}
-		resultCh <- peekResult{sawModel: sawModel, sawDone: sawDone, buffered: buffered.String()}
-	}()
-
-	// Ultra-short empty-stream peek (80ms): only catch instant empty/[DONE], never wait for slow first tokens.
-	select {
-	case result := <-resultCh:
-		if result.err != nil {
-			_ = body.Close()
-			return nil, false, result.err
+		delta, parseErr := parseChatDelta(event.Data)
+		if parseErr != nil {
+			return parseErr
 		}
-		if !result.sawModel && result.sawDone {
-			// 确实是空响应（收到 [DONE] 但没有内容）
-			_, _ = io.Copy(io.Discard, body)
-			_ = body.Close()
-			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
+		if strings.TrimSpace(delta.Content) != "" || strings.TrimSpace(delta.Reasoning) != "" || len(delta.ToolCalls) > 0 || delta.FunctionCall != nil {
+			sawModel = true
+			return errStopPeek
 		}
-		// 有内容或者流还在继续 → 正常返回
-		replayed := io.MultiReader(strings.NewReader(result.buffered), body)
-		return &multiClose{Reader: replayed, closer: body}, false, nil
-	case <-time.After(80 * time.Millisecond):
-		// Peek deadline elapsed: pass through without waiting for full first token.
-		// 注意：这里不关闭 body，让它继续流式输出
-		return body, false, nil
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStopPeek) {
+		_ = body.Close()
+		return nil, false, err
 	}
+	if !sawModel && (sawDone || err == nil) {
+		_ = body.Close()
+		return io.NopCloser(strings.NewReader(buffered.String())), true, nil
+	}
+	replayed := io.MultiReader(strings.NewReader(buffered.String()), body)
+	return &multiClose{Reader: replayed, closer: body}, false, nil
 }
 
 var errStopPeek = errors.New("stop peek")
@@ -868,6 +902,13 @@ func (m *multiClose) Close() error {
 		return nil
 	}
 	return m.closer.Close()
+}
+
+func (s *ChatService) noteFailure(ctx context.Context, accountID string, err error) {
+	if s == nil || s.FailureObserver == nil || strings.TrimSpace(accountID) == "" || err == nil {
+		return
+	}
+	s.FailureObserver(ctxOrBackground(ctx), accountID, err)
 }
 
 func (s *ChatService) markAttempt(ctx context.Context, accountID string) {

@@ -2956,6 +2956,10 @@ def _client_pool_error(exc: Exception | str, *, default_status: int = 503) -> JS
     )
 
 
+def _upstream_http_error_summary(status_code: int | None) -> str:
+    return f"Upstream returned HTTP {status_code or 502}"
+
+
 def _sanitize_upstream_error_message(detail: str, status_code: int | None = None) -> str:
     """Short, non-leaky upstream error for clients (full detail stays in logs/pool)."""
     text = (detail or "").strip()
@@ -3991,8 +3995,60 @@ async def list_models():
     return {"object": "list", "data": load_models_from_cache()}
 
 
+ALL_ACCOUNTS_FAILED_MESSAGE = (
+    "All available upstream accounts failed after automatic retry"
+)
+ALL_ACCOUNTS_FAILED_CODE = "all_accounts_failed"
+
+
+def _all_accounts_failed_openai_response() -> JSONResponse:
+    return openai_error(
+        ALL_ACCOUNTS_FAILED_MESSAGE,
+        status=503,
+        err_type="upstream_error",
+        retry_after=8,
+        code=ALL_ACCOUNTS_FAILED_CODE,
+    )
+
+
+def _all_accounts_failed_anthropic_response() -> JSONResponse:
+    return _anthropic_error_response(
+        f"{ALL_ACCOUNTS_FAILED_CODE}: {ALL_ACCOUNTS_FAILED_MESSAGE}",
+        status=503,
+        err_type="api_error",
+        retry_after=8,
+    )
+
+
+def _all_accounts_failed_anthropic_sse() -> list[str]:
+    return anth.anthropic_stream_terminal_error(
+        f"{ALL_ACCOUNTS_FAILED_CODE}: {ALL_ACCOUNTS_FAILED_MESSAGE}",
+        err_type="api_error",
+    )
+
+
+def _all_accounts_failed_responses_message() -> str:
+    return f"{ALL_ACCOUNTS_FAILED_CODE}: {ALL_ACCOUNTS_FAILED_MESSAGE}"
+
+
+def _all_accounts_failed_chat_sse(chat_id: str) -> tuple[str, str]:
+    payload = {
+        "id": chat_id,
+        "object": "error",
+        "error": {
+            "message": ALL_ACCOUNTS_FAILED_MESSAGE,
+            "type": "upstream_error",
+            "code": ALL_ACCOUNTS_FAILED_CODE,
+        },
+    }
+    return (
+        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n",
+        "data: [DONE]\n\n",
+    )
+
+
 def _retryable_status(code: int) -> bool:
-    return code in (401, 403, 429, 500, 502, 503, 504)
+    return not 200 <= int(code) < 300
 
 
 def _is_empty_model_payload(
@@ -4073,10 +4129,9 @@ def _classify_upstream_body_error(
             "not a model response"
         )
     if _looks_like_gateway_intercept(text):
-        preview = text.strip().replace("\n", " ")[:160]
         return (
             "Upstream returned HTTP 200 non-JSON body "
-            f"(proxy/gateway intercept?): {preview!r}"
+            "(proxy/gateway intercept)"
         )
     return None
 
@@ -4399,12 +4454,11 @@ async def chat_completions(
             )
         except httpx.HTTPStatusError as e:
             code = e.response.status_code if e.response is not None else 502
-            raw_detail = e.response.text[:800] if e.response is not None else str(e)
-            detail = _sanitize_upstream_error_message(raw_detail, code)
+            detail = _upstream_http_error_summary(code)
             hdrs = dict(e.response.headers) if e.response is not None else None
             _report_upstream_failure(
                 creds.auth_key,
-                error=raw_detail,
+                error=detail,
                 status_code=code,
                 model=model,
                 headers=hdrs,
@@ -4423,15 +4477,15 @@ async def chat_completions(
                 protocol="openai",
                 stream=False,
                 status_code=code,
-                error=f"Upstream {code}: {detail}",
+                error=detail,
                 detail={
-                    "message": f"Upstream {code}: {detail}",
+                    "message": detail,
                     "upstream_status": code,
-                    "upstream_body": detail,
+                    "kind": "upstream_http_error",
                 },
                 timing=timing,
             )
-            last_error = f"Upstream {code}: {detail}"
+            last_error = detail
             last_status = code
             if not _retryable_status(code):
                 break
@@ -4465,26 +4519,9 @@ async def chat_completions(
             last_status = 502
             continue
 
-    # All accounts in chain failed — tell clients this is temporary/retryable when
-    # the last status was a known transient upstream code.
-    final_status = last_status if last_status < 600 else 502
-    retryable = final_status in (401, 403, 429, 500, 502, 503, 504)
-    friendly = _sanitize_upstream_error_message(last_error or "", final_status)
-    timing.emit(ok=False, error=friendly or last_error or "all_accounts_failed")
-    if retryable:
-        return openai_error(
-            friendly or "所有账号暂时失败，请稍后重试",
-            status=503,
-            err_type="upstream_error",
-            retry_after=8,
-            code="all_accounts_failed",
-        )
-    return openai_error(
-        friendly or last_error or "All accounts failed",
-        status=final_status,
-        err_type="upstream_error",
-        code=final_status,
-    )
+    # All selected accounts failed after safe pre-commit failover.
+    timing.emit(ok=False, error=ALL_ACCOUNTS_FAILED_CODE)
+    return _all_accounts_failed_openai_response()
 
 
 
@@ -4613,17 +4650,14 @@ async def _stream_proxy_with_failover_inner(
             ) as resp:
                 if timing is not None:
                     timing.mark_upstream_headers()
-                if resp.status_code >= 400:
-                    err_text = (await resp.aread()).decode(
-                        "utf-8", errors="replace"
-                    )[:1500]
+                if _retryable_status(resp.status_code):
+                    detail = _upstream_http_error_summary(resp.status_code)
                     _report_upstream_failure(
-                creds.auth_key,
-                error=err_text,
-                status_code=resp.status_code,
-                model=model,
-                headers=dict(resp.headers,
-            ),
+                        creds.auth_key,
+                        error=detail,
+                        status_code=resp.status_code,
+                        model=model,
+                        headers=dict(resp.headers),
                     )
                     _record_usage_safe(
                         ok=False,
@@ -4634,31 +4668,22 @@ async def _stream_proxy_with_failover_inner(
                         stream=True,
                         status_code=resp.status_code,
                         latency_ms=timing.latency_ms() if timing is not None else None,
-                        error=f"Upstream {resp.status_code}: {err_text}",
+                        error=detail,
                         detail={
-                            "message": f"Upstream {resp.status_code}: {err_text}",
+                            "message": detail,
                             "upstream_status": resp.status_code,
-                            "upstream_body": err_text,
+                            "kind": "upstream_http_error",
                         },
                         timing=timing,
                     )
-                    last_err = f"Upstream {resp.status_code}: {err_text}"
+                    last_err = detail
                     # try next account if retryable and more remain
                     if _retryable_status(resp.status_code) and idx < len(chain) - 1:
                         continue
                     if timing is not None:
                         timing.emit(ok=False, error=last_err)
-                    err_payload = {
-                        "id": chat_id,
-                        "object": "error",
-                        "error": {
-                            "message": last_err,
-                            "type": "upstream_error",
-                            "code": resp.status_code,
-                        },
-                    }
-                    yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
+                    for frame in _all_accounts_failed_chat_sse(chat_id):
+                        yield frame
                     return
 
                 # Defer success/affinity until after first client bytes.
@@ -4952,11 +4977,9 @@ async def _stream_proxy_with_failover_inner(
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
-                        # Non-JSON 200 that isn't obvious HTML: still retryable.
-                        preview = raw[:200].decode("utf-8", errors="replace")
                         raise RuntimeError(
                             "Upstream returned HTTP 200 with non-JSON body "
-                            f"(empty/malformed): {preview!r}"
+                            "(empty/malformed)"
                         )
                     else:
                         if isinstance(data.get("usage"), dict):
@@ -5175,17 +5198,8 @@ async def _stream_proxy_with_failover_inner(
                     continue
                 if timing is not None:
                     timing.emit(ok=False, error=empty_err)
-                err_payload = {
-                    "id": chat_id,
-                    "object": "error",
-                    "error": {
-                        "message": empty_err,
-                        "type": "upstream_error",
-                        "code": "empty_upstream",
-                    },
-                }
-                yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
+                for frame in _all_accounts_failed_chat_sse(chat_id):
+                    yield frame
                 return
 
             _note_success_once()
@@ -5347,25 +5361,12 @@ async def _stream_proxy_with_failover_inner(
             )
             if idx < len(chain) - 1:
                 continue
-            err_payload = {
-                "id": chat_id,
-                "object": "error",
-                "error": {"message": last_err, "type": "proxy_error"},
-            }
-            yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+            for frame in _all_accounts_failed_chat_sse(chat_id):
+                yield frame
             return
 
-    err_payload = {
-        "id": chat_id,
-        "object": "error",
-        "error": {
-            "message": _sanitize_upstream_error_message(last_err or "", 503) or "All accounts failed",
-            "type": "upstream_error",
-        },
-    }
-    yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
-    yield "data: [DONE]\n\n"
+    for frame in _all_accounts_failed_chat_sse(chat_id):
+        yield frame
 
 
 async def _collect_completion(
@@ -5395,7 +5396,7 @@ async def _collect_completion(
 
     client = await get_http_client(account_id)
     async with client.stream("POST", url, headers=headers, json=req_body) as resp:
-        if resp.status_code >= 400:
+        if _retryable_status(resp.status_code):
             raw = await resp.aread()
             # attach body text onto response for callers
             try:
@@ -5450,10 +5451,9 @@ async def _collect_completion(
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError as e:
-                preview = raw[:200].decode("utf-8", errors="replace")
                 raise RuntimeError(
                     "Upstream returned HTTP 200 with non-JSON body "
-                    f"(empty/malformed): {preview!r}"
+                    "(empty/malformed)"
                 ) from e
             if isinstance(data.get("usage"), dict):
                 usage = data["usage"]
@@ -5835,12 +5835,11 @@ async def anthropic_messages(
             )
         except httpx.HTTPStatusError as e:
             code = e.response.status_code if e.response is not None else 502
-            raw_detail = e.response.text[:800] if e.response is not None else str(e)
-            detail = _sanitize_upstream_error_message(raw_detail, code)
+            detail = _upstream_http_error_summary(code)
             hdrs = dict(e.response.headers) if e.response is not None else None
             _report_upstream_failure(
                 creds.auth_key,
-                error=raw_detail,
+                error=detail,
                 status_code=code,
                 model=model,
                 headers=hdrs,
@@ -5859,15 +5858,15 @@ async def anthropic_messages(
                 protocol="anthropic",
                 stream=False,
                 status_code=code,
-                error=f"Upstream {code}: {detail}",
+                error=detail,
                 detail={
-                    "message": f"Upstream {code}: {detail}",
+                    "message": detail,
                     "upstream_status": code,
-                    "upstream_body": detail,
+                    "kind": "upstream_http_error",
                 },
                 timing=timing,
             )
-            last_error = f"Upstream {code}: {detail}"
+            last_error = detail
             last_status = code
             if not _retryable_status(code):
                 break
@@ -5901,15 +5900,7 @@ async def anthropic_messages(
             last_status = 502
             continue
 
-    final_status = last_status if last_status < 600 else 502
-    retryable = final_status in (401, 403, 429, 500, 502, 503, 504)
-    friendly = _sanitize_upstream_error_message(last_error or "", final_status)
-    return _anthropic_error_response(
-        friendly or last_error or "All accounts failed",
-        status=503 if retryable else final_status,
-        err_type="api_error",
-        retry_after=8 if retryable else None,
-    )
+    return _all_accounts_failed_anthropic_response()
 
 
 @app.post("/v1/messages/count_tokens", dependencies=[Depends(require_api_key)])
@@ -6220,16 +6211,15 @@ async def openai_responses(
                 return content, reasoning, finish, usage, tool_calls, creds
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code if e.response is not None else 502
-                raw_detail = e.response.text[:800] if e.response is not None else str(e)
-                detail = _sanitize_upstream_error_message(raw_detail, code)
+                detail = _upstream_http_error_summary(code)
                 hdrs = dict(e.response.headers) if e.response is not None else None
                 _report_upstream_failure(
-                creds.auth_key,
-                error=raw_detail,
-                status_code=code,
-                model=model,
-                headers=hdrs,
-            )
+                    creds.auth_key,
+                    error=detail,
+                    status_code=code,
+                    model=model,
+                    headers=hdrs,
+                )
                 try:
                     from grok2api.store.metrics import inc
 
@@ -6244,15 +6234,15 @@ async def openai_responses(
                     protocol="openai_responses",
                     stream=want_stream,
                     status_code=code,
-                    error=f"Upstream {code}: {detail}",
+                    error=detail,
                     detail={
-                        "message": f"Upstream {code}: {detail}",
+                        "message": detail,
                         "upstream_status": code,
-                        "upstream_body": detail,
+                        "kind": "upstream_http_error",
                     },
                     timing=timing,
                 )
-                last_error = f"Upstream {code}: {detail}"
+                last_error = detail
                 last_status = code
                 if not _retryable_status(code):
                     break
@@ -6285,9 +6275,7 @@ async def openai_responses(
                 last_error = f"Proxy error: {e}"
                 last_status = 502
                 continue
-        final_status = last_status if last_status < 600 else 502
-        friendly = _sanitize_upstream_error_message(last_error or "", final_status)
-        raise RuntimeError(friendly or last_error or "All accounts failed")
+        raise RuntimeError(ALL_ACCOUNTS_FAILED_CODE)
 
     if want_stream:
         _resp_usage_ctx = _capture_usage_request_ctx(request)
@@ -6331,17 +6319,14 @@ async def openai_responses(
                             "POST", url, headers=headers, json=upstream_body
                         ) as resp:
                             timing.mark_upstream_headers()
-                            if resp.status_code >= 400:
-                                err_text = (await resp.aread()).decode(
-                                    "utf-8", errors="replace"
-                                )[:1500]
+                            if _retryable_status(resp.status_code):
+                                detail = _upstream_http_error_summary(resp.status_code)
                                 _report_upstream_failure(
-                creds.auth_key,
-                error=err_text,
-                status_code=resp.status_code,
-                model=model,
-                headers=dict(resp.headers,
-            ),
+                                    creds.auth_key,
+                                    error=detail,
+                                    status_code=resp.status_code,
+                                    model=model,
+                                    headers=dict(resp.headers),
                                 )
                                 _record_usage_safe(
                                     ok=False,
@@ -6352,19 +6337,15 @@ async def openai_responses(
                                     stream=True,
                                     status_code=resp.status_code,
                                     latency_ms=timing.latency_ms(),
-                                    error=f"Upstream {resp.status_code}: {err_text}",
+                                    error=detail,
                                     detail={
-                                        "message": (
-                                            f"Upstream {resp.status_code}: {err_text}"
-                                        ),
+                                        "message": detail,
                                         "upstream_status": resp.status_code,
-                                        "upstream_body": err_text,
+                                        "kind": "upstream_http_error",
                                     },
                                     timing=timing,
                                 )
-                                last_error = (
-                                    f"Upstream {resp.status_code}: {err_text}"
-                                )
+                                last_error = detail
                                 if (
                                     _retryable_status(resp.status_code)
                                     and idx < len(chain) - 1
@@ -6373,20 +6354,14 @@ async def openai_responses(
                                     continue
                                 for frame in oai_resp.failed_responses_sse(
                                     response_id=response_id,
-                                    message=_sanitize_upstream_error_message(
-                                        last_error, resp.status_code
-                                    )
-                                    or last_error,
+                                    message=_all_accounts_failed_responses_message(),
                                     model=model,
                                 ):
                                     yield frame
                                 return
 
-                            # Early response.created at upstream 200 so sub2api/clients see first SSE
-                            # bytes without waiting on model tokens (pre-1.9.63 TTFT).
-                            # Trade-off: empty HTTP 200 cannot silent-failover after the
-                            # envelope opens; we emit response.failed+[DONE] instead.
-                            # Success/affinity still deferred until real content/tools.
+                            # Keep the client stream uncommitted until text or a
+                            # shippable tool produces actual Responses frames.
                             success_noted = False
                             saw_model_output = False
                             if timing is not None:
@@ -6449,33 +6424,8 @@ async def openai_responses(
                                         timing.mark_envelope_open(early=True)
                                 return frames
 
-                            # Open envelope ASAP after upstream 200 (early TTFT).
-                            for frame in _open_responses_stream():
-                                yield frame
-                            # Sync pre-bind response_id → account as soon as the
-                            # stream opens. Async create_task raced Codex's next
-                            # turn (previous_response_id only) and caused sticky=0
-                            # + cold pick + cache miss.
-                            try:
-                                await asyncio.to_thread(
-                                    conversation_affinity.bind_response_chain,
-                                    response_id,
-                                    creds.auth_key,
-                                    api_key_id=key_id,
-                                    session_fp=conv_fp,
-                                    prompt_cache_key=pck,
-                                )
-                            except Exception:
-                                try:
-                                    conversation_affinity.bind_response_chain(
-                                        response_id,
-                                        creds.auth_key,
-                                        api_key_id=key_id,
-                                        session_fp=conv_fp,
-                                        prompt_cache_key=pck,
-                                    )
-                                except Exception:
-                                    pass
+                            # The streamer opens its envelope when the first client
+                            # payload is produced below.
 
                             ctype = (resp.headers.get("content-type") or "").lower()
                             if "text/event-stream" in ctype or "stream" in ctype:
@@ -6572,12 +6522,9 @@ async def openai_responses(
                                 try:
                                     data = json.loads(raw)
                                 except json.JSONDecodeError as e:
-                                    preview = raw[:200].decode(
-                                        "utf-8", errors="replace"
-                                    )
                                     raise RuntimeError(
                                         "Upstream returned HTTP 200 with non-JSON "
-                                        f"body (empty/malformed): {preview!r}"
+                                        "body (empty/malformed)"
                                     ) from e
                                 if isinstance(data.get("usage"), dict):
                                     usage = data["usage"]
@@ -6658,6 +6605,7 @@ async def openai_responses(
                             if (
                                 not streamer.has_client_payload()
                                 and not (joined_content or "").strip()
+                                and not (joined_reasoning or "").strip()
                                 and not can_ship_tools
                                 and not any(str(p or "") for p in streamer._text_parts)
                             ):
@@ -6697,18 +6645,26 @@ async def openai_responses(
                                     timing=timing,
                                 )
                                 last_error = empty_err
+                                if client_gone:
+                                    return
+                                if not stream_started and idx < len(chain) - 1:
+                                    continue
                                 if timing is not None:
                                     timing.emit(ok=False, error=empty_err)
                                 # Always emit a Responses terminal. complete() used
                                 # to set _closed on empty turns, which made fail() a
                                 # no-op and left sub2api without response.failed/DONE
                                 # ("stream usage incomplete: missing terminal event").
-                                fail_frames = list(streamer.fail(empty_err))
+                                fail_frames = list(
+                                    streamer.fail(
+                                        _all_accounts_failed_responses_message()
+                                    )
+                                )
                                 if not fail_frames:
                                     fail_frames = list(
                                         oai_resp.failed_responses_sse(
                                             response_id=response_id,
-                                            message=empty_err,
+                                            message=_all_accounts_failed_responses_message(),
                                             model=model,
                                         )
                                     )
@@ -6732,10 +6688,8 @@ async def openai_responses(
                                 reasoning=joined_reasoning,
                                 force_flush_partial_tools=True,
                             )
-                            # Never promote joined_reasoning into output_text —
-                            # that is the Codex "thinking chain as answer" leak on
-                            # short turns (hello / ack). Empty body falls through to
-                            # empty_complete → response.failed / failover below.
+                            # Never promote joined_reasoning into output_text. A
+                            # reasoning-only turn completes with metadata only.
                             if not complete_frames and not streamer.has_client_payload():
                                 empty_err = (
                                     "Upstream returned HTTP 200 with empty model output "
@@ -6773,18 +6727,26 @@ async def openai_responses(
                                     timing=timing,
                                 )
                                 last_error = empty_err
+                                if client_gone:
+                                    return
+                                if not stream_started and idx < len(chain) - 1:
+                                    continue
                                 if timing is not None:
                                     timing.emit(ok=False, error=empty_err)
                                 # Always emit a Responses terminal. complete() used
                                 # to set _closed on empty turns, which made fail() a
                                 # no-op and left sub2api without response.failed/DONE
                                 # ("stream usage incomplete: missing terminal event").
-                                fail_frames = list(streamer.fail(empty_err))
+                                fail_frames = list(
+                                    streamer.fail(
+                                        _all_accounts_failed_responses_message()
+                                    )
+                                )
                                 if not fail_frames:
                                     fail_frames = list(
                                         oai_resp.failed_responses_sse(
                                             response_id=response_id,
-                                            message=empty_err,
+                                            message=_all_accounts_failed_responses_message(),
                                             model=model,
                                         )
                                     )
@@ -6874,18 +6836,16 @@ async def openai_responses(
                         if idx < len(chain) - 1:
                             continue
                         try:
-                            for frame in streamer.fail(last_error):
+                            for frame in streamer.fail(
+                                _all_accounts_failed_responses_message()
+                            ):
                                 yield frame
                         except Exception:
                             pass
                         return
                 # No account produced a terminal response. Record a chain-level fail
                 # so admin "断联" rows never show bare request_failed + empty detail.
-                final_msg = (
-                    _sanitize_upstream_error_message(last_error or "", 502)
-                    or last_error
-                    or "All accounts failed"
-                )
+                final_msg = _all_accounts_failed_responses_message()
                 _record_usage_safe(
                     ok=False,
                     api_key_id=key_id,
@@ -6945,16 +6905,8 @@ async def openai_responses(
 
     try:
         content, reasoning, _finish, usage, tool_calls, creds = await _run_with_failover()
-    except RuntimeError as e:
-        msg = str(e)
-        # Pool / upstream transient → 503 so relays retry.
-        return openai_error(
-            msg or "All accounts failed",
-            status=503,
-            err_type="upstream_error",
-            retry_after=8,
-            code="all_accounts_failed",
-        )
+    except RuntimeError:
+        return _all_accounts_failed_openai_response()
     except Exception as e:  # noqa: BLE001
         return openai_error(
             f"Proxy error: {e}",
@@ -7114,17 +7066,14 @@ async def _stream_anthropic_with_failover_inner(
             ) as resp:
                 if timing is not None:
                     timing.mark_upstream_headers()
-                if resp.status_code >= 400:
-                    err_text = (await resp.aread()).decode(
-                        "utf-8", errors="replace"
-                    )[:1500]
+                if _retryable_status(resp.status_code):
+                    detail = _upstream_http_error_summary(resp.status_code)
                     _report_upstream_failure(
-                creds.auth_key,
-                error=err_text,
-                status_code=resp.status_code,
-                model=model,
-                headers=dict(resp.headers,
-            ),
+                        creds.auth_key,
+                        error=detail,
+                        status_code=resp.status_code,
+                        model=model,
+                        headers=dict(resp.headers),
                     )
                     _record_usage_safe(
                         ok=False,
@@ -7135,32 +7084,27 @@ async def _stream_anthropic_with_failover_inner(
                         stream=True,
                         status_code=resp.status_code,
                         latency_ms=timing.latency_ms() if timing is not None else None,
-                        error=f"Upstream {resp.status_code}: {err_text}",
+                        error=detail,
                         detail={
-                            "message": f"Upstream {resp.status_code}: {err_text}",
+                            "message": detail,
                             "upstream_status": resp.status_code,
-                            "upstream_body": err_text,
+                            "kind": "upstream_http_error",
                         },
                         timing=timing,
                     )
-                    last_err = f"Upstream {resp.status_code}: {err_text}"
+                    last_err = detail
                     if _retryable_status(resp.status_code) and idx < len(
                         chain
                     ) - 1:
                         continue
                     if timing is not None:
                         timing.emit(ok=False, error=last_err)
-                    for _term_ev in anth.anthropic_stream_terminal_error(
-                        last_err, err_type="api_error"
-                    ):
+                    for _term_ev in _all_accounts_failed_anthropic_sse():
                         yield _term_ev
                     return
 
-                # Early message_start at upstream 200 so clients get first SSE bytes
-                # without waiting on model tokens (restores pre-1.9.63 TTFT feel).
-                # Trade-off: empty HTTP 200 can no longer silent-failover after the
-                # envelope opens; we emit a clean api_error terminal instead (same
-                # as v1.9.46). Success/affinity still deferred until real output.
+                # Keep the client stream uncommitted until the first model payload.
+                # This preserves safe account failover for empty HTTP 200 streams.
                 success_noted = False
                 content_seen = False
                 reasoning_seen = False
@@ -7215,9 +7159,7 @@ async def _stream_anthropic_with_failover_inner(
                         timing.mark_envelope_open(early=True)
                     return frames
 
-                # Open envelope ASAP after upstream 200 (early TTFT).
-                for ev in _open_anthropic_stream():
-                    yield ev
+                # The envelope opens with the first model payload below.
 
                 ctype = (resp.headers.get("content-type") or "").lower()
                 client_gone = False
@@ -7312,8 +7254,8 @@ async def _stream_anthropic_with_failover_inner(
                             # arrives on a subsequent empty-choices chunk.
                             finished = True
                             held_finish = finish
-                    # Empty HTTP 200: envelope already open → clean api_error
-                    # (no silent failover after early open; same as v1.9.46).
+                    # Empty HTTP 200 remains failoverable until model output commits
+                    # the client stream.
                     if (
                         not saw_model_output
                         and not assembler._saw_tool
@@ -7344,15 +7286,16 @@ async def _stream_anthropic_with_failover_inner(
                             timing=timing,
                         )
                         last_err = empty_err
+                        if client_gone:
+                            return
+                        if not stream_started and idx < len(chain) - 1:
+                            continue
                         if timing is not None:
                             timing.emit(ok=False, error=empty_err)
-                        # Envelope already open: terminal error for the client.
                         if not stream_started:
                             for ev in _open_anthropic_stream():
                                 yield ev
-                        for _term_ev in anth.anthropic_stream_terminal_error(
-                            empty_err, err_type="api_error"
-                        ):
+                        for _term_ev in _all_accounts_failed_anthropic_sse():
                             yield _term_ev
                         return
                     # Drain complete: now emit terminal events with best usage
@@ -7468,18 +7411,15 @@ async def _stream_anthropic_with_failover_inner(
                         if not stream_started:
                             for ev in _open_anthropic_stream():
                                 yield ev
-                        for _term_ev in anth.anthropic_stream_terminal_error(
-                            body_err, err_type="api_error"
-                        ):
+                        for _term_ev in _all_accounts_failed_anthropic_sse():
                             yield _term_ev
                         return
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
-                        text = raw.decode("utf-8", errors="replace")
                         empty_err = (
                             "Upstream returned HTTP 200 with non-JSON body "
-                            f"(empty/malformed): {text[:160]!r}"
+                            "(empty/malformed)"
                         )
                         _report_upstream_failure(
                             creds.auth_key,
@@ -7508,9 +7448,7 @@ async def _stream_anthropic_with_failover_inner(
                         if not stream_started:
                             for ev in _open_anthropic_stream():
                                 yield ev
-                        for _term_ev in anth.anthropic_stream_terminal_error(
-                            empty_err, err_type="api_error"
-                        ):
+                        for _term_ev in _all_accounts_failed_anthropic_sse():
                             yield _term_ev
                         return
                     else:
@@ -7715,15 +7653,11 @@ async def _stream_anthropic_with_failover_inner(
                 return
             if idx < len(chain) - 1:
                 continue
-            for _term_ev in anth.anthropic_stream_terminal_error(
-                last_err or "proxy_error", err_type="api_error"
-            ):
+            for _term_ev in _all_accounts_failed_anthropic_sse():
                 yield _term_ev
             return
 
-    for _term_ev in anth.anthropic_stream_terminal_error(
-        _sanitize_upstream_error_message(last_err or "", 503) or "All accounts failed", err_type="api_error"
-    ):
+    for _term_ev in _all_accounts_failed_anthropic_sse():
         yield _term_ev
 
 

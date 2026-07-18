@@ -11,6 +11,11 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+const (
+	defaultUpstreamRetryCount = 3
+	maxUpstreamRetryCount     = 63
+)
+
 func (c *Connector) PublicSettings(ctx context.Context) (map[string]any, error) {
 	rows, err := c.Pool.Query(ctx, "SELECT key, value FROM app_settings")
 	if err != nil {
@@ -35,6 +40,7 @@ func (c *Connector) PublicSettings(ctx context.Context) (map[string]any, error) 
 		return nil, err
 	}
 
+	retryCount := effectiveUpstreamRetryCount(values)
 	out := map[string]any{
 		"account_mode":                  stringSetting(values, "account_mode", "round_robin"),
 		"account_modes":                 []string{"round_robin", "random", "least_used"},
@@ -62,6 +68,8 @@ func (c *Connector) PublicSettings(ctx context.Context) (map[string]any, error) 
 		"model_health_auto_disable":     boolSetting(values, "model_health_auto_disable", true),
 		"probe_models":                  valueOr(values, "probe_models", []string{}),
 		"default_model":                 stringSetting(values, "default_model", ""),
+		"upstream_retry_count":          int64(retryCount),
+		"max_failover_attempts":         int64(retryCount + 1),
 		"registration_config":           mapSetting(values, "registration_config"),
 		"outbound_proxy_config":         mapSetting(values, "outbound_proxy_config"),
 		"outbound_proxy_pool":           map[string]any{"enabled": false, "count": 0, "strategy": "round_robin", "source": "none", "preview": []any{}},
@@ -272,7 +280,7 @@ func (c *Connector) UpdateRuntimeSettings(ctx context.Context, patch map[string]
 		{key: "model_health_interval_sec", kind: "float", minF: 0, maxF: 86400},
 		{key: "model_health_auto_disable", kind: "bool"},
 		{key: "default_model", kind: "string"},
-		{key: "max_failover_attempts", kind: "int", minF: 1, maxF: 64},
+		{key: "upstream_retry_count", kind: "int", minF: 0, maxF: 63},
 		{key: "cooldown_default_sec", kind: "float", minF: 1, maxF: 600},
 		{key: "cooldown_auth_sec", kind: "float", minF: 5, maxF: 1800},
 		{key: "cooldown_rate_limit_sec", kind: "float", minF: 5, maxF: 1800},
@@ -395,6 +403,62 @@ func (c *Connector) UpdateRuntimeSettings(ctx context.Context, patch map[string]
 		return nil, errors.New("没有可更新的字段")
 	}
 	return c.PublicSettings(ctx)
+}
+
+func effectiveUpstreamRetryCount(values map[string]any) int {
+	if value, ok := numericSetting(values["upstream_retry_count"]); ok {
+		return clampInt(value, 0, maxUpstreamRetryCount)
+	}
+	if value, ok := numericSetting(values["max_failover_attempts"]); ok {
+		return clampInt(value-1, 0, maxUpstreamRetryCount)
+	}
+	return defaultUpstreamRetryCount
+}
+
+func numericSetting(value any) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		return int(v), true
+	case float32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case int:
+		return v, true
+	case json.Number:
+		n, err := v.Int64()
+		return int(n), err == nil
+	default:
+		return 0, false
+	}
+}
+
+func clampInt(value, minimum, maximum int) int {
+	if value < minimum {
+		return minimum
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
+}
+
+func (c *Connector) UpstreamRetryCount(ctx context.Context) (int, error) {
+	if c == nil || c.Pool == nil {
+		return defaultUpstreamRetryCount, errors.New("postgres unavailable")
+	}
+	values := map[string]any{}
+	for _, key := range []string{"upstream_retry_count", "max_failover_attempts"} {
+		value, err := c.GetSetting(ctx, key)
+		if err == nil {
+			values[key] = value
+			continue
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return defaultUpstreamRetryCount, err
+		}
+	}
+	return effectiveUpstreamRetryCount(values), nil
 }
 
 func asFloat(value any) (float64, bool) {

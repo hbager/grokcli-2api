@@ -57,6 +57,8 @@ func (c *Connector) GetPoolCandidate(ctx context.Context, accountID string) (*po
 	return &candidate, nil
 }
 
+const poolCandidateWindow = 64
+
 func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, error) {
 	candidateCacheMu.Lock()
 	if time.Since(candidateCacheAt) < candidateCacheTTL && len(candidateCacheData) > 0 {
@@ -87,7 +89,7 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 		     OR COALESCE(a.payload->>'token', '') <> ''
 		  )
 		ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.fail_count, 0) ASC, COALESCE(ap.request_count, 0) ASC, a.id ASC
-		LIMIT 32`)
+		LIMIT $1`, poolCandidateWindow)
 	if err != nil {
 		return nil, err
 	}
