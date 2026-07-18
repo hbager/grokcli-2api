@@ -10,7 +10,7 @@
     {
       "name": "GROK2API_PORT",
       "type": "integer",
-      "default": 3000,
+      "default": 40081,
       "minimum": 1,
       "maximum": 65535,
       "scope": "startup"

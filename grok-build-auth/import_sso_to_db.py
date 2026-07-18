@@ -4,8 +4,8 @@ Read all SSO JSON files from sso_output/ and import them into the running
 Docker service's Postgres DB via the admin API.
 
 Usage:
-    python import_sso_to_db.py                  # default: localhost:3000, password from .env
-    python import_sso_to_db.py --host 127.0.0.1 --port 3000 --password change-me
+    python import_sso_to_db.py                  # default: localhost:40081, password from .env
+    python import_sso_to_db.py --host 127.0.0.1 --port 40081 --password change-me
 """
 import argparse
 import glob
@@ -132,7 +132,7 @@ def poll_job(base_url: str, token: str, job_id: str, timeout: int = 300) -> dict
 def main():
     parser = argparse.ArgumentParser(description="Import SSO accounts to Docker DB")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=3000)
+    parser.add_argument("--port", type=int, default=40081)
     parser.add_argument("--password", default=None, help="Admin password (default: from .env)")
     parser.add_argument("--sso-dir", default=str(SSO_DIR), help="SSO output directory")
     args = parser.parse_args()

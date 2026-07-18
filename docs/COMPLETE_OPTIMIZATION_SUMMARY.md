@@ -112,7 +112,7 @@ go build -o grok2api ./cmd/grok2api
 ./grok2api
 
 # 检查数据库状态
-curl http://localhost:3000/admin/api/status | jq '.store'
+curl http://localhost:40081/admin/api/status | jq '.store'
 
 # 预期输出:
 {
@@ -132,14 +132,14 @@ curl http://localhost:3000/admin/api/status | jq '.store'
 ```
 
 ### 3. 前端验证
-访问 `http://localhost:3000/admin` 应该看到：
+访问 `http://localhost:40081/admin` 应该看到：
 - ✅ **PostgreSQL**: 已连接 · backend=hybrid
 - ✅ **Redis**: 已连接 · workers=1
 
 ### 4. 性能测试
 ```bash
 # 压测工具
-wrk -t12 -c400 -d30s http://localhost:3000/v1/chat/completions
+wrk -t12 -c400 -d30s http://localhost:40081/v1/chat/completions
 
 # 监控 503 错误率
 watch -n 1 'grep "503" logs/access.log | wc -l'

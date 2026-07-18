@@ -46,7 +46,6 @@ services:
       # Only the app API is published. Postgres/Redis stay internal-only
       # (compose network). Inline Turnstile Solver listens on container
       # loopback 127.0.0.1:5072 and is NOT published to the host.
-      - "3000:40081"
       - "40081:40081"
     shm_size: "1gb"
     security_opt:
@@ -91,7 +90,7 @@ services:
       PYTHONPATH: "/app:/app/grok-build-auth"
     healthcheck:
       # $$ keeps substitution inside the container so override ports (e.g. 40081) work
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${GROK2API_PORT:-3000}/health >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${GROK2API_PORT:-40081}/health >/dev/null"]
       interval: 10s
       timeout: 3s
       retries: 12

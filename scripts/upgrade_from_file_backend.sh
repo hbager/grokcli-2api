@@ -97,6 +97,6 @@ echo
 echo "Next steps:"
 echo "  1) Ensure .env has GROK2API_STORE_BACKEND=hybrid and REDIS_URL / DATABASE_URL"
 echo "  2) docker compose up -d"
-echo "  3) curl -fsS http://127.0.0.1:3000/health"
+echo "  3) curl -fsS http://127.0.0.1:40081/health"
 echo "  4) Re-login admin UI (sessions are not migrated)"
 echo "See docs/UPGRADE.md for details."

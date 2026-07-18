@@ -672,11 +672,11 @@ def test_cors_origin_config_rejects_non_origins() -> None:
 
     with patch.dict(
         os.environ,
-        {"GROK2API_CORS_ORIGINS": "https://admin.example,http://localhost:3000/,http://[::1]"},
+        {"GROK2API_CORS_ORIGINS": "https://admin.example,http://localhost:40081/,http://[::1]"},
     ):
         assert config._cors_origins() == [
             "https://admin.example",
-            "http://localhost:3000",
+            "http://localhost:40081",
             "http://[::1]",
         ]
 

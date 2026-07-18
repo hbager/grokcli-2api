@@ -94,10 +94,10 @@ cp .env.example .env
 # 编辑 .env：至少改 GROK2API_ADMIN_PASSWORD；生产请改 Postgres 密码
 
 docker compose up -d --build
-curl -fsS http://127.0.0.1:3000/health
+curl -fsS http://127.0.0.1:40081/health
 ```
 
-浏览器打开：`http://127.0.0.1:3000/admin`
+浏览器打开：`http://127.0.0.1:40081/admin`
 
 #### 启动时指定打码线程数
 
@@ -129,12 +129,12 @@ TURNSTILE_THREAD=3 GROK2API_REG_CONCURRENCY=3 docker compose up -d --build
 
 > 2 核小机器建议 `TURNSTILE_THREAD=1~2`；`3` 已较重，`5` 容易把 CPU/内存打满。
 
-**默认只映射应用端口 `3000`（内联部署）。**
+**默认只映射应用端口 `40081`（内联部署）。**
 栈内 **PostgreSQL / Redis / 本地过盾** 都不绑定宿主机端口：
 
 | 服务 | 容器内地址 | 是否映射到宿主机 |
 |------|------------|------------------|
-| app | `0.0.0.0:3000` | 是 → `127.0.0.1:3000` |
+| app | `0.0.0.0:40081` | 是 → `127.0.0.1:40081` |
 | postgres | `postgres:5432` | **否**（compose 内网） |
 | redis | `redis:6379` | **否**（compose 内网） |
 | 本地过盾 | `127.0.0.1:5072` | **否**（主容器 loopback 内联） |
@@ -205,11 +205,11 @@ services:
     image: ghcr.io/hm2899/grokcli-2api:1.9.91
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
-      - "3000:3000"
+      - "40081:40081"
     environment:
       TZ: Asia/Shanghai
       GROK2API_HOST: "0.0.0.0"
-      GROK2API_PORT: "3000"
+      GROK2API_PORT: "40081"
       GROK2API_ADMIN_PASSWORD: "change-me"
       GROK2API_STORE_BACKEND: "hybrid"
       GROK2API_REQUIRE_SHARED_STORES: "1"
@@ -354,7 +354,7 @@ docker compose run --rm \
 ### OpenAI 兼容
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:3000/v1
+export OPENAI_BASE_URL=http://127.0.0.1:40081/v1
 export OPENAI_API_KEY=你的管理台API_Key
 
 curl "$OPENAI_BASE_URL/chat/completions" \
@@ -366,7 +366,7 @@ curl "$OPENAI_BASE_URL/chat/completions" \
 ### Anthropic 兼容
 
 ```bash
-curl http://127.0.0.1:3000/v1/messages \
+curl http://127.0.0.1:40081/v1/messages \
   -H "x-api-key: 你的管理台API_Key" \
   -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
@@ -432,9 +432,9 @@ API：
 ## 运维
 
 ```bash
-curl -fsS http://127.0.0.1:3000/health
+curl -fsS http://127.0.0.1:40081/health
 curl -fsS -H "Authorization: Bearer $GROK2API_CLIENT_KEY" \
-  http://127.0.0.1:3000/metrics | head
+  http://127.0.0.1:40081/metrics | head
 docker compose logs -f grokcli-2api
 # 时区
 docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'

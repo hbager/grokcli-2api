@@ -11,7 +11,7 @@ WorkingDirectory=/opt/grokcli-2api
 # cp /opt/grokcli-2api/.env.example /opt/grokcli-2api/.env  then edit
 EnvironmentFile=-/opt/grokcli-2api/.env
 Environment=GROK2API_HOST=0.0.0.0
-Environment=GROK2API_PORT=3000
+Environment=GROK2API_PORT=40081
 Environment=GROK2API_OPEN_BROWSER=0
 Environment=GROK2API_ACCOUNT_MODE=round_robin
 Environment=GROK2API_TOKEN_MAINTAIN=1

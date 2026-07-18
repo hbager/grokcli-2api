@@ -16,7 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TZ=Asia/Shanghai \
     GROK2API_HOST=0.0.0.0 \
-    GROK2API_PORT=3000 \
+    GROK2API_PORT=40081 \
     GROK2API_OPEN_BROWSER=0 \
     GROK2API_STORE_BACKEND=hybrid \
     GROK2API_RUNTIME=python \
@@ -109,7 +109,7 @@ RUN chmod +x /app/entrypoint.sh /app/bin/grok2api /app/bin/grok2api-migrate \
     && test -x /app/bin/grok2api-migrate \
     && python -c "import app; import grok2api.app as pkg_app; from grok2api.upstream import grok_build_adapter; import scripts.registration_service as regsvc; print('build-check', pkg_app.APP_VERSION, grok_build_adapter.ADAPTER_BUILD, app.APP_VERSION, 'reg-sidecar-ok')"
 
-EXPOSE 3000 5072
+EXPOSE 40081 5072
 
 # data/ only for optional JSON import artifacts / models cache
 VOLUME ["/app/data"]

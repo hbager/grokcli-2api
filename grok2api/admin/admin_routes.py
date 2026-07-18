@@ -598,7 +598,7 @@ def _public_api_base(request: Request | None = None) -> str:
 
     # Fallback only when no request context (startup / offline tools).
     host = str(getattr(_config, "HOST", "") or "")
-    port = int(getattr(_config, "PORT", 3000) or 3000)
+    port = int(getattr(_config, "PORT", 40081) or 40081)
     if _is_loopback_host(host) or host in ("0.0.0.0", "::"):
         display = "127.0.0.1"
     else:

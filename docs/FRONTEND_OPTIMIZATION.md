@@ -174,7 +174,7 @@ self.addEventListener('install', (event) => {
 # 启动服务
 ./grok2api
 
-# 访问 http://localhost:3000/admin
+# 访问 http://localhost:40081/admin
 # 应该看到：
 # ✅ PostgreSQL: 已连接 · backend=hybrid
 # ✅ Redis: 已连接 · workers=1

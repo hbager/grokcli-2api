@@ -59,7 +59,7 @@ GROK2API_GO_MAINTAINER=0
 ```bash
 GROK2API_RUNTIME=go
 GROK2API_HOST=0.0.0.0
-GROK2API_PORT=3000
+GROK2API_PORT=40081
 GROK2API_STORE_BACKEND=hybrid
 GROK2API_REQUIRE_SHARED_STORES=1
 GROK2API_REQUIRE_MIGRATIONS=1
@@ -108,8 +108,8 @@ ExecStart=/opt/grokcli-2api/bin/grok2api
 ### Process probes
 
 ```bash
-curl -fsS http://127.0.0.1:3000/live
-curl -fsS http://127.0.0.1:3000/ready
+curl -fsS http://127.0.0.1:40081/live
+curl -fsS http://127.0.0.1:40081/ready
 # ready must be 200 only when PG/migrations/redis checks pass
 ```
 
@@ -118,13 +118,13 @@ curl -fsS http://127.0.0.1:3000/ready
 ### Models (if public_read enabled)
 
 ```bash
-curl -fsS -H "Authorization: Bearer $API_KEY" http://127.0.0.1:3000/v1/models
+curl -fsS -H "Authorization: Bearer $API_KEY" http://127.0.0.1:40081/v1/models
 ```
 
 ### count_tokens
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:3000/v1/messages/count_tokens \
+curl -fsS -X POST http://127.0.0.1:40081/v1/messages/count_tokens \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"system":"hi","messages":[{"role":"user","content":"hello"}]}'
@@ -133,7 +133,7 @@ curl -fsS -X POST http://127.0.0.1:3000/v1/messages/count_tokens \
 ### Non-stream messages
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:3000/v1/messages \
+curl -fsS -X POST http://127.0.0.1:40081/v1/messages \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
@@ -156,7 +156,7 @@ Expect:
 ### Stream messages
 
 ```bash
-curl -N -X POST http://127.0.0.1:3000/v1/messages \
+curl -N -X POST http://127.0.0.1:40081/v1/messages \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{

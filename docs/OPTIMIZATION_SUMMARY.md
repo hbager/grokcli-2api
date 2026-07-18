@@ -64,13 +64,13 @@ go build -o grok2api ./cmd/grok2api
 ./grok2api
 
 # 测试 OpenAI 协议
-curl -X POST http://localhost:3000/v1/chat/completions \
+curl -X POST http://localhost:40081/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_KEY" \
   -d '{"model":"grok-4.5","messages":[{"role":"user","content":"hi"}]}'
 
 # 测试 Anthropic 协议
-curl -X POST http://localhost:3000/v1/messages \
+curl -X POST http://localhost:40081/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: YOUR_KEY" \
   -H "anthropic-version: 2023-06-01" \

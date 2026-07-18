@@ -138,7 +138,7 @@ go build -o grok2api ./cmd/grok2api
 ./grok2api
 
 # 3. 压测 (可选)
-wrk -t12 -c400 -d30s --latency http://localhost:3000/v1/chat/completions
+wrk -t12 -c400 -d30s --latency http://localhost:40081/v1/chat/completions
 
 # 4. 监控日志
 tail -f logs/app.log | grep -E "(503|timeout|retry)"

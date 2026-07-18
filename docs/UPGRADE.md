@@ -67,7 +67,7 @@ python scripts/migrate_json_to_pg.py --data-dir ./data --merge-pool
 
 ```bash
 docker compose up -d
-curl -fsS http://127.0.0.1:3000/health
+curl -fsS http://127.0.0.1:40081/health
 ```
 
 ### 5. 验证
@@ -107,7 +107,7 @@ docker compose pull   # 若用 GHCR
 # 或
 docker compose build
 docker compose up -d
-curl -fsS http://127.0.0.1:3000/health
+curl -fsS http://127.0.0.1:40081/health
 ```
 
 ---
@@ -154,6 +154,6 @@ python scripts/migrate_json_to_pg.py --data-dir ./data --skip-keys --merge-pool
 python migrate_json_to_pg.py --data-dir ./data --dry-run
 
 # 健康与存储
-curl -s http://127.0.0.1:3000/health | jq .
-curl -s http://127.0.0.1:3000/metrics | head
+curl -s http://127.0.0.1:40081/health | jq .
+curl -s http://127.0.0.1:40081/metrics | head
 ```

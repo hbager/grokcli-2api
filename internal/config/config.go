@@ -10,7 +10,7 @@ import (
 
 const (
 	defaultHost           = "0.0.0.0"
-	defaultPort           = 3000
+	defaultPort           = 40081
 	defaultModel          = "grok-4.5"
 	defaultUpstream       = "https://cli-chat-proxy.grok.com/v1"
 	defaultRedisURL       = "redis://127.0.0.1:6379/0"

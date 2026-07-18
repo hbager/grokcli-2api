@@ -44,7 +44,7 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Address() != "0.0.0.0:3000" {
+	if cfg.Address() != "0.0.0.0:40081" {
 		t.Fatalf("unexpected address %q", cfg.Address())
 	}
 	if cfg.DefaultModel != "grok-4.5" {
@@ -83,7 +83,7 @@ func TestLoadAliasesAndOverrides(t *testing.T) {
 	t.Setenv("REDIS_URL", "redis://redis:6379/1")
 	t.Setenv("GROK2API_REDIS_URL", "redis://preferred:6379/2")
 	t.Setenv("DATABASE_URL", "postgresql://db/fallback")
-	t.Setenv("GROK2API_PORT", "40081")
+	t.Setenv("GROK2API_PORT", "41000")
 	t.Setenv("GROK2API_SSE_KEEPALIVE", "0.08")
 	t.Setenv("GROK2API_REQUIRE_SHARED_STORES", "off")
 	t.Setenv("GROK2API_REQUIRE_MIGRATIONS", "false")
@@ -103,7 +103,7 @@ func TestLoadAliasesAndOverrides(t *testing.T) {
 	if cfg.DatabaseURL != "postgresql://db/fallback" {
 		t.Fatalf("unexpected database URL %q", cfg.DatabaseURL)
 	}
-	if cfg.Port != 40081 || cfg.SSEKeepalive != 80*time.Millisecond {
+	if cfg.Port != 41000 || cfg.SSEKeepalive != 80*time.Millisecond {
 		t.Fatalf("unexpected parsed values: port=%d keepalive=%s", cfg.Port, cfg.SSEKeepalive)
 	}
 	if cfg.RequireSharedStores || cfg.RequireMigrations {

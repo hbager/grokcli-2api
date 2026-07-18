@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 # Local server
 HOST = os.getenv("GROK2API_HOST", "0.0.0.0")
-PORT = int(os.getenv("GROK2API_PORT", "3000"))
+PORT = int(os.getenv("GROK2API_PORT", "40081"))
 
 
 def _default_workers() -> int:

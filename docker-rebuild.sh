@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 
 APP_SERVICE="${GROKCLI_APP_SERVICE:-grokcli-2api}"
 # Default health port matches docker-compose.yml (override via env / compose override)
-HEALTH_PORT="${GROKCLI_HEALTH_PORT:-3000}"
+HEALTH_PORT="${GROKCLI_HEALTH_PORT:-40081}"
 HEALTH_URL="${GROKCLI_HEALTH_URL:-http://127.0.0.1:${HEALTH_PORT}/health}"
 
 echo "== git =="
