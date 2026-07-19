@@ -71,9 +71,22 @@ func Apply(body map[string]any) map[string]any {
 		return map[string]any{"enabled": false, "applied": false}
 	}
 	opts := DefaultOptions()
+	// Fast path: default OFF and no auto threshold → skip clone + full JSON size scan.
+	// This is critical for Codex multi-turn TTFT with large tool transcripts.
+	if !opts.Enabled && AutoChars() <= 0 {
+		stats := map[string]any{"enabled": false, "applied": false}
+		body["_history_compact"] = stats
+		return stats
+	}
 	force := ShouldAutoCompact(body)
 	if force {
 		opts.Enabled = true
+	}
+	// Still disabled after auto check: avoid heavy clone/marshal.
+	if !opts.Enabled {
+		stats := map[string]any{"enabled": false, "applied": false}
+		body["_history_compact"] = stats
+		return stats
 	}
 	messages := normalizeMessages(body["messages"])
 	compacted, stats := CompactMessages(messages, opts)
@@ -85,6 +98,8 @@ func Apply(body map[string]any) map[string]any {
 	return stats
 }
 
+// CompactMessages shrinks tool-loop history when opts.Enabled.
+// Callers should avoid invoking this on the disabled fast path (see Apply).
 func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 	stats := map[string]any{
 		"enabled": false, "applied": false,
@@ -94,6 +109,11 @@ func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 		"policy": "soft-tier",
 	}
 	if len(messages) == 0 {
+		return messages, stats
+	}
+	if !opts.Enabled {
+		// Disabled: return original slice, no clone / no full JSON marshal.
+		stats["enabled"] = false
 		return messages, stats
 	}
 	keep := max(1, opts.KeepToolRounds)
@@ -118,10 +138,6 @@ func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 	stats["prefix_stable"] = stable
 	stats["keep_tool_rounds"] = keep
 	stats["mid_tool_rounds"] = midN
-	if !opts.Enabled {
-		stats["after_chars"] = before
-		return out, stats
-	}
 
 	spans := toolRoundSpans(out)
 	stats["tool_rounds"] = len(spans)
@@ -621,8 +637,26 @@ func IsOpenAINativeClient(userAgent string) bool {
 			return false
 		}
 	}
+	// Codex / OpenAI agent UAs. Keep broad for tool-policy (multi-tool, zero gap).
 	for _, marker := range []string{
 		"codex", "openai/python", "openai-python", "openai/", "chatgpt", "gpt-agent", "responses-sdk",
+	} {
+		if strings.Contains(ua, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsCodexClient is narrower than IsOpenAINativeClient. Used for TTFT clamps that
+// must not affect sub2api / new-api OpenAI SDK relays.
+func IsCodexClient(userAgent string) bool {
+	ua := strings.ToLower(strings.TrimSpace(userAgent))
+	if ua == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"codex", "codex-cli", "codex-tui", "gpt-agent",
 	} {
 		if strings.Contains(ua, marker) {
 			return true

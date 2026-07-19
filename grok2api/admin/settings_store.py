@@ -94,7 +94,6 @@ _PG_SCALAR_KEYS = (
     "probe_fail_kick_streak",
     "probe_fail_disable_streak",
     "probe_kick_cooldown_sec",
-    "upstream_retry_count",
     "max_failover_attempts",
     # Protocol registration (MoeMail / YesCaptcha / proxy) — admin UI config
     "registration_config",
@@ -1167,12 +1166,7 @@ def set_reasoning_compat(mode: str) -> str:
 def get_outbound_max_tools() -> int:
     raw = _get_setting_value("outbound_max_tools", None)
     if raw is None:
-        try:
-            import grok2api.protocol.history_compact as hc
-
-            return int(getattr(hc, "OUTBOUND_MAX_TOOLS", 1) or 0)
-        except Exception:
-            return 1
+        return 1
     try:
         v = int(raw)
     except (TypeError, ValueError):
@@ -1187,12 +1181,6 @@ def set_outbound_max_tools(value: int | str) -> int:
         raise ValueError("outbound_max_tools 必须是整数 0–64") from e
     v = max(0, min(64, v))
     _set_setting_value("outbound_max_tools", v)
-    try:
-        import grok2api.protocol.history_compact as hc
-
-        hc.OUTBOUND_MAX_TOOLS = v
-    except Exception:
-        pass
     return v
 
 
@@ -1200,12 +1188,7 @@ def get_outbound_max_tools_openai() -> int:
     """Per-turn tool cap for OpenAI chat/completions (0 = unlimited)."""
     raw = _get_setting_value("outbound_max_tools_openai", None)
     if raw is None:
-        try:
-            import grok2api.protocol.history_compact as hc
-
-            return int(getattr(hc, "OUTBOUND_MAX_TOOLS_OPENAI", 0) or 0)
-        except Exception:
-            return 0
+        return 0
     try:
         v = int(raw)
     except (TypeError, ValueError):
@@ -1220,24 +1203,13 @@ def set_outbound_max_tools_openai(value: int | str) -> int:
         raise ValueError("outbound_max_tools_openai 必须是整数 0–64") from e
     v = max(0, min(64, v))
     _set_setting_value("outbound_max_tools_openai", v)
-    try:
-        import grok2api.protocol.history_compact as hc
-
-        hc.OUTBOUND_MAX_TOOLS_OPENAI = v
-    except Exception:
-        pass
     return v
 
 
 def get_outbound_tool_gap_sec() -> float:
     raw = _get_setting_value("outbound_tool_gap_sec", None)
     if raw is None:
-        try:
-            import grok2api.protocol.history_compact as hc
-
-            return float(getattr(hc, "OUTBOUND_TOOL_GAP_SEC", 0.08) or 0.0)
-        except Exception:
-            return 0.08
+        return 0.08
     try:
         v = float(raw)
     except (TypeError, ValueError):
@@ -1252,36 +1224,19 @@ def set_outbound_tool_gap_sec(value: float | str) -> float:
         raise ValueError("outbound_tool_gap_sec 必须是数字 0–2") from e
     v = max(0.0, min(2.0, v))
     _set_setting_value("outbound_tool_gap_sec", v)
-    try:
-        import grok2api.protocol.history_compact as hc
-
-        hc.OUTBOUND_TOOL_GAP_SEC = v
-    except Exception:
-        pass
     return v
 
 
 def get_history_compact_enabled() -> bool:
     raw = _get_setting_value("history_compact_enabled", None)
     if raw is None:
-        try:
-            import grok2api.protocol.history_compact as hc
-
-            return bool(getattr(hc, "HISTORY_COMPACT_ENABLED", False))
-        except Exception:
-            return False
+        return False
     return bool(raw)
 
 
 def set_history_compact_enabled(enabled: bool) -> bool:
     val = bool(enabled)
     _set_setting_value("history_compact_enabled", val)
-    try:
-        import grok2api.protocol.history_compact as hc
-
-        hc.HISTORY_COMPACT_ENABLED = val
-    except Exception:
-        pass
     return val
 
 
@@ -1289,12 +1244,7 @@ def get_history_compact_auto_chars() -> int:
     """0 disables auto threshold; otherwise chars of messages JSON that trigger compact."""
     raw = _get_setting_value("history_compact_auto_chars", None)
     if raw is None:
-        try:
-            import grok2api.protocol.history_compact as hc
-
-            return int(getattr(hc, "HISTORY_COMPACT_AUTO_CHARS", 0) or 0)
-        except Exception:
-            return 0  # IQ-first: no auto-force
+        return 0  # IQ-first: no auto-force
     try:
         v = int(raw)
     except (TypeError, ValueError):
@@ -1315,12 +1265,6 @@ def set_history_compact_auto_chars(value: int | str) -> int:
     else:
         v = max(4_000, min(5_000_000, v))
     _set_setting_value("history_compact_auto_chars", v)
-    try:
-        import grok2api.protocol.history_compact as hc
-
-        hc.HISTORY_COMPACT_AUTO_CHARS = v
-    except Exception:
-        pass
     return v
 
 
@@ -1330,12 +1274,7 @@ def get_history_keep_tool_rounds() -> int:
         # Accept legacy key from earlier UI draft
         raw = _get_setting_value("history_keep_recent_turns", None)
     if raw is None:
-        try:
-            import grok2api.protocol.history_compact as hc
-
-            return int(getattr(hc, "HISTORY_KEEP_TOOL_ROUNDS", 32) or 32)
-        except Exception:
-            return 32
+        return 32
     try:
         v = int(raw)
     except (TypeError, ValueError):
@@ -1350,12 +1289,6 @@ def set_history_keep_tool_rounds(value: int | str) -> int:
         raise ValueError("history_keep_tool_rounds 必须是整数 1–64") from e
     v = max(1, min(64, v))
     _set_setting_value("history_keep_tool_rounds", v)
-    try:
-        import grok2api.protocol.history_compact as hc
-
-        hc.HISTORY_KEEP_TOOL_ROUNDS = v
-    except Exception:
-        pass
     return v
 
 
@@ -1373,12 +1306,7 @@ def get_history_max_tool_result_chars() -> int:
     if raw is None:
         raw = _get_setting_value("history_tool_result_max_chars", None)
     if raw is None:
-        try:
-            import grok2api.protocol.history_compact as hc
-
-            return int(getattr(hc, "HISTORY_MAX_TOOL_RESULT_CHARS", 48_000) or 48_000)
-        except Exception:
-            return 48_000
+        return 48_000
     try:
         v = int(raw)
     except (TypeError, ValueError):
@@ -1393,12 +1321,6 @@ def set_history_max_tool_result_chars(value: int | str) -> int:
         raise ValueError("history_max_tool_result_chars 必须是整数 512–2000000") from e
     v = max(512, min(2_000_000, v))
     _set_setting_value("history_max_tool_result_chars", v)
-    try:
-        import grok2api.protocol.history_compact as hc
-
-        hc.HISTORY_MAX_TOOL_RESULT_CHARS = v
-    except Exception:
-        pass
     return v
 
 
@@ -2952,7 +2874,6 @@ def get_pool_policy() -> dict[str, Any]:
             "probe_fail_kick_streak": int(cd.get("probe_fail_kick_streak") or 2),
             "probe_fail_disable_streak": int(cd.get("probe_fail_disable_streak") or 4),
             "probe_kick_cooldown_sec": cd.get("probe_kick_cooldown_sec", 600.0),
-            "upstream_retry_count": ap.upstream_retry_count(),
             "max_failover_attempts": ap.max_failover_attempts(),
         }
     except Exception:
@@ -2967,7 +2888,6 @@ def get_pool_policy() -> dict[str, Any]:
             "probe_fail_kick_streak": 2,
             "probe_fail_disable_streak": 4,
             "probe_kick_cooldown_sec": 600,
-            "upstream_retry_count": 3,
             "max_failover_attempts": 4,
         }
 
@@ -2986,7 +2906,7 @@ def set_pool_policy(patch: dict[str, Any]) -> dict[str, Any]:
         "probe_fail_kick_streak": (1.0, 20.0),
         "probe_fail_disable_streak": (2.0, 50.0),
         "probe_kick_cooldown_sec": (30.0, 7200.0),
-        "upstream_retry_count": (0.0, 63.0),
+        "max_failover_attempts": (1.0, 64.0),
     }
     for key, (lo, hi) in mapping.items():
         if key not in patch or patch[key] is None:
@@ -2997,18 +2917,11 @@ def set_pool_policy(patch: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{key} 必须是数字") from e
         val = max(lo, min(hi, val))
         if key in (
-            "upstream_retry_count",
+            "max_failover_attempts",
             "probe_fail_kick_streak",
             "probe_fail_disable_streak",
         ):
             _set_setting_value(key, int(val))
-            if key == "upstream_retry_count":
-                try:
-                    import grok2api.pool.account_pool as ap
-
-                    ap._policy_cache.pop("upstream_retry_count_effective", None)
-                except Exception:
-                    pass
         else:
             _set_setting_value(key, float(val))
     return get_pool_policy()
@@ -3243,13 +3156,7 @@ def apply_outbound_proxy_config_to_runtime(
         invalidate_outbound_proxy_cache()
     except Exception:
         pass
-    try:
-        import app as _app
-
-        if hasattr(_app, "invalidate_http_clients"):
-            _app.invalidate_http_clients()
-    except Exception:
-        pass
+    # Python public app removed; Go owns HTTP clients.
     try:
         import grok2api.pool.model_health as _mh
 
@@ -3340,7 +3247,7 @@ def update_runtime_settings(patch: dict[str, Any]) -> dict[str, Any]:
         "probe_fail_kick_streak",
         "probe_fail_disable_streak",
         "probe_kick_cooldown_sec",
-        "upstream_retry_count",
+        "max_failover_attempts",
     )
     pool_patch: dict[str, Any] = {}
     nested = patch.get("pool_policy")

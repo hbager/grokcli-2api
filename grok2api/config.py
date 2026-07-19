@@ -199,7 +199,7 @@ TOKEN_REFRESH_WORKERS = _env_int("GROK2API_TOKEN_REFRESH_WORKERS", 4, maximum=32
 MODEL_PROBE_WORKERS = _env_int("GROK2API_MODEL_PROBE_WORKERS", 4, maximum=32)
 QUOTA_WORKERS = _env_int("GROK2API_QUOTA_WORKERS", 6, maximum=32)
 # SSO cookie → token is network-bound device flow; 8–16 works well on hybrid stacks.
-SSO_IMPORT_WORKERS = _env_int("GROK2API_SSO_IMPORT_WORKERS", 12, maximum=32)
+SSO_IMPORT_WORKERS = _env_int("GROK2API_SSO_IMPORT_WORKERS", 6, maximum=12)
 # Startup stagger: first background cycle waits longer with large pools
 TOKEN_MAINTAIN_STARTUP_DELAY = _env_float(
     "GROK2API_TOKEN_MAINTAIN_STARTUP_DELAY", 20.0, minimum=5.0
@@ -375,7 +375,7 @@ REQUIRE_SHARED_STORES = os.getenv("GROK2API_REQUIRE_SHARED_STORES", "1").lower()
 # ── History compaction (Claude Code / long tool loops via sub2api) ──
 # Shrink past tool results before upstream so multi-round agent sessions
 # do not blow past body size / context and surface as client API errors.
-# Implemented in history_compact.py; env knobs live there too (imported below).
+# History compact now lives in Go; these env knobs remain for registration-side settings compatibility.
 
 # Map common aliases -> real model ids (OpenAI + Anthropic client defaults)
 MODEL_ALIASES: dict[str, str] = {

@@ -326,6 +326,16 @@ def resolve_proxy_for_request(
         password=proxy_password,
         fallback_env=fallback_env,
     )
+    if not pool and fallback_env:
+        # Prefer admin outbound / auto-discovered peer proxies.
+        try:
+            src = get_outbound_proxy_source() or {}
+            if src.get("enabled", True):
+                pool = list(src.get("pool") or [])
+                if not strategy:
+                    strategy = src.get("proxy_strategy") or strategy
+        except Exception:
+            pool = []
     if not pool:
         return None
     strat = strategy
@@ -446,6 +456,74 @@ def curl_proxies_arg(proxy_url: str | None) -> dict[str, str] | None:
 # ── Outbound (account pool) proxy selection ─────────────────────────────────
 
 
+
+
+def _auto_proxy_candidates() -> list[str]:
+    """Best-effort proxies reachable from dockerized app.
+
+    Order:
+      1) env GROK2API_AUTO_PROXY / HTTP(S)_PROXY
+      2) compose-peer service names (privoxy/warp-proxy)
+      3) host-gateway common ports (when extra_hosts host.docker.internal is set)
+    """
+    out: list[str] = []
+    for key in (
+        "GROK2API_AUTO_PROXY",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        v = (os.getenv(key) or "").strip()
+        if v:
+            out.append(v)
+    # Peer containers on shared docker networks.
+    out.extend(
+        [
+            "http://privoxy:8118",
+            "http://warp-proxy:1080",
+            "socks5://warp-proxy:1080",
+            "http://host.docker.internal:40080",
+            "http://host.docker.internal:7890",
+            "http://host.docker.internal:8118",
+        ]
+    )
+    # de-dupe preserve order
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for u in out:
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
+def first_working_proxy(candidates: list[str] | None = None, *, timeout: float = 1.2) -> str | None:
+    """Return first candidate that accepts TCP connect (not full HTTP check)."""
+    import socket
+    from urllib.parse import urlparse
+
+    for raw in candidates or _auto_proxy_candidates():
+        try:
+            url = canonicalize_proxy_line(raw)
+        except Exception:
+            url = (raw or "").strip()
+        if not url:
+            continue
+        try:
+            p = urlparse(url if "://" in url else ("http://" + url))
+            host = p.hostname
+            port = p.port or (1080 if (p.scheme or "").startswith("socks") else 8080)
+            if not host:
+                continue
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return url
+        except Exception:
+            continue
+    return None
+
 def get_outbound_proxy_source() -> dict[str, Any]:
     """Load effective outbound proxy pool text/auth/strategy.
 
@@ -474,12 +552,12 @@ def get_outbound_proxy_source() -> dict[str, Any]:
             strategy = normalize_proxy_strategy(
                 str(cfg.get("proxy_strategy") or "round_robin")
             )
-            if text:
+            if text or not enabled:
                 source = "settings"
     except Exception:
         pass
 
-    if not text:
+    if enabled and not text:
         env_text = _env_proxy_text()
         if env_text:
             text = env_text
@@ -492,7 +570,7 @@ def get_outbound_proxy_source() -> dict[str, Any]:
             )
             source = "env"
 
-    if not text:
+    if enabled and not text:
         try:
             from grok2api.admin.settings_store import get_registration_config
 
@@ -541,7 +619,20 @@ def get_outbound_proxy_source() -> dict[str, Any]:
             "proxy_strategy": strategy,
             "source": source if pool else "none",
             "pool": pool,
+            "text": text,
         }
+    if enabled and not out.get("pool"):
+        # Auto-discover reachable local/peer proxies so registration/SSO
+        # don't silently go direct when UI pool text is empty.
+        auto = first_working_proxy()
+        if auto:
+            out["text"] = auto
+            out["proxy"] = auto
+            out["pool"] = [auto]
+            out["source"] = "auto"
+            out["enabled"] = True
+            # Re-key cache so empty settings don't stick forever without auto.
+            cache_key = (True, "auto", auto, user, password, strategy)
     with _lock:
         _outbound_proxy_cache_key = cache_key
         _outbound_proxy_cache_value = _copy_outbound_proxy_source(out)

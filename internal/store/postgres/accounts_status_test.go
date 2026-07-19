@@ -49,8 +49,11 @@ func TestActiveBlockedModelsExpires(t *testing.T) {
 
 func TestBuildAccountListWhereStatus(t *testing.T) {
 	where, args := buildAccountListWhere("", "cooldown", nil)
-	if where == "" || !containsFold(where, "cooldown") {
+	if where == "" || !containsFold(where, "cooldown_until") {
 		t.Fatalf("cooldown where=%q args=%v", where, args)
+	}
+	if containsFold(where, "cooldown_count") {
+		t.Fatalf("cooldown filter must not use cooldown_count: %q", where)
 	}
 	where, args = buildAccountListWhere("foo", "disabled", nil)
 	if len(args) != 3 {

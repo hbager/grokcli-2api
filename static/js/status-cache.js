@@ -4,7 +4,7 @@ window.G2A = window.G2A || {};
   "use strict";
 
   const STATUS_CACHE_KEY = "g2a_status_cache";
-  const STATUS_CACHE_TTL = 30000; // 30 seconds
+  const STATUS_CACHE_TTL = 8000; // 8 seconds — keep pool/maintainer chips hot
 
   let cachedStatus = null;
   let cacheTimestamp = 0;

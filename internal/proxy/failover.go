@@ -10,25 +10,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 )
 
-var (
-	ErrCommitted         = errors.New("response already committed")
-	ErrAllAccountsFailed = errors.New("all upstream accounts failed")
-)
-
-type AllAccountsFailedError struct {
-	Attempts int
-	Last     error
-}
-
-func (e *AllAccountsFailedError) Error() string {
-	return fmt.Sprintf("all %d available upstream account attempts failed", e.Attempts)
-}
-
-func (e *AllAccountsFailedError) Is(target error) bool {
-	return target == ErrAllAccountsFailed
-}
-
-func (e *AllAccountsFailedError) Unwrap() error { return e.Last }
+var ErrCommitted = errors.New("response already committed")
 
 type CommitState struct {
 	mu        sync.Mutex

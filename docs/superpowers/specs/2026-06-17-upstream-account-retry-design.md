@@ -1,7 +1,9 @@
 # 上游錯誤自動換號重試設計
 
 日期：2026-06-17
-狀態：已核准
+狀態：已被 v2.0.1 取代
+
+> 本文件只保留歷史決策脈絡，不是現行實作規格。現行 Go-only public runtime 使用 `max_failover_attempts`（總嘗試數 1–64）；不得實作本文的 `upstream_retry_count` 或 Python public API 路徑。
 
 ## 目標
 

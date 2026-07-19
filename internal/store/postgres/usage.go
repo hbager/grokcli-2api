@@ -593,13 +593,26 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 		if scanErr := rows.Scan(&id, &createdAt, &apiKeyID, &accountID, &model, &protocol, &path, &stream, &okValue, &prompt, &completion, &totalTok, &cacheRead, &cacheCreate, &reasoning, &clientIP, &userAgent, &statusCode, &latency, &ttft, &errText, &detail, &keyName, &keyPrefix, &accountEmail); scanErr != nil {
 			return nil, scanErr
 		}
+		detailMap := decodeMap(detail)
+		reasoningEffort := ""
+		if detailMap != nil {
+			if v, ok := detailMap["reasoning_effort"].(string); ok {
+				reasoningEffort = strings.TrimSpace(v)
+			}
+			if reasoningEffort == "" {
+				if v, ok := detailMap["thinking_intensity"].(string); ok {
+					reasoningEffort = strings.TrimSpace(v)
+				}
+			}
+		}
 		items = append(items, map[string]any{
 			"id": id, "created_at": unixOrNil(createdAt), "api_key_id": stringPtr(apiKeyID), "account_id": stringPtr(accountID),
 			"model": stringPtr(model), "protocol": stringPtr(protocol), "path": stringPtr(path), "stream": boolPtr(stream), "ok": boolPtr(okValue),
 			"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": totalTok, "cache_read_tokens": cacheRead,
 			"cache_creation_tokens": cacheCreate, "reasoning_tokens": reasoning, "client_ip": stringPtr(clientIP), "user_agent": stringPtr(userAgent),
-			"status_code": intPtr(statusCode), "latency_ms": intPtr(latency), "ttft_ms": intPtr(ttft), "error": stringPtr(errText), "detail": decodeMap(detail),
-			"api_key_name": stringPtr(keyName), "api_key_prefix": stringPtr(keyPrefix), "account_email": stringPtr(accountEmail),
+			"status_code": intPtr(statusCode), "latency_ms": intPtr(latency), "ttft_ms": intPtr(ttft), "error": stringPtr(errText), "detail": detailMap,
+			"reasoning_effort": reasoningEffort,
+			"api_key_name":     stringPtr(keyName), "api_key_prefix": stringPtr(keyPrefix), "account_email": stringPtr(accountEmail),
 		})
 	}
 	return map[string]any{

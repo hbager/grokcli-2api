@@ -3,6 +3,7 @@ package responses
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
 )
@@ -42,7 +43,9 @@ type LiveStreamer struct {
 	text          string
 	reasoning     string
 	output        int
+	textOut       int // output_index of the open text message item (-1 if none)
 	tools         map[int]*liveTool
+	shellArgKeys  map[string]string
 }
 
 func NewLiveStreamer(responseID, model string, allowed []string) *LiveStreamer {
@@ -53,13 +56,82 @@ func NewLiveStreamer(responseID, model string, allowed []string) *LiveStreamer {
 // maxTools <= 0 means unlimited (Codex / OpenAI-native).
 func NewLiveStreamerWithMaxTools(responseID, model string, allowed []string, maxTools int) *LiveStreamer {
 	return &LiveStreamer{
-		responseID: responseID,
-		model:      model,
-		allowed:    append([]string(nil), allowed...),
-		maxTools:   maxTools,
-		messageID:  "msg_" + responseID,
-		tools:      make(map[int]*liveTool),
+		responseID:   responseID,
+		model:        model,
+		allowed:      append([]string(nil), allowed...),
+		maxTools:     maxTools,
+		messageID:    "msg_" + responseID,
+		reasoningID:  "rs_" + responseID,
+		textOut:      -1,
+		tools:        make(map[int]*liveTool),
+		shellArgKeys: map[string]string{},
 	}
+}
+
+// SetShellArgKeys configures client-facing shell parameter names (Codex uses "cmd").
+func (s *LiveStreamer) SetShellArgKeys(keys map[string]string) {
+	if s == nil {
+		return
+	}
+	if keys == nil {
+		s.shellArgKeys = map[string]string{}
+		return
+	}
+	s.shellArgKeys = keys
+}
+
+func (s *LiveStreamer) projectArgs(toolName, args string) string {
+	if s == nil || args == "" {
+		return args
+	}
+	// Codex validates local schema field "cmd". Default ALL shell-family tools to cmd.
+	// Only keep "command" when the client tool schema explicitly has command and NOT cmd.
+	preferred := ""
+	if s.shellArgKeys != nil {
+		if v := strings.TrimSpace(s.shellArgKeys[toolName]); v != "" {
+			preferred = v
+		} else if v := strings.TrimSpace(s.shellArgKeys[strings.ToLower(toolName)]); v != "" {
+			preferred = v
+		} else if nk := toolcall.NameKey(toolName); nk != "" {
+			if v := strings.TrimSpace(s.shellArgKeys[nk]); v != "" {
+				preferred = v
+			}
+		}
+	}
+	// Hard rule: any shell tool (exec_command/shell/bash/...) defaults to cmd.
+	// Pure OpenAI command-only tools are rare; if keys map says "command" we honor it.
+	if preferred == "" {
+		if toolcall.IsShellTool(toolName) || looksLikeShellArgs(args) {
+			preferred = "cmd"
+		} else {
+			return args
+		}
+	}
+	out := toolcall.ProjectShellArgsForClient(args, toolName, preferred)
+	// Final safety: if we preferred cmd but output still only has command, force rewrite.
+	if preferred == "cmd" && strings.Contains(out, `"command"`) && !strings.Contains(out, `"cmd"`) {
+		out = toolcall.ProjectShellArgsForClient(out, "shell", "cmd")
+	}
+	return out
+}
+
+// looksLikeShellArgs detects shell payloads even when the tool name is unknown
+// (custom names / namespaced wrappers) so we still project command→cmd.
+func looksLikeShellArgs(args string) bool {
+	a := strings.TrimSpace(args)
+	if a == "" {
+		return false
+	}
+	// Common shell arg keys.
+	if strings.Contains(a, `"command"`) || strings.Contains(a, `"cmd"`) ||
+		strings.Contains(a, `"shell_command"`) || strings.Contains(a, `"cmdline"`) {
+		// Avoid treating random tools that merely mention "command" in a string value.
+		// Require object-looking JSON with those keys near the start half.
+		if strings.HasPrefix(a, "{") || strings.Contains(a, `{"command"`) || strings.Contains(a, `{"cmd"`) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *LiveStreamer) initial() map[string]any {
@@ -117,41 +189,29 @@ func (s *LiveStreamer) Text(delta string) []string {
 	}
 	frames := s.Start()
 	if s.reasoningOpen {
-		frames = append(frames,
-			s.sequence.Event("response.reasoning_summary_part.done", map[string]any{
-				"item_id": s.reasoningID, "output_index": s.output, "summary_index": 0,
-				"part": map[string]any{"type": "summary_text", "text": s.reasoning},
-			}),
-			s.sequence.Event("response.output_item.done", map[string]any{
-				"output_index": s.output,
-				"item": map[string]any{
-					"id": s.reasoningID, "type": "reasoning", "status": "completed",
-					"summary": []any{map[string]any{"type": "summary_text", "text": s.reasoning}},
-				},
-			}),
-		)
-		s.reasoningOpen = false
-		s.output++
+		frames = append(frames, s.closeReasoning()...)
 	}
 	if !s.textOpen {
 		s.textOpen = true
+		s.textOut = s.output
+		s.output++
 		frames = append(frames,
 			s.sequence.Event("response.output_item.added", map[string]any{
-				"output_index": s.output,
+				"output_index": s.textOut,
 				"item": map[string]any{
 					"id": s.messageID, "type": "message", "role": "assistant",
 					"status": "in_progress", "content": []any{},
 				},
 			}),
 			s.sequence.Event("response.content_part.added", map[string]any{
-				"item_id": s.messageID, "output_index": s.output, "content_index": 0,
+				"item_id": s.messageID, "output_index": s.textOut, "content_index": 0,
 				"part": map[string]any{"type": "output_text", "text": ""},
 			}),
 		)
 	}
 	s.text += delta
 	frames = append(frames, s.sequence.Event("response.output_text.delta", map[string]any{
-		"item_id": s.messageID, "output_index": s.output, "content_index": 0,
+		"item_id": s.messageID, "output_index": s.textOut, "content_index": 0,
 		"delta": delta,
 	}))
 	return frames
@@ -183,23 +243,63 @@ func (s *LiveStreamer) ToolDeltas(deltas []ToolDelta) []string {
 			state.arguments = toolcall.Merge(state.arguments, delta.Arguments, state.name)
 		}
 	}
+	frames = append(frames, s.emitReadyTools(false)...)
+	return frames
+}
+
+// emitReadyTools flushes complete function_call items. When force=true (stream end),
+// we still only emit tools whose JSON is CompleteJSON after EffectiveJSON coercion.
+// Incomplete required fields are dropped so clients never hang on a half tool, and
+// the envelope still closes via response.completed.
+func (s *LiveStreamer) emitReadyTools(force bool) []string {
+	if s.closed {
+		return nil
+	}
 	indexes := make([]int, 0, len(s.tools))
 	for index := range s.tools {
 		indexes = append(indexes, index)
 	}
 	sort.Ints(indexes)
+	frames := make([]string, 0)
 	for _, index := range indexes {
 		state := s.tools[index]
-		if state.emitted || state.name == "" || !toolcall.CompleteJSON(state.arguments, state.name) {
+		if state.emitted || state.name == "" {
 			continue
+		}
+		if force {
+			// Force-finish: recover trailing junk / mild truncation so intermittent
+			// incomplete tools still emit instead of vanishing at stream end.
+			state.arguments = toolcall.CoerceCompleteJSON(state.arguments, state.name)
+			if !toolcall.CompleteJSON(state.arguments, state.name) {
+				// Skip incomplete tools (do not block later indexes).
+				continue
+			}
+		} else {
+			// Live path: normalize only; CompleteJSONStrict rejects truncation
+			// "repairs" so unterminated fragments stay pending until real end.
+			normalized := toolcall.NormalizeJSON(state.arguments, state.name)
+			if normalized == "" {
+				normalized = state.arguments
+			}
+			if !toolcall.CompleteJSONStrict(normalized, state.name) {
+				continue
+			}
+			state.arguments = normalized
 		}
 		if s.maxTools > 0 && s.toolsStarted >= s.maxTools {
 			break
+		}
+		// Close open reasoning before tools so envelope order stays valid.
+		if s.reasoningOpen {
+			frames = append(frames, s.closeReasoning()...)
 		}
 		state.emitted = true
 		s.toolsStarted++
 		state.output = s.output
 		state.itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+		// Project to the client's shell schema key (Codex: "cmd"; OpenAI: "command").
+		clientArgs := s.projectArgs(state.name, state.arguments)
+		state.arguments = clientArgs
 		frames = append(frames,
 			s.sequence.Event("response.output_item.added", map[string]any{
 				"output_index": state.output,
@@ -210,17 +310,17 @@ func (s *LiveStreamer) ToolDeltas(deltas []ToolDelta) []string {
 			}),
 			s.sequence.Event("response.function_call_arguments.delta", map[string]any{
 				"item_id": state.itemID, "output_index": state.output,
-				"delta": state.arguments,
+				"delta": clientArgs,
 			}),
 			s.sequence.Event("response.function_call_arguments.done", map[string]any{
 				"item_id": state.itemID, "output_index": state.output,
-				"arguments": state.arguments,
+				"arguments": clientArgs,
 			}),
 			s.sequence.Event("response.output_item.done", map[string]any{
 				"output_index": state.output,
 				"item": map[string]any{
 					"id": state.itemID, "type": "function_call", "status": "completed",
-					"call_id": state.id, "name": state.name, "arguments": state.arguments,
+					"call_id": state.id, "name": state.name, "arguments": clientArgs,
 				},
 			}),
 		)
@@ -229,12 +329,54 @@ func (s *LiveStreamer) ToolDeltas(deltas []ToolDelta) []string {
 	return frames
 }
 
+func (s *LiveStreamer) closeReasoning() []string {
+	if !s.reasoningOpen {
+		return nil
+	}
+	frames := []string{
+		s.sequence.Event("response.reasoning_summary_part.done", map[string]any{
+			"item_id": s.reasoningID, "output_index": s.output, "summary_index": 0,
+			"part": map[string]any{"type": "summary_text", "text": s.reasoning},
+		}),
+		s.sequence.Event("response.output_item.done", map[string]any{
+			"output_index": s.output,
+			"item": map[string]any{
+				"id": s.reasoningID, "type": "reasoning", "status": "completed",
+				"summary": []any{map[string]any{"type": "summary_text", "text": s.reasoning}},
+			},
+		}),
+	}
+	s.reasoningOpen = false
+	s.output++
+	return frames
+}
+
 func (s *LiveStreamer) HasClientPayload() bool {
-	if s.text != "" {
+	// True only when the client has received (or will receive via Complete)
+	// user-visible output: text, reasoning, or tools. Envelope-only start is NOT
+	// a client payload so empty upstream can still Fail.
+	if s.text != "" || s.reasoning != "" || s.reasoningOpen || s.textOpen {
 		return true
 	}
 	for _, state := range s.tools {
-		if state.emitted {
+		if state.emitted || state.name != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// HasPendingTools reports whether any tool args are buffered but not yet
+// emitted (incomplete JSON). Used by the server to keep the client SSE warm
+// while we hold incomplete function_call frames — otherwise proxies cut the
+// stream during multi-second tool-arg drips (upstream not idle, so ReadSSE
+// keepalive never fires, and the client sees silence).
+func (s *LiveStreamer) HasPendingTools() bool {
+	if s == nil {
+		return false
+	}
+	for _, state := range s.tools {
+		if state != nil && !state.emitted && state.name != "" {
 			return true
 		}
 	}
@@ -242,22 +384,49 @@ func (s *LiveStreamer) HasClientPayload() bool {
 }
 
 func (s *LiveStreamer) Complete(usage *Usage) []string {
-	if s.closed || !s.HasClientPayload() {
+	// Preserve empty-stream contract used by callers: if we never opened any client
+	// payload AND never started the envelope, emit nothing so Fail can still run.
+	if s.closed {
 		return nil
 	}
-	frames := make([]string, 0, 5)
+	if !s.started && !s.HasClientPayload() {
+		return nil
+	}
+	// Empty envelope-only start (no text/tools/reasoning): leave Complete empty so
+	// Fail path can still surface upstream empty HTTP 200 (TestEmptyCompleteCanStillFail).
+	if s.started && s.text == "" && s.reasoning == "" && !s.textOpen && !s.reasoningOpen {
+		hasTool := false
+		for _, state := range s.tools {
+			if state.emitted || state.name != "" {
+				hasTool = true
+				break
+			}
+		}
+		if !hasTool {
+			return nil
+		}
+	}
+
+	frames := s.Start()
+	// Force-flush remaining tools (incomplete JSON included).
+	frames = append(frames, s.emitReadyTools(true)...)
+	frames = append(frames, s.closeReasoning()...)
+
 	if s.textOpen {
+		// Prefer the output index of the open message item: when reasoning/tools
+		// ran first, text may not be at 0. Track via messageID scan is complex;
+		// use the reserved textOut slot even when later tools advance s.output.
 		frames = append(frames,
 			s.sequence.Event("response.output_text.done", map[string]any{
-				"item_id": s.messageID, "output_index": 0, "content_index": 0,
+				"item_id": s.messageID, "output_index": s.textOutputIndex(), "content_index": 0,
 				"text": s.text,
 			}),
 			s.sequence.Event("response.content_part.done", map[string]any{
-				"item_id": s.messageID, "output_index": 0, "content_index": 0,
+				"item_id": s.messageID, "output_index": s.textOutputIndex(), "content_index": 0,
 				"part": map[string]any{"type": "output_text", "text": s.text},
 			}),
 			s.sequence.Event("response.output_item.done", map[string]any{
-				"output_index": 0,
+				"output_index": s.textOutputIndex(),
 				"item": map[string]any{
 					"id": s.messageID, "type": "message", "role": "assistant",
 					"status":  "completed",
@@ -265,11 +434,15 @@ func (s *LiveStreamer) Complete(usage *Usage) []string {
 				},
 			}),
 		)
+		s.textOpen = false
 	}
 	completed := map[string]any{
 		"id": s.responseID, "object": "response", "created_at": 0,
 		"status": "completed", "model": s.model, "usage": NormalizeUsage(usage),
-		"output": []any{},
+		// Codex / OpenAI SDKs read response.output on completed. Leaving it empty
+		// makes clients drop streamed function_call items (tool call "succeeds"
+		// in SSE but disappears from the final response object).
+		"output": s.snapshotOutput(),
 	}
 	frames = append(frames,
 		s.sequence.Event("response.completed", map[string]any{"response": completed}),
@@ -277,6 +450,76 @@ func (s *LiveStreamer) Complete(usage *Usage) []string {
 	)
 	s.closed = true
 	return frames
+}
+
+// snapshotOutput rebuilds the ordered output array for response.completed.
+// Includes completed reasoning / message / function_call items that were emitted.
+func (s *LiveStreamer) snapshotOutput() []any {
+	type piece struct {
+		index int
+		item  map[string]any
+	}
+	pieces := make([]piece, 0, 4+len(s.tools))
+	// Reasoning item (closed or open — Complete closes it first).
+	if s.reasoning != "" {
+		// reasoning always opened at some index; approximate 0 when unknown.
+		// Prefer ordering by emission: tools after closeReasoning bump output.
+		pieces = append(pieces, piece{index: -2, item: map[string]any{
+			"id": s.reasoningID, "type": "reasoning", "status": "completed",
+			"summary": []any{map[string]any{"type": "summary_text", "text": s.reasoning}},
+		}})
+	}
+	if s.text != "" {
+		pieces = append(pieces, piece{index: s.textOutputIndex(), item: map[string]any{
+			"id": s.messageID, "type": "message", "role": "assistant", "status": "completed",
+			"content": []any{map[string]any{"type": "output_text", "text": s.text}},
+		}})
+	}
+	// Tools by emission index.
+	indexes := make([]int, 0, len(s.tools))
+	for index, state := range s.tools {
+		if state == nil || !state.emitted {
+			continue
+		}
+		indexes = append(indexes, index)
+	}
+	// stable order by state.output then map key
+	for _, index := range indexes {
+		state := s.tools[index]
+		outIdx := state.output
+		if outIdx < 0 {
+			outIdx = 1000 + index
+		}
+		itemID := state.itemID
+		if itemID == "" {
+			itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+		}
+		pieces = append(pieces, piece{index: outIdx, item: map[string]any{
+			"id": itemID, "type": "function_call", "status": "completed",
+			"call_id": state.id, "name": state.name, "arguments": state.arguments,
+		}})
+	}
+	// Sort: reasoning first (-2), then by index.
+	sort.SliceStable(pieces, func(i, j int) bool {
+		return pieces[i].index < pieces[j].index
+	})
+	out := make([]any, 0, len(pieces))
+	for _, p := range pieces {
+		out = append(out, p.item)
+	}
+	return out
+}
+
+// textOutputIndex returns the output_index used when the text message item was opened.
+// Falls back to 0 for legacy simple streams.
+func (s *LiveStreamer) textOutputIndex() int {
+	if s == nil {
+		return 0
+	}
+	if s.textOut >= 0 {
+		return s.textOut
+	}
+	return 0
 }
 
 func (s *LiveStreamer) Fail(message, errorType string) []string {

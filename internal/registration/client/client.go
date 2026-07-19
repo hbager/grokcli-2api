@@ -43,12 +43,8 @@ func (c *Client) Sessions(ctx context.Context) (map[string]any, error) {
 	return c.do(ctx, http.MethodGet, "/sessions", nil, nil)
 }
 
-func (c *Client) Session(ctx context.Context, id string, includeAuth bool) (map[string]any, error) {
-	query := ""
-	if includeAuth {
-		query = "?include_auth_json=1"
-	}
-	return c.do(ctx, http.MethodGet, "/sessions/"+url.PathEscape(id)+query, nil, nil)
+func (c *Client) Session(ctx context.Context, id string) (map[string]any, error) {
+	return c.do(ctx, http.MethodGet, "/sessions/"+url.PathEscape(id), nil, nil)
 }
 
 func (c *Client) StopSession(ctx context.Context, id string) (map[string]any, error) {
@@ -73,6 +69,18 @@ func (c *Client) Reclaim(ctx context.Context, autoResume bool) (map[string]any, 
 
 func (c *Client) StopAll(ctx context.Context) (map[string]any, error) {
 	return c.do(ctx, http.MethodPost, "/stop", map[string]any{}, nil)
+}
+
+func (c *Client) StartDeviceLogin(ctx context.Context, request map[string]any) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodPost, "/internal/device/v1/login", request, nil)
+}
+
+func (c *Client) DeviceLoginSession(ctx context.Context, sessionID string) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodGet, "/internal/device/v1/sessions/"+url.PathEscape(sessionID), nil, nil)
+}
+
+func (c *Client) DeviceLoginSessions(ctx context.Context) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodGet, "/internal/device/v1/sessions", nil, nil)
 }
 
 func (c *Client) StartSSOImport(ctx context.Context, request map[string]any) (map[string]any, error) {

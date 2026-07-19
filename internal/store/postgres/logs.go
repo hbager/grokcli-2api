@@ -161,14 +161,37 @@ func boolPtr(ptr *bool) any {
 }
 
 // WriteTask inserts or updates a task_logs row (Python task_log.record parity).
+//
+// When taskID is set, UPDATE the latest existing row for the same (kind, task_id)
+// so start/progress/finish of one job stays a single row. A brand-new task_id
+// always inserts. Without task_id, always inserts (one-shot events).
+//
+// progress_done / progress_total follow Python semantics:
+//
+//	probe:  done=available, total=attempted
+//	renew:  done=refreshed, total=attempted
 func (c *Connector) WriteTask(ctx context.Context, kind, status, summary, taskID string, ok *bool, detail map[string]any, progressDone, progressTotal int, finished bool) (int64, error) {
 	kind = strings.TrimSpace(kind)
 	if kind == "" {
 		kind = "task"
 	}
-	status = strings.TrimSpace(status)
+	if len(kind) > 64 {
+		kind = kind[:64]
+	}
+	status = strings.TrimSpace(strings.ToLower(status))
 	if status == "" {
 		status = "done"
+	}
+	if len(status) > 64 {
+		status = status[:64]
+	}
+	taskID = strings.TrimSpace(taskID)
+	if len(taskID) > 128 {
+		taskID = taskID[:128]
+	}
+	summary = strings.TrimSpace(summary)
+	if len(summary) > 500 {
+		summary = summary[:500]
 	}
 	if detail == nil {
 		detail = map[string]any{}
@@ -177,6 +200,54 @@ func (c *Connector) WriteTask(ctx context.Context, kind, status, summary, taskID
 	if err != nil {
 		return 0, err
 	}
+	if progressDone < 0 {
+		progressDone = 0
+	}
+	if progressTotal < 0 {
+		progressTotal = 0
+	}
+	// Derive ok from status when caller did not set it (Python parity).
+	if ok == nil {
+		switch status {
+		case "done", "success", "completed", "ok", "partial":
+			v := true
+			ok = &v
+		case "error", "failed", "cancelled", "stopped":
+			v := false
+			ok = &v
+		}
+	}
+
+	// Upsert-by-task_id: keep one row per running job lifecycle.
+	if taskID != "" {
+		var id int64
+		err = c.Pool.QueryRow(ctx, `
+			UPDATE task_logs SET
+			  status = $1,
+			  summary = NULLIF($2, ''),
+			  detail = $3::jsonb,
+			  ok = $4,
+			  progress_done = $5,
+			  progress_total = $6,
+			  updated_at = now(),
+			  finished_at = CASE
+			    WHEN $7::bool THEN COALESCE(finished_at, now())
+			    ELSE finished_at
+			  END
+			WHERE id = (
+			  SELECT id FROM task_logs
+			  WHERE kind = $8 AND task_id = $9
+			  ORDER BY id DESC
+			  LIMIT 1
+			)
+			RETURNING id
+		`, status, summary, detailBytes, ok, progressDone, progressTotal, finished, kind, taskID).Scan(&id)
+		if err == nil && id > 0 {
+			return id, nil
+		}
+		// No existing row (or update miss) → insert below.
+	}
+
 	var finishedAt *time.Time
 	if finished {
 		now := time.Now()
@@ -186,6 +257,7 @@ func (c *Connector) WriteTask(ctx context.Context, kind, status, summary, taskID
 	err = c.Pool.QueryRow(ctx, `
 		INSERT INTO task_logs (kind, task_id, status, summary, detail, ok, progress_done, progress_total, finished_at, updated_at)
 		VALUES ($1, NULLIF($2,''), $3, NULLIF($4,''), $5::jsonb, $6, $7, $8, $9::timestamptz, now())
-		RETURNING id`, kind, taskID, status, summary, detailBytes, ok, progressDone, progressTotal, finishedAt).Scan(&id)
+		RETURNING id
+	`, kind, taskID, status, summary, detailBytes, ok, progressDone, progressTotal, finishedAt).Scan(&id)
 	return id, err
 }

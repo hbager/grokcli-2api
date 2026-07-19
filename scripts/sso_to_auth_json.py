@@ -68,29 +68,30 @@ _DEVICE_FLOW_LAST_TS = 0.0
 
 def _device_flow_gap_sec() -> float:
     try:
-        return max(0.0, float(os.getenv("GROK2API_SSO_DEVICE_GAP_SEC", "1.2") or 1.2))
+        return max(0.0, float(os.getenv("GROK2API_SSO_DEVICE_GAP_SEC", "0.85") or 0.85))
     except (TypeError, ValueError):
-        return 1.2
+        return 0.85
 
 
 def _device_flow_retries() -> int:
     # Bulk registration can burst device/code after many SSO successes; give
     # rate-limit retries more headroom than the historical default of 3.
     try:
-        return max(1, min(12, int(os.getenv("GROK2API_SSO_DEVICE_RETRIES", "6") or 6)))
+        return max(1, min(16, int(os.getenv("GROK2API_SSO_DEVICE_RETRIES", "8") or 8)))
     except (TypeError, ValueError):
         return 6
 
 
 def _device_flow_backoff_sec(attempt: int) -> float:
-    # attempt is 1-based after a failure
-    base = 2.0 * attempt
+    # attempt is 1-based after a failure. Mild exponential — prefer throughput.
+    base = 1.4 * (1.45 ** max(0, attempt - 1))
     try:
-        base = float(os.getenv("GROK2API_SSO_DEVICE_BACKOFF_SEC", str(base)) or base)
+        override = os.getenv("GROK2API_SSO_DEVICE_BACKOFF_SEC")
+        if override:
+            base = float(override)
     except (TypeError, ValueError):
         pass
-    # Cap higher than before so slow_down storms during bulk convert can recover.
-    return max(1.0, min(45.0, base))
+    return max(0.8, min(25.0, base))
 
 
 def _wait_device_flow_slot() -> None:
@@ -123,9 +124,25 @@ def _is_rate_limited_payload(text: str | None = None, url: str | None = None, st
 def _proxy_kwargs() -> dict:
     """Return curl_cffi compatible proxy kwargs from env / proxy pool."""
     try:
-        from proxy_pool import resolve_proxy_for_request, curl_proxies_arg
+        try:
+            from grok2api.upstream.proxy_pool import (
+                resolve_proxy_for_request,
+                curl_proxies_arg,
+                get_outbound_proxy_source,
+                first_working_proxy,
+            )
+        except Exception:
+            from proxy_pool import resolve_proxy_for_request, curl_proxies_arg  # type: ignore
+            get_outbound_proxy_source = None  # type: ignore
+            first_working_proxy = None  # type: ignore
 
         url = resolve_proxy_for_request(fallback_env=True)
+        if not url and get_outbound_proxy_source is not None:
+            src = get_outbound_proxy_source() or {}
+            pool = list(src.get("pool") or [])
+            url = pool[0] if pool else None
+        if not url and first_working_proxy is not None:
+            url = first_working_proxy()
         proxies = curl_proxies_arg(url)
         if proxies:
             return {"proxies": proxies}

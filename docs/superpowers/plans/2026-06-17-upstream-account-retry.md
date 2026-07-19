@@ -1,5 +1,7 @@
 # 上游錯誤自動換號重試 Implementation Plan
 
+> **已淘汰（v2.0.1）：** 本文件保留作為歷史設計紀錄，不是現行實作規格。現行 Go-only public runtime 使用 `max_failover_attempts`（總嘗試數 1–64）；不得實作本文的 `upstream_retry_count`、`ChatService.MaxAttempts` 或 Python public API 路徑。
+
 > **For agentic workers:** Execute each task at its recorded risk level. Use `subagent-driven-development` only for strict plans with independently review-worthy tasks; otherwise use `executing-plans` inline.
 
 **Goal:** 新增可在系統設定調整的上游自動換號重試次數 `N`，讓 Go 與 Python 的三種 LLM API 在所有上游錯誤或空回覆時最多嘗試 `N+1` 個不同帳號。

@@ -2,16 +2,18 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.91** · CLIProxyAPI 号池同步 · 号池统计修正 · 无 SSO 续期失败硬删 · 历史压缩默认关（智商优先）
+**当前版本：v2.0.1** · Docker 入口自动 migrate · 空库 schema_migrations 修复 · Go 主进程
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.91` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:2.0.1` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
+
+> **分支**：默认 `main`（Go 2.x）。纯 Python 快照在次要分支 [`python`](https://github.com/HM2899/grokcli-2api/tree/python)，发布时不会覆盖。
 
 - **独立运行**：不依赖本地 Grok CLI / 浏览器 OAuth
 - **Hybrid 存储（默认强制）**：PostgreSQL 持久 + Redis 热状态 + 多 Worker
@@ -29,12 +31,14 @@
 客户端 (OpenAI / Anthropic SDK · new-api · Claude Code / sub2api)
         │  /v1/chat/completions  ·  /v1/responses  ·  /v1/messages
         ▼
-  grokcli-2api  (FastAPI · multi-worker · TZ=Asia/Shanghai)
+  grokcli-2api  (Go 主进程 · multi-worker · TZ=Asia/Shanghai)
         │  管理台 /admin
         │  账号轮询 · 冷却/过期踢出 · inflight 分散 · Prompt Cache 会话粘性
         │  任务日志（注册 / SSO / JSON / 测活 / 续期）
         │  PostgreSQL（账号 / Key / 设置 / 冷却 / 任务日志）—— 容器内网
         │  Redis（粘性 / 计数 / 锁 / 会话 / 任务进度）—— 容器内网
+        │
+        ├─ Python sidecar（loopback）：注册机 / SSO 转换 / 过盾
         ▼
   cli-chat-proxy.grok.com
 ```
@@ -68,18 +72,17 @@
 
 ---
 
-## 本版本重点（v1.9.91）
+## 本版本重点（v2.0.1）
 
 | 能力 | 行为 |
 |------|------|
-| **CLIProxyAPI 同步** | 设置页配置 CPA Management API；账号页「导入 CLIProxyAPI（选中/全部）」把本地号池推到 CPA auth 目录 |
-| **CPA 文件格式** | 导入识别 `type=xai/codex` 单文件与 `cliproxyapi-auth-bundle`；导出官方 CPA 单账号 JSON 包 |
-| **号池统计修正** | `live/可轮询` 不再把冷却/封禁算进去；分类互斥：enabled · cooldown · model_blocked · expired · disabled |
-| **无 SSO 续期失败** | 连续 2 次 RT 失败且无 SSO：**硬删凭证 + 号池行**（不再假挂在总量里） |
-| **历史压缩默认关** | 默认不压历史（智商优先）；可选软分层压缩作安全阀 |
-| **注册自动推送** | 可选注册成功后自动推 **sub2api** 与/或 **CLIProxyAPI** |
+| **Docker 自动迁移** | `entrypoint` 启动前执行 `grok2api-migrate up`；空库自动建 `schema_migrations` + SQL |
+| **空库 fail-closed 修复** | 不再因 `relation "schema_migrations" does not exist` 卡在 `/ready` 503 |
+| **入口开关** | `GROK2API_AUTO_MIGRATE=0` 可跳过；应用进程仍只校验不改 schema |
+| **继承 v2.0.0** | Go 主进程 · 流式 tool 可靠性 · 管理台/冷却统计对齐 |
 
-继承 v1.9.90：Claude Code tool 解析修复 · stop_reason 对齐 · `grok2api/` 包布局。
+
+继承 v1.9.92：CPA 风格 prompt cache · 同会话粘号 · 首字延迟热路径 · 用量明细补齐。
 
 ---
 
@@ -163,7 +166,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.91
+docker pull ghcr.io/hm2899/grokcli-2api:2.0.1
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -202,7 +205,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.91
+    image: ghcr.io/hm2899/grokcli-2api:2.0.1
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "40081:40081"
@@ -265,7 +268,7 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-s
 5. **账号失效清绑定**（disable / quota 踢号时 `clear_affinity_for_account`）
 6. **可观测**（响应字段 / header 回传 cache 命中量）
 
-> 注意：CPA 对官方 `api.x.ai` 会透传 `prompt_cache_key` + `x-grok-conv-id`。本项目上游是 cookie SSO → cli-chat-proxy，**不认**这些字段——我们只把 `prompt_cache_key` 当 **本地粘性指纹**，出站前会剥掉。
+> 注意：历史版本对 cli-chat-proxy 走 `/chat/completions`。**v1.9.92+ 出站改为 CPA 同款 `/responses`**（chat body 自动转 responses input，SSE 再桥回 chat.completion.chunk），并透传 `prompt_cache_key` + `x-grok-conv-id`。是否出现 `cached_tokens>0` 仍取决于上游账号/模型是否真正回 cache（当前 build-free 实测常为 0）。
 
 | 客户端提示 | 行为 |
 |------------|------|
@@ -303,25 +306,24 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-s
 - 多轮用同一 API Key；观察 `X-Grok2API-Affinity: 1` 且账号字段跨轮不变
 - 第二轮起看 `cached_tokens > 0`；若 affinity=1 仍为 0，则是上游未回 cache，不是粘性失败
 
-### 本地开发热更新
+### 本地开发
 
-生产默认 `reload=False` + 多 worker。改代码后要自动重启：
+主进程为 **Go**；Python 仅保留注册机 / SSO 转换 / 过盾 sidecar。
 
 ```bash
 # 仅起 Redis/Postgres（若尚未运行）
 docker compose up -d postgres redis
 
-# 宿主机 Python 热更新（监听 .py / static/js / static/admin）
+# 编译并启动 Go（entrypoint 会按需拉起 Python sidecar）
 ./dev.sh
 # 或
-GROK2API_RELOAD=1 GROK2API_WORKERS=1 python app.py
+go build -o bin/grok2api ./cmd/grok2api && ./bin/grok2api
 ```
 
 说明：
-- `GROK2API_RELOAD=1` 时强制 **1 worker**（uvicorn 限制）
-- 默认忽略 `data/`、`static/dist/`、`__pycache__/`，避免写库/打包触发无意义重启
-- 管理台 `static/js` 源文件变更会触发进程重启；带 hash 的 `static/dist` 仍建议跑 `python scripts/build_admin_assets.py`
-- Docker 镜像内一般不挂源码，热更新请用宿主机 `./dev.sh`，或 bind-mount 代码后再设 `GROK2API_RELOAD=1`
+- 默认 `GROK2API_RUNTIME=go`，公开 API / 管理台控制面均由 Go 提供
+- 注册 / SSO / Turnstile 仍走 loopback Python sidecar（见 `docs/PYTHON_SIDECAR.md`）
+- 管理台静态资源变更可跑 `python scripts/build_admin_assets.py`
 
 ---
 
@@ -336,16 +338,46 @@ chmod +x scripts/upgrade_from_file_backend.sh
 
 # 或
 docker compose up -d redis postgres
+# Schema SQL is applied automatically by entrypoint (grok2api-migrate up).
+# Manual one-shot (optional):
 docker compose run --rm \
   -e DATABASE_URL=postgresql://grok2api:grok2api@postgres:5432/grok2api \
-  grokcli-2api \
-  python scripts/migrate_json_to_pg.py --data-dir /app/data --merge-pool
+  --entrypoint /app/bin/grok2api-migrate \
+  grokcli-2api up
+# or: go run ./cmd/grok2api-migrate up
 ```
 
 迁移内容：`auth.json` / `keys.json` / `settings.json`（含账号池状态）→ PostgreSQL。
 不迁移：Redis 热状态、管理台登录会话。
 
-已是 hybrid 时，拉新镜像即可；表结构由 `grok2api/store/pg.py` 启动时幂等升级。
+已是 hybrid 时，拉新镜像即可。Docker 入口会先跑 `grok2api-migrate up`（建 `schema_migrations` + 版本化 SQL）；Go 进程本身只校验、不改 schema。可用 `GROK2API_AUTO_MIGRATE=0` 关闭入口自动迁移。
+
+
+### 已部署库出现 `schema_migrations does not exist` 时
+
+新镜像（≥2.0.1）会在入口自动 migrate。若你仍在跑旧镜像，或关闭了 `GROK2API_AUTO_MIGRATE`，可手动：
+
+```bash
+# 1) 先备份 PostgreSQL
+docker exec grokcli-2api-postgres pg_dump -U grok2api -d grok2api \
+  > /root/grok2api-before-migration-$(date +%F-%H%M%S).sql
+ls -lh /root/grok2api-before-migration-*.sql
+
+# 2) 执行版本化 SQL 迁移（IF NOT EXISTS，不删已有账号/Key）
+docker exec grokcli-2api /app/bin/grok2api-migrate -dir /app/migrations up
+# 期望：applied 0001 ... 或 ok: 0 migration(s) applied
+
+# 3) 校验
+docker exec grokcli-2api /app/bin/grok2api-migrate -dir /app/migrations verify
+# 期望：ok: 1 migration file(s) verified
+
+# 4) 重启并检查
+docker restart grokcli-2api
+# 端口以 compose 为准（示例 3000 / 本地 override 常为 40081）
+sleep 15
+curl -fsS http://127.0.0.1:3000/health || curl -fsS http://127.0.0.1:40081/health
+docker logs --tail 100 grokcli-2api
+```
 
 ---
 
@@ -474,19 +506,18 @@ Host: 原始 Host
 ### 发布镜像（GHCR）
 
 ```bash
-# 1) grok2api/app.py 中 APP_VERSION 必须与 git tag 一致（镜像路径全小写）
+# 1) grok2api/app.py 的 APP_VERSION 与 internal/buildinfo.Version 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v1.9.91"
+git add -A && git commit -m "release: v2.0.1"
 git push origin main
-git tag -a v1.9.91 -m "v1.9.91"
-git push origin v1.9.91
-gh release create v1.9.91 --title "v1.9.91 CLIProxyAPI sync + pool stats + hard-delete no-SSO" --notes-file - <<'EOF'
+git tag -a v2.0.1 -m "v2.0.1"
+git push origin v2.0.1
+gh release create v2.0.1 --title "v2.0.1 Docker auto-migrate + schema_migrations fix" --notes-file - <<'EOF'
 ## Highlights
-- CLIProxyAPI：设置页配置 + 账号页一键同步本地号池到 CPA auth 目录（Management API）
-- CPA 文件格式导入/导出（xai/codex 单文件、cliproxyapi-auth-bundle）
-- 号池统计互斥修正：可轮询 ≠ 总量 − 过期
-- 续不上 AT 且无 SSO：硬删账号
-- 历史压缩默认关闭（智商优先）
+- Docker entrypoint 启动前自动执行 `grok2api-migrate up`，修复空库 `schema_migrations does not exist`
+- 保留应用进程 fail-closed 只校验、不改 schema 的合约
+- 可用 `GROK2API_AUTO_MIGRATE=0` 关闭入口自动迁移
+- 文档补充：备份 → migrate → verify → restart 运维恢复步骤
 EOF
 # 监视构建
 gh run list --workflow=docker-publish.yml --limit 3
@@ -495,50 +526,46 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.91
+docker pull ghcr.io/hm2899/grokcli-2api:2.0.1
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
 CI 会把 `github.repository` 强制转成小写后再推送，避免 `HM2899` 大小写导致 `docker pull` 失败。
 `docker-publish.yml` 在 tag 推送时还会校验 `v*` 与 `APP_VERSION` 一致。
 
-**不要提交**：`.env`、`data/`、`docker-compose.override.yml`、`docker-rebuild.local.sh`、密钥与本地 SSO 备份。
+**不要提交**：`.env`、`data/`、`docker-compose.override.yml`、`docker-rebuild.local.sh`、密钥与本地 SSO 备份、`bin/` 本地二进制。
+
+**不要**：`git push --force origin main` / 删除或 force-push `python` 次要分支。
 
 ---
 
 ## 目录提示
 
 ```
-# 运行时入口
-app.py                                   # 兼容启动包装（真实应用在 grok2api/app.py）
-grok2api/app.py                          # FastAPI 应用、OpenAI/Anthropic 路由入口
+# Go 主进程
+cmd/grok2api/                            # Go 入口（公开 API + 管理台控制面）
+cmd/grok2api-migrate/                    # JSON/file → PG 迁移
+internal/                                # Go 实现（proxy / admin / pool / store / protocol）
+bin/grok2api                             # 本地/镜像内二进制
 
-# 业务包（新代码请从这里 import）
-grok2api/admin/                          # 管理台路由、API Key、设置、任务日志、用量统计
-grok2api/pool/                           # 账号池、认证、配额、模型健康、token 维护、会话粘性
-grok2api/protocol/                       # Claude / Responses / OpenAI 协议兼容与历史压缩
-grok2api/upstream/                       # Grok 上游、OIDC、sub2api、CLIProxyAPI、代理、模型目录
-grok2api/store/                          # Redis + PostgreSQL 适配（PG 表、Redis 热状态、锁、指标）
+# Python 仅保留 sidecar
+scripts/registration_service.py          # 注册机 + SSO 内部 HTTP（loopback）
+scripts/sso_to_auth_json.py              # SSO cookie → token 转换
+grok2api/admin/sso_import.py             # SSO 导入任务（sidecar 使用）
+grok2api/upstream/grok_build_adapter.py  # 注册编排
+grok2api/upstream/moemail.py             # 邮箱提供方
+grok-build-auth/                         # 协议注册引擎（vendored）
+turnstile-solver/                        # 本地过盾（Camoufox/Playwright）
+sso_to_auth_json.py                      # 兼容包装 → scripts/sso_to_auth_json.py
 
-# 兼容层（旧导入仍可用）
-account_pool.py / admin_routes.py / ...  # root shim → grok2api.*
-store/                                   # root store wrapper → grok2api/store
-migrate_json_to_pg.py                    # 兼容包装；推荐 scripts/migrate_json_to_pg.py
-sso_to_auth_json.py                      # 兼容包装；推荐 scripts/sso_to_auth_json.py
-
-# 脚本（见 scripts/README.md）
+# 脚本 / 前端 / 部署
 scripts/build_admin_assets.py            # 管理台静态资源打包
 scripts/upgrade_from_file_backend.sh     # file → hybrid 升级
-scripts/migrate_json_to_pg.py            # JSON → PG 迁移
-scripts/_test_*.py                       # 本地回归（粘性 / 冷却 / 踢出 / tool parse / 终态帧）
-
-# 前端 / 部署
 static/                                  # 管理台前端
-docs/UPGRADE.md                          # 升级说明
+docs/ARCHITECTURE_GO_PYTHON_BOUNDARY.md  # Go/Python 边界
+docs/PYTHON_SIDECAR.md                   # sidecar 集成
 docker-compose.yml                       # redis + postgres（内网）+ app
 .github/workflows/docker-publish.yml     # GHCR 多架构（小写镜像名）
-grok-build-auth/                         # 协议注册引擎（vendored）
-turnstile-solver/                        # 本地过盾（内联）
 ```
 
 ---
@@ -557,7 +584,21 @@ turnstile-solver/                        # 本地过盾（内联）
 
 ## 版本
 
-- **v1.9.91**（当前）
+- **v2.0.1**（当前）
+  - **Docker 入口自动 migrate**：启动前跑 `grok2api-migrate up`，空 Postgres 不再因 `schema_migrations` 缺失 fail-closed
+  - 应用进程仍只校验 checksum（`GROK2API_REQUIRE_MIGRATIONS`）；入口可用 `GROK2API_AUTO_MIGRATE=0` 关闭
+  - 文档补充备份 → migrate → verify → restart 恢复步骤
+- **v2.0.0**
+  - **Go 主进程正式版**：公开 API / 管理台默认 Go；Python 仅 sidecar（注册机 / SSO / 过盾）
+  - **流式 tool 可靠性**：tool 帧原子写出；软断/写失败 force-finish
+  - **管理台状态对齐**：额度/模型测试写库后刷新轮询状态；状态筛选与顶部统计同源
+  - **冷却统计修正**：冷却不再按失败次数叠乘到多天；free-usage 只冷却不写模型封禁
+  - **筛选少号修复**：状态 chips 与「有 SSO」叠加时不再悄悄少号
+  - **分支**：`main` = Go 2.x；`python` = 最后一版纯 Python 快照（次要分支）
+- **v1.9.92**
+  - CPA 风格 prompt cache · 同会话粘号 · 首字延迟热路径 · 用量明细补齐
+  - 公开 API / 管理台主路径默认 Go；Python 仅 sidecar
+- **v1.9.91**
   - 修复 Claude Code 报错 `The model's tool call could not be parsed (retry also failed)`
   - `stop_reason=tool_use` 仅在实际发出 tool_use 内容块时设置（不再仅因 `finish_reason=tool_calls`）
   - 无 required 参数的工具（EnterPlanMode / TaskList / ExitPlanMode 等）空参数补 `input: {}`
@@ -727,7 +768,7 @@ turnstile-solver/                        # 本地过盾（内联）
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `grok2api/app.py` 中 `APP_VERSION` 一致（当前 **1.9.91**）。
+> 镜像 tag 与 `grok2api/app.py` 的 `APP_VERSION` / `internal/buildinfo.Version` 一致（当前 **2.0.1**）。
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License

@@ -24,6 +24,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/store/redis"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 	"github.com/hm2899/grokcli-2api/internal/upstream/oidc"
+	"github.com/hm2899/grokcli-2api/internal/upstream/outboundproxy"
 )
 
 func main() {
@@ -66,13 +67,45 @@ func main() {
 			if adminSessions == nil {
 				adminSessions = store
 			}
+			// One-shot: free-usage mis-tags (模型封禁) → durable cooldown only.
+			repairCtx, repairDone := context.WithTimeout(context.Background(), 30*time.Second)
+			if n, err := store.RepairFreeUsageModelBlocks(repairCtx); err != nil {
+				slog.Warn("repair free-usage model blocks failed", "error", err)
+			} else if n > 0 {
+				slog.Info("repaired free-usage model blocks into cooldown", "accounts", n)
+			}
+			repairDone()
 		}
 	}
 
+	// Live config snapshots let admin settings writes hot-reload without races.
+	runtimeCfg := config.NewRuntimeConfig(cfg)
 	if store != nil {
-		oidcClient := &oidc.Client{}
+		if settings, err := store.PublicSettings(context.Background()); err == nil {
+			runtimeCfg.ApplyStoreSettings(settings)
+			loaded := runtimeCfg.Load()
+			slog.Info("loaded durable settings into runtime config",
+				"default_model", loaded.DefaultModel,
+				"sse_keepalive", loaded.SSEKeepalive.String(),
+				"outbound_max_tools", loaded.OutboundMaxTools,
+				"outbound_proxy_enabled", loaded.OutboundProxyConfigured && loaded.OutboundProxyEnabled,
+			)
+		} else {
+			slog.Warn("failed to load durable settings at boot", "error", err)
+		}
+	}
+	proxySelector := outboundproxy.New(runtimeCfg.Load)
+	chatClient := &grok.Client{BaseURL: cfg.UpstreamBase, HTTP: grok.NewHTTPClient(proxySelector.Proxy)}
+	quotaSvc := quota.New(store, cfg.UpstreamBase)
+	quotaSvc.SetProxy(proxySelector.Proxy)
+
+	if store != nil {
+		oidcTransport := http.DefaultTransport.(*http.Transport).Clone()
+		oidcTransport.Proxy = proxySelector.Proxy
+		oidcClient := &oidc.Client{HTTP: &http.Client{Timeout: 30 * time.Second, Transport: oidcTransport}}
 		maintSvc = maintainer.New(store, redisClient, oidcClient)
 		healthSvc = modelhealth.New(store, redisClient, cfg.UpstreamBase, []string{cfg.DefaultModel})
+		healthSvc.SetProxy(proxySelector.Proxy)
 		if leader != nil {
 			maintSvc.IsLeader = leader.IsLeader
 			healthSvc.IsLeader = leader.IsLeader
@@ -131,18 +164,19 @@ func main() {
 		MessagesEnabled:   cfg.GoMessages,
 		ResponsesEnabled:  cfg.GoResponses,
 		APIKeys:           auth.NewAPIKeyVerifier(cfg, store),
-		Models:            models.NewCatalog(cfg, store),
+		Models:            models.NewDynamicCatalog(runtimeCfg.Load, store),
 		Store:             store,
 		AdminSessions:     adminSessions,
 		PickObserver:      redis.NewPickObserver(redisClient),
-		AffinityStore:     redis.NewChatAffinity(redisClient, cfg.SSEKeepalive*1800),
-		Upstream:          &grok.Client{BaseURL: cfg.UpstreamBase},
+		AffinityStore:     redis.NewChatAffinity(redisClient, 24*time.Hour),
+		Upstream:          chatClient,
 		Redis:             redisClient,
 		Leader:            leader,
 		Maintainer:        maintSvc,
 		ModelHealth:       healthSvc,
-		Quota:             quota.New(store, cfg.UpstreamBase),
+		Quota:             quotaSvc,
 		Config:            cfg,
+		RuntimeConfig:     runtimeCfg,
 		RegistrationURL:   cfg.RegistrationServiceURL,
 		RegistrationToken: cfg.RegistrationToken,
 	})

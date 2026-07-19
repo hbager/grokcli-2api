@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
 )
@@ -83,11 +84,18 @@ func (s *StreamAssembler) Start(inputTokens int) []string {
 
 func (s *StreamAssembler) Feed(content, reasoning string, calls []ToolDelta) []string {
 	frames := s.Start(0)
-	if s.toolsRequested && !s.sawTool && (content != "" || reasoning != "") {
-		s.held = append(s.held, heldDelta{content: content, reasoning: reasoning})
-		s.outputRunes += len([]rune(content)) + len([]rune(reasoning))
-		content, reasoning = "", ""
+	// When tools are declared, keep TEXT held until a tool arrives / Finish.
+	// REASONING must stream live so long Claude Code thinking turns keep the
+	// SSE pipe warm (idle proxies ~60s otherwise cut the connection).
+	if s.toolsRequested && !s.sawTool {
+		if content != "" {
+			s.held = append(s.held, heldDelta{content: content})
+			s.outputRunes += len([]rune(content))
+			content = ""
+		}
+		// reasoning falls through to emitText below (live)
 	} else if s.toolsRequested && s.sawTool {
+		// After first tool, drop further text/reasoning for this turn (tool-only).
 		content, reasoning = "", ""
 	}
 	if content != "" || reasoning != "" {
@@ -126,13 +134,101 @@ func (s *StreamAssembler) Feed(content, reasoning string, calls []ToolDelta) []s
 	return frames
 }
 
+// HasClientPayload reports whether any user-visible content was or will be
+// emitted: text, thinking, held text, or tool_use. Envelope-only message_start
+// is NOT a client payload (empty upstream must still fail).
+func (s *StreamAssembler) HasClientPayload() bool {
+	if s == nil {
+		return false
+	}
+	if s.sawTool || s.toolsStarted > 0 || s.outputRunes > 0 {
+		return true
+	}
+	if s.textBlock >= 0 || s.thinkingBlock >= 0 {
+		return true
+	}
+	if len(s.held) > 0 {
+		return true
+	}
+	for _, state := range s.tools {
+		if state == nil {
+			continue
+		}
+		if state.started || state.name != "" || strings.TrimSpace(state.arguments) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// HasPendingTools reports buffered but not-yet-emitted tool arguments.
+func (s *StreamAssembler) HasPendingTools() bool {
+	if s == nil {
+		return false
+	}
+	for _, state := range s.tools {
+		if state == nil || state.started || state.stopped {
+			continue
+		}
+		if state.name != "" || strings.TrimSpace(state.arguments) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// HasHeldContent reports text held for tool-only turns (toolsRequested && !sawTool).
+// Upstream may still be streaming held text without reasoning — client sees silence
+// and reverse proxies cut Claude Code mid-turn. Callers should force SSE keepalive.
+func (s *StreamAssembler) HasHeldContent() bool {
+	if s == nil {
+		return false
+	}
+	return len(s.held) > 0
+}
+
+// NeedsClientKeepalive is true when the assembler is buffering work the client
+// cannot yet see (held text and/or incomplete tools).
+func (s *StreamAssembler) NeedsClientKeepalive() bool {
+	return s.HasHeldContent() || s.HasPendingTools()
+}
+
 func (s *StreamAssembler) Finish(finishReason string, usage Usage) []string {
 	frames := s.Start(usage.PromptTokens)
 	for _, state := range s.tools {
-		if state.started || state.stopped || state.name == "" {
+		if state.started || state.stopped {
 			continue
 		}
-		state.arguments = toolcall.EffectiveJSON(state.arguments, state.name)
+		// Name may have arrived late; ensure CanonicalName + edit aliases re-apply.
+		if state.name != "" {
+			state.name = toolcall.CanonicalName(state.name, s.allowed)
+		}
+		if state.name == "" {
+			continue
+		}
+		// Force-finish recovery: trailing junk / mild truncation / late Update→Edit
+		// rename should not drop otherwise-valid tools intermittently.
+		state.arguments = toolcall.CoerceCompleteJSON(state.arguments, state.name)
+		// If still incomplete, retry under Edit schema (Update→Edit rename race:
+		// name may have been Update when first args arrived; after CanonicalName
+		// it's Edit and edit-only aliases/defaults must re-apply).
+		if !toolcall.CompleteJSON(state.arguments, state.name) {
+			for _, tryName := range []string{
+				toolcall.CanonicalName("Edit", s.allowed),
+				toolcall.CanonicalName("Update", s.allowed),
+				"Edit",
+			} {
+				tryName = strings.TrimSpace(tryName)
+				if tryName == "" || tryName == state.name {
+					continue
+				}
+				if coerced := toolcall.CoerceCompleteJSON(state.arguments, tryName); toolcall.CompleteJSON(coerced, tryName) {
+					state.name = tryName
+					state.arguments = coerced
+					break
+				}
+			}
+		}
 	}
 	hasReady := false
 	for _, state := range s.tools {
@@ -161,6 +257,8 @@ func (s *StreamAssembler) Finish(finishReason string, usage Usage) []string {
 			outputTokens = 1
 		}
 	}
+	// Always emit message_delta + message_stop so Claude Code can leave "running"
+	// even when tools were incomplete/dropped.
 	frames = append(frames, event("message_delta", map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
@@ -189,18 +287,40 @@ func (s *StreamAssembler) emitReadyTools() []string {
 		if state.stopped || state.started {
 			continue
 		}
-		if state.name == "" || !toolcall.CompleteJSON(state.arguments, state.name) {
-			break
+		if state.name == "" {
+			continue
+		}
+		// Live path: normalize but do NOT invent missing new_string, and use
+		// CompleteJSONStrict so truncation repair cannot mark an unterminated
+		// fragment complete (otherwise Claude Code receives {"file_path":"/a"}
+		// and the still-arriving ".go"} is discarded).
+		// Force-finish CoerceCompleteJSON runs in Finish() so path+old without
+		// replace wait for the real replacement instead of emitting delete-match
+		// mid-stream (Claude Code then ignores the late args → Update "errors").
+		normalized := toolcall.NormalizeJSON(state.arguments, state.name)
+		if normalized == "" {
+			normalized = state.arguments
+		}
+		if !toolcall.CompleteJSONStrict(normalized, state.name) {
+			// Do NOT break: a lower index may be incomplete while a higher
+			// index already has complete JSON. Breaking here hung Claude Code
+			// tasks that received tools out of order / partial early slots.
+			continue
 		}
 		if s.maxTools > 0 && s.toolsStarted >= s.maxTools {
 			break
 		}
+		state.arguments = normalized
 		state.block = s.nextBlock
 		s.nextBlock++
 		state.started = true
 		s.toolsStarted++
 		s.sawTool = true
 		s.held = nil
+		argsJSON := state.arguments
+		if strings.TrimSpace(argsJSON) == "" {
+			argsJSON = "{}"
+		}
 		frames = append(frames, event("content_block_start", map[string]any{
 			"type": "content_block_start", "index": state.block,
 			"content_block": map[string]any{
@@ -209,9 +329,9 @@ func (s *StreamAssembler) emitReadyTools() []string {
 		}))
 		frames = append(frames, event("content_block_delta", map[string]any{
 			"type": "content_block_delta", "index": state.block,
-			"delta": map[string]any{"type": "input_json_delta", "partial_json": state.arguments},
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": argsJSON},
 		}))
-		s.outputRunes += len([]rune(state.arguments))
+		s.outputRunes += len([]rune(argsJSON))
 		frames = append(frames, event("content_block_stop", map[string]any{
 			"type": "content_block_stop", "index": state.block,
 		}))

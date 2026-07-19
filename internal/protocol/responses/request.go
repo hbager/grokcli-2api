@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/hm2899/grokcli-2api/internal/protocol/reasoning"
 )
 
 func BuildChatBody(raw map[string]any, model string) map[string]any {
@@ -258,14 +260,11 @@ func ConvertTools(raw any) []any {
 	return out
 }
 
+// ReasoningEffort returns a canonical low|medium|high|xhigh for Responses bodies.
+// Accepts Codex labels (auto/default/standard/extra-high) and Claude-style
+// thinking budgets via the shared normalizer.
 func ReasoningEffort(raw map[string]any) string {
-	if effort := stringValue(raw["reasoning_effort"]); effort != "" {
-		return effort
-	}
-	if reasoning, ok := raw["reasoning"].(map[string]any); ok {
-		return stringValue(reasoning["effort"])
-	}
-	return ""
+	return reasoning.FromRequest(raw)
 }
 
 func BuildObject(responseID, model, content, reasoning string, toolCalls []map[string]any, usage map[string]any, createdAt int64, previous string, metadata map[string]any) map[string]any {

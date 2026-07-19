@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
 DATA_DIR = ROOT / "data"
 REGISTER_SSO_DIR = DATA_DIR / "register_sso"
-ADAPTER_BUILD = "v1.9.81-reg-sso-account-persist"
+ADAPTER_BUILD = "v1.9.93-reg-sso-pg-verify"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -605,16 +605,75 @@ def _clean_old_sessions() -> None:
             _mirror_reg_sess(sid, None)
 
 
+_PUBLIC_REG_SESSION_FIELDS = frozenset(
+    {
+        "id",
+        "status",
+        "created_at",
+        "updated_at",
+        "email",
+        "message",
+        "error",
+        "adapter_build",
+        "batch_id",
+        "batch_index",
+        "batch_total",
+        "cancel_requested",
+        "account_created",
+        "create_account_http",
+        "create_account_ok_flag",
+        "create_account_set_cookies",
+        "create_account_error",
+        "create_http_status",
+        "create_ok",
+        "sso_attempts",
+        "sso_missing",
+        "sso_recoverable",
+        "imported_account_ids",
+        "imported_accounts",
+        "auth_json_count",
+        "probe",
+        "probe_delay_sec",
+        "sub2api_push",
+        "cliproxyapi_push",
+    }
+)
+
+_PUBLIC_REG_BATCH_FIELDS = frozenset(
+    {
+        "id",
+        "status",
+        "created_at",
+        "updated_at",
+        "count",
+        "concurrency",
+        "stagger_ms",
+        "session_ids",
+        "adapter_build",
+        "message",
+        "error",
+        "finished",
+        "ok_count",
+        "fail_count",
+        "spawned",
+        "runner_alive",
+        "cancel_requested",
+        "inflight",
+        "spawn_errors",
+    }
+)
+
+
 def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
-    out = dict(sess)
-    out.pop("_client", None)
-    out.pop("_oauth_client", None)
-    out.pop("password", None)
-    out.pop("yescaptcha_key", None)
+    out = {
+        key: sess[key]
+        for key in _PUBLIC_REG_SESSION_FIELDS
+        if key in sess and not callable(sess[key])
+    }
     # Prefer explicit imported ids; fall back to auth_json summary for UI/logs.
     imported_ids = list(out.get("imported_account_ids") or [])
     imported_accounts = list(out.get("imported_accounts") or [])
-    aj = out.get("auth_json")
+    aj = sess.get("auth_json")
     if isinstance(aj, dict):
         rows = [x for x in (aj.get("imported") or []) if isinstance(x, dict)]
         out["auth_json_count"] = len(rows)
@@ -635,9 +694,15 @@ def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
         out["imported_account_ids"] = imported_ids
     if imported_accounts:
         out["imported_accounts"] = imported_accounts
-    # Drop full auth payload from list/poll responses (secrets).
-    out.pop("auth_json", None)
     return out
+
+
+def _compact_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: batch[key]
+        for key in _PUBLIC_REG_BATCH_FIELDS
+        if key in batch and not callable(batch[key])
+    }
 
 
 def ensure_xconsole() -> None:
@@ -1156,9 +1221,19 @@ def _proxy_pool(
     username: str | None = None,
     password: str | None = None,
 ) -> list[str]:
-    """Parse multi-line proxy text into full proxy URLs."""
+    """Parse multi-line proxy text into full proxy URLs.
+
+    Preference:
+      1) explicit proxy_text (+ optional user/pass)
+      2) env / outbound_proxy_config pool
+      3) auto-discovered peer proxy (privoxy etc.)
+    """
     try:
-        from grok2api.upstream.proxy_pool import parse_proxy_pool
+        from grok2api.upstream.proxy_pool import (
+            parse_proxy_pool,
+            get_outbound_proxy_source,
+            first_working_proxy,
+        )
 
         pool = parse_proxy_pool(
             proxy_text,
@@ -1168,6 +1243,22 @@ def _proxy_pool(
         )
         if pool:
             return pool
+        # When registration form proxy is empty, reuse outbound pool text/auth.
+        src = get_outbound_proxy_source() or {}
+        if src.get("enabled", True):
+            pool = list(src.get("pool") or [])
+            if not pool:
+                pool = parse_proxy_pool(
+                    src.get("text"),
+                    username=src.get("username"),
+                    password=src.get("password"),
+                    fallback_env=False,
+                )
+            if pool:
+                return pool
+        auto = first_working_proxy()
+        if auto:
+            return [auto]
     except Exception:
         pass
     # Fallback: treat as single proxy via classic normalizer.
@@ -2339,7 +2430,7 @@ def _run_registration(
         update("registering", "loading signup page")
         _check_cancel()
         client = XConsoleAuthClient(
-            debug=True,
+            debug=False,
             proxy=proxy or "",
             signup_url="https://accounts.x.ai/sign-up?redirect=grok-com",
         )
@@ -2423,7 +2514,7 @@ def _run_registration(
             # Keep captcha wait bounded; cancel still interrupts via on_progress.
             timeout=float(os.environ.get("GROK2API_YESCAPTCHA_TIMEOUT", "120") or 120),
             poll_interval=float(os.environ.get("GROK2API_YESCAPTCHA_POLL", "2") or 2),
-            debug=True,
+            debug=False,
             on_progress=_turnstile_progress,
             # Local: no cloud fallback. YesCaptcha: allow cn/global peer fallback.
             auto_fallback_endpoint=auto_fallback,
@@ -2568,11 +2659,8 @@ def _run_registration(
             raise RuntimeError("email verification code timeout")
         code = str(code or "").strip().upper().replace(" ", "").replace("-", "")
         if len(code) != 6:
-            raise RuntimeError(
-                f"invalid email verification code shape: {code!r} "
-                f"(expect 6 alnum chars)"
-            )
-        update("registering", f"code received: {code}; verifying + creating immediately")
+            raise RuntimeError("invalid email verification code shape (expected 6 alnum chars)")
+        update("registering", "email code received; verifying + creating immediately")
 
         # Prefer empty castle token (YesCaptcha cannot mint Castle fingerprints).
         # Retry create_account once with a fresh Turnstile + fresh email code when
@@ -2581,7 +2669,7 @@ def _run_registration(
         res = None
         sc: list[str] = []
         rsc_body = ""
-        rsc_preview = ""
+        rsc_size = 0
         http_status = 0
         signup_err: str | None = None
         for ca in range(1, create_attempts + 1):
@@ -2619,8 +2707,8 @@ def _run_registration(
                         .replace("-", "")
                     )
                     if len(code) != 6:
-                        raise RuntimeError(f"fresh email code invalid: {code!r}")
-                    update("registering", f"fresh code received: {code}")
+                        raise RuntimeError("fresh email code invalid (expected 6 alnum chars)")
+                    update("registering", "fresh email code received")
                 except Exception as mail_err:  # noqa: BLE001
                     print(f"[grok-build-auth] email code refresh failed: {mail_err}")
                     break
@@ -2653,7 +2741,7 @@ def _run_registration(
             )
             sc = list(getattr(res, "set_cookies", None) or [])
             rsc_body = getattr(res, "rsc_body", "") or ""
-            rsc_preview = rsc_body[:800]
+            rsc_size = len(rsc_body.encode("utf-8"))
             http_status = int(getattr(res, "http_status", 0) or 0)
             try:
                 signup_err = client.extract_signup_error(rsc_body)
@@ -2663,22 +2751,13 @@ def _run_registration(
             print(f"[grok-build-auth] create_account set-cookies count={len(sc)}")
             print(f"[grok-build-auth] create_account ok={bool(getattr(res, 'ok', False))}")
             print(f"[grok-build-auth] create_account error={signup_err!r}")
-            print(f"[grok-build-auth] create_account rsc_body preview: {rsc_preview}")
+            print(f"[grok-build-auth] create_account body_bytes={rsc_size}")
             print(f"[grok-build-auth] adapter_build={ADAPTER_BUILD}")
             sess["create_account_http"] = http_status
             sess["create_account_ok_flag"] = bool(getattr(res, "ok", False))
             sess["create_account_set_cookies"] = len(sc)
             sess["create_account_error"] = signup_err
 
-            # Persist full body for offline diagnosis (truncated).
-            try:
-                debug_path = (
-                    ROOT / "data" / "register_sso" / f"{sid}.create_account.rsc.txt"
-                )
-                debug_path.parent.mkdir(parents=True, exist_ok=True)
-                debug_path.write_text(rsc_body[:200_000], encoding="utf-8")
-            except Exception:
-                pass
 
             if http_status != 200:
                 # Non-200 is terminal for this attempt; try once more only on 5xx.
@@ -2688,7 +2767,7 @@ def _run_registration(
                     "create_account transport failed. "
                     f"adapter_build={ADAPTER_BUILD}; HTTP {http_status}; "
                     f"error={signup_err!r}; set_cookies={len(sc)}; "
-                    f"body_preview={rsc_preview!r}"
+                    f"body_bytes={rsc_size}"
                 )
 
             # Structured hard error: retry with fresh captcha when recoverable.
@@ -2709,7 +2788,7 @@ def _run_registration(
                     "create_account rejected by xAI. "
                     f"adapter_build={ADAPTER_BUILD}; HTTP {http_status}; "
                     f"error={signup_err!r}; set_cookies={len(sc)}; "
-                    f"body_preview={rsc_preview!r}"
+                    f"body_bytes={rsc_size}"
                 )
 
             # HTTP 200 without structured error — proceed even if res.ok is False
@@ -2745,9 +2824,7 @@ def _run_registration(
             try:
                 from xconsole_client.sso import (
                     SSOExtractor,
-                    parse_all_set_cookie_urls,
                     parse_sso_from_set_cookies,
-                    parse_sso_jwt_url,
                     parse_sso_token_from_text,
                 )
 
@@ -2757,19 +2834,11 @@ def _run_registration(
                 if sso:
                     sso_attempts.append("parse_set_cookie_or_rsc")
                 if not sso and rsc_body:
-                    print(
-                        f"[grok-build-auth] set-cookie candidates="
-                        f"{parse_all_set_cookie_urls(rsc_body)[:3]}"
-                    )
-                    print(
-                        f"[grok-build-auth] primary set-cookie url="
-                        f"{parse_sso_jwt_url(rsc_body)}"
-                    )
                     extractor = SSOExtractor(
                         transport_request=client._request,
                         base_headers=client._base_headers,
                         cookie_jar=client._t.cookies,
-                        debug=True,
+                        debug=False,
                     )
                     sso = extractor.extract(
                         rsc_body, email=email, password=password, save=False
@@ -2887,11 +2956,11 @@ def _run_registration(
                 except Exception:
                     pass
             print(
-                f"[grok-build-auth] CreateSession fallback sso="
-                f"{(sso[:60] if sso else None)} attempts={sso_attempts}"
+                f"[grok-build-auth] CreateSession fallback "
+                f"sso_set={bool(sso)} attempts={sso_attempts}"
             )
 
-        print(f"[grok-build-auth] fetch_sso_token result: {sso[:60] if sso else None}")
+        print(f"[grok-build-auth] fetch_sso_token result: sso_set={bool(sso)}")
         sess["sso"] = sso
         sess["sso_attempts"] = list(sso_attempts)
         session_cookies = extract_cookies_from_auth_client(client)
@@ -2918,7 +2987,7 @@ def _run_registration(
                 f"signup_error={signup_err!r}; set_cookies={len(sc)}; "
                 f"cookie_keys={sorted((session_cookies or {}).keys())}; "
                 f"attempts={sso_attempts}; "
-                f"body_preview={rsc_preview!r}. "
+                f"body_bytes={rsc_size}. "
                 "Account may have been created, but neither RSC set-cookie chain "
                 "nor CreateSession password fallback produced an sso cookie. "
                 "Common causes: turnstile_failed, rate_limited, or account not yet "
@@ -2939,7 +3008,7 @@ def _run_registration(
                 "SSO obtained but sso_to_auth_json conversion failed "
                 "(device verify/approve/token poll; often xAI device-flow "
                 "rate_limited/slow_down under concurrent registration). "
-                f"adapter_build={ADAPTER_BUILD}; sso_prefix={sso[:24]!r}"
+                f"adapter_build={ADAPTER_BUILD}; sso_set={bool(sso)}"
             )
         _key, entry = sso_import.token_to_auth_entry(token, email=email)
         # Keep the raw SSO cookie with the account so export/re-import works
@@ -2987,11 +3056,51 @@ def _run_registration(
             )
         # Registration import is durable PostgreSQL (accounts + account_pool).
         # auth.json is not written at runtime in hybrid mode (export-only).
-        if import_result.get("storage") and import_result.get("storage") != "postgres":
+        storage = import_result.get("storage")
+        if not storage:
+            try:
+                storage = accounts._accounts_store_source()
+            except Exception:
+                storage = "unknown"
+        import_result["storage"] = storage
+        if storage != "postgres":
             print(
-                f"[grok-build-auth] WARN: import storage={import_result.get('storage')} "
-                f"(expected postgres). Check DATABASE_URL."
+                f"[grok-build-auth] WARN: import storage={storage} "
+                f"(expected postgres). Check DATABASE_URL / STORE_BACKEND."
             )
+        # Verify SSO cookie actually landed in durable store (re-read by id).
+        try:
+            imported_probe_ids = [
+                str(x.get("id"))
+                for x in (import_result.get("imported") or [])
+                if isinstance(x, dict) and x.get("id")
+            ]
+            if sso_cookie and imported_probe_ids:
+                from grok2api.pool.accounts import get_sso_value as _gsv
+                try:
+                    from grok2api.pool.auth_store import read_auth_entry as _rae
+                except Exception:
+                    _rae = None  # type: ignore[assignment]
+                for aid in imported_probe_ids[:5]:
+                    hit = _rae(aid) if _rae is not None else None
+                    payload = hit[1] if isinstance(hit, tuple) and len(hit) == 2 else None
+                    if not isinstance(payload, dict):
+                        continue
+                    if _gsv(payload):
+                        continue
+                    print(
+                        f"[grok-build-auth] WARN: account {aid} imported without SSO "
+                        f"in payload; rewriting sso field [{ADAPTER_BUILD}]"
+                    )
+                    fix = dict(payload)
+                    fix["sso"] = sso_cookie
+                    fix["sso_cookie"] = sso_cookie
+                    if reg_password:
+                        fix.setdefault("password", reg_password)
+                        fix.setdefault("register_password", reg_password)
+                    accounts.import_auth_payload(fix, merge=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[grok-build-auth] WARN: post-import SSO verify failed: {e}")
         imported_rows = [
             x for x in (import_result.get("imported") or []) if isinstance(x, dict)
         ]
@@ -3978,7 +4087,7 @@ def stop_registration_batch(batch_id: str) -> dict[str, Any]:
         "already_terminal": already,
         "missing": missing,
         "message": out.get("message") or "stop requested",
-        "batch": out,
+        "batch": _compact_batch(out),
     }
 
 
@@ -4082,7 +4191,7 @@ def list_registration_sessions() -> dict[str, Any]:
                     and stats.get("missing", 0) == 0
                 ):
                     stats["batch_status"] = "cancelled"
-            item = {**b, **stats}
+            item = {**_compact_batch(b), **stats}
             # Align top-level status with computed batch_status for UI restore filters.
             bst = str(stats.get("batch_status") or "").lower()
             cur = str(b.get("status") or "").lower()
@@ -4108,20 +4217,11 @@ def list_registration_sessions() -> dict[str, Any]:
     }
 
 
-def get_registration_session(
-    sid: str, *, include_auth_json: bool = False
-) -> dict[str, Any] | None:
+def get_registration_session(sid: str) -> dict[str, Any] | None:
     sess = _load_reg_sess(sid)
     if not sess:
         return None
-    out = dict(sess)
-    out.pop("_client", None)
-    out.pop("_oauth_client", None)
-    out.pop("password", None)
-    out.pop("yescaptcha_key", None)
-    if not include_auth_json:
-        out.pop("auth_json", None)
-    return out
+    return _compact_session(sess)
 
 
 def _batch_stats(
@@ -4308,7 +4408,7 @@ def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
         )
     except Exception:
         pass
-    out = {**b, **stats, "sessions": sessions}
+    out = {**_compact_batch(b), **stats, "sessions": sessions}
     # Surface effective status for older UIs that only read `status`.
     if stats.get("batch_status"):
         # Don't clobber an explicit cooperative "stopping" marker while workers live.
@@ -4335,7 +4435,7 @@ def main() -> int:
     sid = result["id"]
     deadline = time.time() + 600
     while time.time() < deadline:
-        sess = get_registration_session(sid, include_auth_json=True)
+        sess = get_registration_session(sid)
         if not sess:
             print("session disappeared", file=sys.stderr)
             return 1

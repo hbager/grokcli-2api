@@ -22,7 +22,10 @@ import (
 
 func TestAnthropicMessagesE2EAgainstFakeUpstream(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/chat/completions" {
+		// Upstream client now targets /responses (CPA-compatible). Accept both for
+		// transitional fixtures that still emit chat.completion.chunk frames.
+		if r.URL.Path != "/v1/responses" && r.URL.Path != "/responses" &&
+			r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/chat/completions" {
 			http.NotFound(w, r)
 			return
 		}
@@ -190,6 +193,14 @@ func TestAnthropicMessagesE2EAgainstFakeUpstream(t *testing.T) {
 				t.Fatalf("missing %q in %q", marker, out)
 			}
 		}
+		// Alias rewrite must land as Claude-facing keys inside escaped partial_json.
+		// SSE data is JSON, so quotes inside partial_json are backslash-escaped.
+		if !strings.Contains(out, `\"file_path\"`) || !strings.Contains(out, `\"old_string\"`) {
+			t.Fatalf("expected normalized Edit args in partial_json, body=%q", out)
+		}
+		if strings.Contains(out, `\"file_path\":\"/right\"`) == false {
+			t.Fatalf("expected rewritten file_path=/right in partial_json, body=%q", out)
+		}
 	})
 
 	t.Run("empty stream failovers then errors", func(t *testing.T) {
@@ -219,11 +230,19 @@ func TestAnthropicMessagesE2EAgainstFakeUpstream(t *testing.T) {
 		if hits < 2 {
 			t.Fatalf("expected failover across accounts, hits=%d", hits)
 		}
-		// After both empty, stream may open with terminal error frames.
+		// After both empty, early message_start is open — must still close with
+		// Anthropic event:error + message_stop (not a silent end_turn).
 		out := rec.Body.String()
-		if rec.Code == http.StatusOK {
-			if !strings.Contains(out, "event: error") && !strings.Contains(out, "empty model output") {
-				t.Fatalf("expected empty error terminal, body=%q", out)
+		if rec.Code != http.StatusOK {
+			// Non-stream style error is also acceptable if failover never opened SSE.
+			if !strings.Contains(out, "empty model output") && !strings.Contains(out, `"type":"error"`) {
+				t.Fatalf("expected empty/upstream error body, status=%d body=%q", rec.Code, out)
+			}
+			return
+		}
+		for _, marker := range []string{"event: error", "empty model output", "event: message_stop"} {
+			if !strings.Contains(out, marker) {
+				t.Fatalf("missing %q in empty-stream terminal body=%q", marker, out)
 			}
 		}
 	})
@@ -293,6 +312,12 @@ func (m *memAffinity) BindAffinity(_ context.Context, fingerprint, accountID str
 	m.bound[fingerprint] = accountID
 	return nil
 }
+func (m *memAffinity) ClearAffinity(_ context.Context, fingerprint string) error {
+	if m != nil && m.bound != nil {
+		delete(m.bound, fingerprint)
+	}
+	return nil
+}
 
 func merge(base map[string]any, extra map[string]any) map[string]any {
 	out := map[string]any{}
@@ -308,3 +333,41 @@ func merge(base map[string]any, extra map[string]any) map[string]any {
 // Ensure scanner helpers stay available for future SSE asserts.
 var _ = bufio.NewScanner
 var _ = io.EOF
+
+func TestChatCompletionsStreamUpdateRemap(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// Single complete Update with search/replace + chatter.
+		frame := "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Update\",\"arguments\":\"{\\\"path\\\":\\\"/x.go\\\",\\\"search\\\":\\\"a\\\",\\\"replace\\\":\\\"b\\\",\\\"explanation\\\":\\\"x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"
+		_, _ = w.Write([]byte(frame))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer local.Close()
+	h := server.NewMux(server.Options{
+		Ready:       func() bool { return true },
+		ChatEnabled: true,
+		APIKeys:     auth.NewAPIKeyVerifier(config.Config{LegacyAPIKey: "secret", RequireAPIKey: "true"}, nil),
+		Candidates:  []pool.Candidate{{ID: "acc", Token: "t", Enabled: true}},
+		Config:      config.Config{UpstreamBase: local.URL + "/v1", DefaultModel: "grok-4.5"},
+	})
+	body := `{"model":"grok-4.5","stream":true,"tools":[{"type":"function","function":{"name":"Edit","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"edit"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	out := rec.Body.String()
+	if !strings.Contains(out, `"name":"Edit"`) && !strings.Contains(out, `"name": "Edit"`) {
+		t.Fatalf("expected Edit remap in chat stream: %s", out)
+	}
+	if strings.Contains(out, `"name":"Update"`) {
+		t.Fatalf("Update leaked: %s", out)
+	}
+	// Args are JSON-encoded inside the SSE frame; look for escaped keys.
+	if !strings.Contains(out, "file_path") || !strings.Contains(out, "old_string") || !strings.Contains(out, "new_string") {
+		t.Fatalf("expected densified Edit args: %s", out)
+	}
+	if strings.Contains(out, "explanation") {
+		t.Fatalf("explanation leaked (Invalid tool parameters): %s", out)
+	}
+}

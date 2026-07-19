@@ -68,11 +68,11 @@
       try {
         var t = localStorage.getItem("g2a_theme");
         if (t !== "light" && t !== "dark") {
-          t = "dark";
+          t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
         }
         document.documentElement.setAttribute("data-theme", t);
         document.documentElement.style.colorScheme = t;
-        document.documentElement.style.background = t === "light" ? "#f6f1e7" : "#171713";
+        document.documentElement.style.background = t === "light" ? "#f5f7fb" : "#0a0a0f";
         var tok = localStorage.getItem("g2a_admin_token") || "";
         var ts = Number(localStorage.getItem("g2a_admin_token_ts") || 0) || 0;
         var grace = tok && ts && (Date.now() - ts) < 7 * 24 * 3600 * 1000;
@@ -92,10 +92,10 @@
 
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>账号 · grokcli-2api</title>
+  <title>账号 / 轮询 · grokcli-2api</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Azeret+Mono:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700;800&family=Barlow:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
   <link rel="stylesheet" href="/static/dist/admin-antd.880e6214a1.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
@@ -114,8 +114,7 @@
       <nav class="g2a-menu">
         <a class="g2a-menu-item " href="/admin" data-page="overview"><span class="g2a-menu-ico">◫</span><span>概览</span></a>
         <a class="g2a-menu-item " href="/admin/keys" data-page="keys"><span class="g2a-menu-ico">🔑</span><span>API Keys</span></a>
-        <a class="g2a-menu-item is-active" href="/admin/accounts" data-page="accounts"><span class="g2a-menu-ico">👥</span><span>账号</span></a>
-        <a class="g2a-menu-item " href="/admin/rotation" data-page="rotation"><span class="g2a-menu-ico">⇄</span><span>轮询</span></a>
+        <a class="g2a-menu-item is-active" href="/admin/accounts" data-page="accounts"><span class="g2a-menu-ico">👥</span><span>账号 / 轮询</span></a>
         <a class="g2a-menu-item " href="/admin/usage" data-page="usage"><span class="g2a-menu-ico">Σ</span><span>用量</span></a>
         <a class="g2a-menu-item " href="/admin/logs" data-page="logs"><span class="g2a-menu-ico">📜</span><span>任务日志</span></a>
         <a class="g2a-menu-item " href="/admin/models" data-page="models"><span class="g2a-menu-ico">▣</span><span>模型</span></a>
@@ -132,7 +131,7 @@
     <div class="g2a-main">
       <header class="g2a-header">
         <div>
-          <h1 id="page-title">账号</h1>
+          <h1 id="page-title">账号 / 轮询</h1>
           <p id="page-sub">Grok 账号、设备码登录、额度与导入导出</p>
         </div>
         <div class="g2a-header-actions">
@@ -143,6 +142,29 @@
       </header>
       <div class="g2a-mobile-nav" id="mobile-nav"></div>
       <div class="g2a-content">
+
+<section class="g2a-card">
+  <div class="g2a-card-head">
+    <div>
+      <h3>轮询策略</h3>
+      <p>所有账号对等，无主账号。支持 round_robin / least_used / random。</p>
+    </div>
+  </div>
+  <div class="g2a-form-row">
+    <div class="g2a-field">
+      <label for="account-mode">模式</label>
+      <select id="account-mode">
+        <option value="round_robin">round_robin（顺序轮流）</option>
+        <option value="least_used">least_used（优先少用）</option>
+        <option value="random">random（随机）</option>
+      </select>
+    </div>
+    <div class="g2a-field g2a-field-action">
+      <label>&nbsp;</label>
+      <button class="g2a-btn g2a-btn-primary" id="btn-save-mode">保存</button>
+    </div>
+  </div>
+</section>
 
 <section class="g2a-card">
   <div class="g2a-card-head">
@@ -235,8 +257,8 @@
         <tr>
           <th><input type="checkbox" id="acc-check-page" /></th>
           <th>邮箱 / ID</th>
-          <th>状态</th>
-          <th>池</th>
+          <th>Token</th>
+          <th>轮询状态</th>
           <th>用量</th>
           <th>额度</th>
           <th>探测</th>
@@ -292,6 +314,7 @@
     <div class="g2a-field">
       <label id="reg-api-key-label">邮箱 API Key</label>
       <input id="reg-api-key" placeholder="按服务填写，各自独立保存" autocomplete="off" name="reg-api-key" />
+      <label class="g2a-check"><input type="checkbox" id="reg-api-key-clear" /> 清除当前服务已保存的 Key</label>
     </div>
     <div class="g2a-field">
       <label id="reg-domain-label">邮箱域名</label>
@@ -307,6 +330,7 @@
     <div class="g2a-field" id="reg-yescaptcha-wrap" style="display:none">
       <label>YesCaptcha Key</label>
       <input id="reg-yescaptcha-key" placeholder="仅 YesCaptcha 模式需要" />
+      <label class="g2a-check"><input type="checkbox" id="reg-yescaptcha-key-clear" /> 清除已保存的 Key</label>
     </div>
     <div class="g2a-field"><label>数量</label><input id="reg-count" type="number" min="1" value="1" /></div>
     <div class="g2a-field"><label title="同时注册的线程数：3 就是同时只跑 3 个，完成一个再补一个">线程数</label><input id="reg-concurrency" type="number" min="1" max="10" value="5" /></div>
@@ -330,7 +354,7 @@
       <p class="g2a-muted" style="margin:4px 0 0" id="reg-proxy-hint">支持多行代理池；批量注册时按策略轮换。共享账号可填下方用户名/密码。</p>
     </div>
     <div class="g2a-field"><label>代理用户名</label><input id="reg-proxy-username" placeholder="可选，共享认证" /></div>
-    <div class="g2a-field"><label>代理密码</label><input id="reg-proxy-password" type="password" placeholder="可选，共享认证" /></div>
+    <div class="g2a-field"><label>代理密码</label><input id="reg-proxy-password" type="password" placeholder="可选，共享认证" /><label class="g2a-check"><input type="checkbox" id="reg-proxy-password-clear" /> 清除已保存的密码</label></div>
     <div class="g2a-field">
       <label for="reg-proxy-strategy" title="round_robin=按序轮换 · random=随机 · sticky=始终用第一个">代理策略</label>
       <select id="reg-proxy-strategy">
@@ -466,6 +490,6 @@
   <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.d65f32a200.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.720aaf9d28.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.5b68f5842a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

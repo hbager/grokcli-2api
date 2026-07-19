@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
+
 	"github.com/hm2899/grokcli-2api/internal/protocol/historycompact"
 )
 
@@ -26,9 +28,8 @@ var unsupportedUpstreamParams = map[string]bool{
 	"logprobs":          true,
 	"top_logprobs":      true,
 	"n":                 true,
-	// Python oracle strips public prompt_cache_* before upstream; affinity uses private copies.
-	"prompt_cache_key":         true,
-	"prompt_cache_retention":   true,
+	// Keep public prompt_cache_key / prompt_cache_retention for upstream
+	// (CPA-style Grok prompt cache). Only strip private affinity copies.
 	"_history_compact":         true,
 	"_prompt_stabilize":        true,
 	"_prompt_cache_key":        true,
@@ -151,10 +152,19 @@ func stabilizeMessage(msg map[string]any) (map[string]any, int) {
 			delete(item, "thought_signature")
 			if fn, ok := item["function"].(map[string]any); ok {
 				fn2 := cloneAnyMap(fn)
+				toolName := firstNonEmptyString(fn2["name"], item["name"])
 				if args, ok := fn2["arguments"].(string); ok {
+					// Normalize shell aliases (cmd→command) for upstream Grok history.
+					if isShellToolName(toolName) {
+						if fixed := toolcall.NormalizeJSON(args, toolName); fixed != "" {
+							args = fixed
+						}
+					}
 					if canon := canonicalJSONText(args); canon != "" {
 						fn2["arguments"] = canon
 						canonCount++
+					} else {
+						fn2["arguments"] = args
 					}
 				} else if fn2["arguments"] == nil {
 					fn2["arguments"] = "{}"
@@ -162,6 +172,12 @@ func stabilizeMessage(msg map[string]any) (map[string]any, int) {
 					fn2["arguments"] = canonicalJSONText(fn2["arguments"])
 					if fn2["arguments"] == "" {
 						fn2["arguments"] = "{}"
+					}
+					// Shell object args: re-normalize if possible.
+					if isShellToolName(toolName) {
+						if fixed := toolcall.NormalizeJSON(fmt.Sprint(fn2["arguments"]), toolName); fixed != "" {
+							fn2["arguments"] = fixed
+						}
 					}
 					canonCount++
 				}
@@ -185,8 +201,15 @@ func stabilizeMessage(msg map[string]any) (map[string]any, int) {
 		out["tool_calls"] = stableCalls
 	}
 	if fc, ok := msg["function_call"].(map[string]any); ok && stringFromAny(fc["name"]) != "" {
-		fn2 := map[string]any{"name": stringFromAny(fc["name"])}
+		toolName := stringFromAny(fc["name"])
+		fn2 := map[string]any{"name": toolName}
 		if args, ok := fc["arguments"].(string); ok {
+			// Normalize shell aliases (cmd→command) for upstream Grok history.
+			if isShellToolName(toolName) {
+				if fixed := toolcall.NormalizeJSON(args, toolName); fixed != "" {
+					args = fixed
+				}
+			}
 			if canon := canonicalJSONText(args); canon != "" {
 				fn2["arguments"] = canon
 			} else {
@@ -196,6 +219,11 @@ func stabilizeMessage(msg map[string]any) (map[string]any, int) {
 			fn2["arguments"] = canonicalJSONText(fc["arguments"])
 			if fn2["arguments"] == "" {
 				fn2["arguments"] = fmt.Sprint(fc["arguments"])
+			}
+			if isShellToolName(toolName) {
+				if fixed := toolcall.NormalizeJSON(fmt.Sprint(fn2["arguments"]), toolName); fixed != "" {
+					fn2["arguments"] = fixed
+				}
 			}
 		} else {
 			fn2["arguments"] = "{}"
@@ -440,9 +468,20 @@ func normalizeFunctionTool(tool map[string]any) map[string]any {
 		outFn["name"] = name
 		rawParams := firstNonNil(outFn["parameters"], outFn["input_schema"], tool["parameters"], tool["input_schema"])
 		outFn["parameters"] = ensureToolParameters(rawParams)
+		outFn["parameters"] = hardenShellToolParameters(name, outFn["parameters"])
 		delete(outFn, "input_schema")
 		if outFn["description"] == nil && tool["description"] != nil {
 			outFn["description"] = tool["description"]
+		}
+		// Nudge description so the model sticks to the schema parameter name.
+		if isShellToolName(name) {
+			desc := stringFromAny(outFn["description"])
+			hint := " Argument is the shell command string or argv array."
+			if desc == "" {
+				outFn["description"] = "Run a shell command." + hint
+			} else if !strings.Contains(strings.ToLower(desc), `parameter name "command"`) && !strings.Contains(strings.ToLower(desc), "parameter name 'command'") {
+				outFn["description"] = desc + hint
+			}
 		}
 		return map[string]any{"type": "function", "function": outFn}
 	}
@@ -455,7 +494,111 @@ func normalizeFunctionTool(tool map[string]any) map[string]any {
 		outFn["description"] = tool["description"]
 	}
 	outFn["parameters"] = ensureToolParameters(firstNonNil(tool["parameters"], tool["input_schema"]))
+	outFn["parameters"] = hardenShellToolParameters(name, outFn["parameters"])
+	if isShellToolName(name) {
+		desc := stringFromAny(outFn["description"])
+		hint := " Argument is the shell command string or argv array."
+		if desc == "" {
+			outFn["description"] = "Run a shell command." + hint
+		} else if !strings.Contains(strings.ToLower(desc), `parameter name "command"`) {
+			outFn["description"] = desc + hint
+		}
+	}
 	return map[string]any{"type": "function", "function": outFn}
+}
+
+func isShellToolName(name string) bool {
+	// Keep parity with toolcall.IsShellTool so Codex exec_command / run_command
+	// get schema harden (cmd→command) and history alias rewrite.
+	return toolcall.IsShellTool(name)
+}
+
+// hardenShellToolParameters forces a single canonical "command" property for
+// shell-like tools so Grok stops oscillating between cmd/command/args.
+func hardenShellToolParameters(name string, params any) map[string]any {
+	out, ok := params.(map[string]any)
+	if !ok || out == nil {
+		out = emptyToolParameters()
+	} else {
+		out = cloneAnyMap(out)
+	}
+	if !isShellToolName(name) {
+		return out
+	}
+	if out["type"] == nil {
+		out["type"] = "object"
+	}
+	props, _ := out["properties"].(map[string]any)
+	if props == nil {
+		props = map[string]any{}
+	} else {
+		props = cloneAnyMap(props)
+	}
+	// Keep existing command schema if present; otherwise define a clear string|array schema.
+	cmdSchema, _ := props["command"].(map[string]any)
+	if cmdSchema == nil {
+		// Steal description from common wrong names if any.
+		desc := ""
+		for _, alt := range []string{"cmd", "argv", "args", "shell_command", "cmdline", "command_line", "script"} {
+			if altSchema, ok := props[alt].(map[string]any); ok {
+				if d := stringFromAny(altSchema["description"]); d != "" {
+					desc = d
+					break
+				}
+			}
+		}
+		if desc == "" {
+			desc = "Shell command as a single string (preferred) or argv array of strings."
+		}
+		cmdSchema = map[string]any{
+			"description": desc,
+			// JSON Schema union as array of types is widely accepted.
+			"type":  []any{"string", "array"},
+			"items": map[string]any{"type": "string"},
+		}
+	} else {
+		cmdSchema = cloneAnyMap(cmdSchema)
+		// Ensure description mentions the required parameter name.
+		d := stringFromAny(cmdSchema["description"])
+		if d == "" {
+			cmdSchema["description"] = "Shell command string or argv array of strings."
+		} else if !strings.Contains(strings.ToLower(d), "must be command") && !strings.Contains(strings.ToLower(d), "parameter name") {
+			cmdSchema["description"] = d
+		}
+	}
+	// Rebuild properties: command first, then non-conflicting extras (workdir/timeout).
+	newProps := map[string]any{"command": cmdSchema}
+	for k, v := range props {
+		lk := strings.ToLower(strings.TrimSpace(k))
+		switch lk {
+		case "command", "cmd", "argv", "args", "shell_command", "cmdline", "command_line", "script", "bash", "line":
+			continue // drop aliases from schema so model cannot pick them
+		default:
+			newProps[k] = v
+		}
+	}
+	out["properties"] = newProps
+	// required must include command and must not list aliases
+	reqOut := []any{"command"}
+	if rawReq, ok := out["required"].([]any); ok {
+		for _, item := range rawReq {
+			key := strings.ToLower(strings.TrimSpace(fmt.Sprint(item)))
+			switch key {
+			case "command", "cmd", "argv", "args", "shell_command", "cmdline", "command_line", "script":
+				continue
+			case "":
+				continue
+			default:
+				reqOut = append(reqOut, item)
+			}
+		}
+	}
+	out["required"] = reqOut
+	// Strict-ish: discourage invented keys.
+	if out["additionalProperties"] == nil {
+		out["additionalProperties"] = false
+	}
+	return out
 }
 
 func ensureToolParameters(params any) map[string]any {

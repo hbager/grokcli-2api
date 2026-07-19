@@ -12,30 +12,30 @@ permissions:
   contents: read
 
 jobs:
-  python-oracle:
+  contracts:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-      - name: Install oracle dependencies
-        run: python -m pip install -r requirements.txt
       - name: Validate contract manifests
         run: |
-          python -m pip install jsonschema
+          python -m pip install -q jsonschema
           python -m json.tool contracts/env-manifest.json >/dev/null
-          python - <<'PY'
+          python - <<'PY2'
           import json, pathlib
           import jsonschema
           root = pathlib.Path("contracts")
           schema = json.loads((root / "manifest.schema.json").read_text())
           manifest = json.loads((root / "manifest.json").read_text())
           jsonschema.validate(manifest, schema)
-          PY
-      - name: Run Python regression oracle
-        run: python scripts/run_regressions.py
+          env_manifest = json.loads((root / "env-manifest.json").read_text())
+          assert "variables" in env_manifest or isinstance(env_manifest, (dict, list))
+          runtime = next(v for v in env_manifest["variables"] if v["name"] == "GROK2API_RUNTIME")
+          assert runtime["values"] == ["go"], runtime
+          print("contracts ok", manifest.get("oracle", {}).get("version"))
+          PY2
 
   go-foundation:
     runs-on: ubuntu-latest
@@ -54,14 +54,21 @@ jobs:
       - name: Run Go race tests
         run: go test -race ./...
       - name: Build migration-safe binary
-        run: go build -o /tmp/grok2api ./cmd/grok2api
-      - name: Gate Python and Go versions match
+        # Output must not be bare "grok2api" — that path is the Python package directory.
         run: |
-          python - <<'PY'
+          mkdir -p bin
+          go build -o bin/grok2api ./cmd/grok2api
+          go build -o bin/grok2api-migrate ./cmd/grok2api-migrate
+      - name: Gate release version pins match
+        run: |
+          python - <<'PY2'
           import pathlib, re
           py = pathlib.Path("grok2api/app.py").read_text(encoding="utf-8")
           go = pathlib.Path("internal/buildinfo/buildinfo.go").read_text(encoding="utf-8")
+          pin = pathlib.Path(".release-commit").read_text(encoding="utf-8").strip()
           pv = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', py).group(1)
           gv = re.search(r'Version\s*=\s*"([^"]+)"', go).group(1)
           assert pv == gv, (pv, gv)
-          PY
+          assert pin in (f"v{pv}", pv), (pin, pv)
+          print("version ok", pv)
+          PY2

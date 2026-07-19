@@ -24,6 +24,8 @@ Everything else is Go:
 
 ## Hard rules
 
+0. **Python public API server has been removed.** `GROK2API_RUNTIME=python` is no longer supported.
+
 1. **Go must not reimplement** captcha, browser automation, Turnstile, MoeMail/YYDS mailbox flows, or registration device-code browser execution.
 2. **Go may orchestrate** registration by calling an internal Python registration HTTP API:
    - registration base: `/internal/registration/v1/*`
@@ -32,7 +34,7 @@ Everything else is Go:
    - client: `internal/registration/client`
 3. **Go may invoke SSO conversion scripts** as subprocesses for admin import endpoints, or call a thin Python helper HTTP wrapper. Prefer script/subprocess first to avoid re-hosting captcha stacks.
 4. Python registration/captcha process is a **sidecar**, not the public API server.
-5. Public `GROK2API_RUNTIME=go` is the target default once parity is sufficient. Docker may still default Python until cutover is complete.
+5. Public `GROK2API_RUNTIME=go` is the default. Python remains only as registration/SSO/captcha sidecars.
 
 ## Process model
 
@@ -70,6 +72,7 @@ Everything else is Go:
 | `/admin/api/models/sync` | Go |
 | `/admin/api/settings/{cliproxyapi,sub2api}` + export/push formats | Go |
 | `/admin/api/accounts/register-*` | Go facade → Python registration service |
+| `/admin/api/accounts/register-email/config` | Go (PG `registration_config`) |
 | `/admin/api/accounts/import-sso` and SSO conversion | Go facade → Python scripts/service |
 | captcha solve endpoints / browser pool | Python only |
 | `/internal/registration/v1/*` | Python only |
@@ -77,19 +80,23 @@ Everything else is Go:
 
 ## Feature flags
 
-Staged Go flags remain:
+Staged Go flags remain (defaults are **on** after Python main removal):
 
-- `GROK2API_RUNTIME=go|python`
-- `GROK2API_GO_PUBLIC_READ`
-- `GROK2API_GO_CHAT`
-- `GROK2API_GO_MESSAGES`
-- `GROK2API_GO_RESPONSES`
-- `GROK2API_GO_ADMIN_READ`
-- `GROK2API_GO_ADMIN_WRITE`
-- `GROK2API_GO_MAINTAINER`
-- `GROK2API_GO_WRITES`
+- `GROK2API_RUNTIME=go` only (`python` is rejected by Go config + entrypoint)
+- `GROK2API_GO_PUBLIC_READ` (default true)
+- `GROK2API_GO_CHAT` (default true)
+- `GROK2API_GO_MESSAGES` (default true)
+- `GROK2API_GO_RESPONSES` (default true)
+- `GROK2API_GO_ADMIN_READ` (default true)
+- `GROK2API_GO_ADMIN_WRITE` (default true)
+- `GROK2API_GO_MAINTAINER` (default true)
+- `GROK2API_GO_WRITES` (default true)
+- `GROK2API_GO_OWNERSHIP_MODE=all` (default)
 - `GROK2API_REGISTRATION_SERVICE_URL` (Python sidecar URL)
 - `GROK2API_REGISTRATION_MODE=external`
+- `GROK2API_STICKY_FIRST_ONLY` (default true)
+- `GROK2API_FIRST_BYTE_PROBE_WORKERS` (default 3)
+- `GROK2API_CODEX_FORCE_REASONING_LOW` (default true)
 
 ## Non-goals for Go
 

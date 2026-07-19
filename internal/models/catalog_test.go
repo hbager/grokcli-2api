@@ -6,6 +6,35 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/config"
 )
 
+func TestCatalogUsesLiveDefaultModel(t *testing.T) {
+	runtime := config.NewRuntimeConfig(config.Config{DefaultModel: "before"})
+	catalog := NewDynamicCatalog(runtime.Load, nil)
+	if got := catalog.Resolve(""); got != "before" {
+		t.Fatalf("Resolve before update=%q", got)
+	}
+	runtime.ApplyStoreSettings(map[string]any{"default_model": "after"})
+	if got := catalog.Resolve(""); got != "after" {
+		t.Fatalf("Resolve after update=%q", got)
+	}
+}
+
+func TestCatalogLoadsOneConfigSnapshotPerOperation(t *testing.T) {
+	loads := 0
+	catalog := NewDynamicCatalog(func() config.Config {
+		loads++
+		return config.Config{DefaultModel: "grok-4.5"}
+	}, nil)
+	catalog.Resolve("custom-model")
+	if loads != 1 {
+		t.Fatalf("Resolve config loads=%d want 1", loads)
+	}
+	loads = 0
+	catalog.PublicModels(t.Context())
+	if loads != 1 {
+		t.Fatalf("PublicModels config loads=%d want 1", loads)
+	}
+}
+
 func TestFallbackModelsIncludePythonExtras(t *testing.T) {
 	catalog := NewCatalog(config.Config{DefaultModel: "grok-4.5"}, nil)
 	items := catalog.PublicModels(t.Context())

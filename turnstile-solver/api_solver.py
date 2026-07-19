@@ -684,6 +684,92 @@ class TurnstileAPIServer:
         
         return False
 
+
+    async def _dismiss_cookie_banners(self, page, index: int = 0):
+        """Dismiss OneTrust / cookie consent overlays that intercept Turnstile clicks."""
+        # CSS / text selectors commonly used by xAI / CF pages.
+        selectors = [
+            '#onetrust-accept-btn-handler',
+            'button#onetrust-accept-btn-handler',
+            '#onetrust-reject-all-handler',
+            'button[aria-label*="Accept"]',
+            'button:has-text("Accept All Cookies")',
+            'button:has-text("Accept all cookies")',
+            'button:has-text("Accept All")',
+            'button:has-text("I Accept")',
+            'button:has-text("Allow all")',
+            'button:has-text("同意")',
+            'button:has-text("接受全部")',
+            '.onetrust-close-btn-handler',
+            '#onetrust-close-btn-container button',
+        ]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                # short visibility check
+                if await loc.count() == 0:
+                    continue
+                try:
+                    visible = await loc.is_visible(timeout=300)
+                except Exception:
+                    visible = False
+                if not visible:
+                    continue
+                try:
+                    await loc.click(timeout=800, force=True)
+                except Exception:
+                    try:
+                        await page.evaluate(
+                            """(s) => { const el = document.querySelector(s); if (el) el.click(); }""",
+                            sel if not sel.startswith('button:has-text') else '#onetrust-accept-btn-handler',
+                        )
+                    except Exception:
+                        pass
+                # Hide residual overlay so it cannot intercept pointer events.
+                try:
+                    await page.evaluate(
+                        """
+                        () => {
+                          const ids = ['onetrust-consent-sdk','onetrust-banner-sdk','onetrust-pc-sdk'];
+                          for (const id of ids) {
+                            const el = document.getElementById(id);
+                            if (el) { el.style.display='none'; el.style.pointerEvents='none'; el.remove(); }
+                          }
+                          document.querySelectorAll('.onetrust-pc-dark-filter, .ot-fade-in').forEach(el => {
+                            el.style.display='none'; el.style.pointerEvents='none';
+                          });
+                          document.body && document.body.classList.remove('ot-overflow-y-hidden');
+                          document.documentElement && document.documentElement.classList.remove('ot-overflow-y-hidden');
+                        }
+                        """
+                    )
+                except Exception:
+                    pass
+                if self.debug:
+                    logger.debug(f"Browser {index}: Dismissed cookie banner via {sel}")
+                await asyncio.sleep(0.3)
+                return True
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"Browser {index}: cookie dismiss {sel} failed: {e}")
+                continue
+        # Always try force-hide even if no button found.
+        try:
+            await page.evaluate(
+                """
+                () => {
+                  const ids = ['onetrust-consent-sdk','onetrust-banner-sdk','onetrust-pc-sdk'];
+                  for (const id of ids) {
+                    const el = document.getElementById(id);
+                    if (el) { el.style.display='none'; el.style.pointerEvents='none'; }
+                  }
+                }
+                """
+            )
+        except Exception:
+            pass
+        return False
+
     async def _try_click_strategies(self, page, index: int):
         strategies = [
             ('checkbox_click', lambda: self._find_and_click_checkbox(page, index)),
@@ -714,7 +800,10 @@ class TurnstileAPIServer:
         try:
             # Пробуем кликнуть напрямую без count() проверки
             locator = page.locator(selector).first
-            await locator.click(timeout=1000)
+            try:
+                await locator.click(timeout=1000, force=True)
+            except Exception:
+                await locator.click(timeout=1000)
             return True
         except Exception as e:
             # Логируем ошибку только в debug режиме
@@ -991,12 +1080,22 @@ class TurnstileAPIServer:
 
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
                 await self._unblock_rendering(page)
+                try:
+                    await self._dismiss_cookie_banners(page, index)
+                except Exception as e:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: cookie dismiss after goto failed: {e}")
 
                 if self.debug:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
 
                 await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
-                await asyncio.sleep(3)
+                await asyncio.sleep(1)
+                try:
+                    await self._dismiss_cookie_banners(page, index)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
 
                 locator = page.locator('input[name="cf-turnstile-response"]')
                 max_attempts = 30
@@ -1043,6 +1142,10 @@ class TurnstileAPIServer:
                                     continue
 
                         if attempt > 2 and attempt % 3 == 0 and click_count < max_clicks:
+                            try:
+                                await self._dismiss_cookie_banners(page, index)
+                            except Exception:
+                                pass
                             click_success = await self._try_click_strategies(page, index)
                             click_count += 1
                             if click_success and self.debug:

@@ -9,8 +9,7 @@ This runbook enables the staged Go implementation of:
 - `POST /v1/messages/count_tokens`
 - `POST /messages/count_tokens`
 
-Python remains the production oracle until this canary is explicitly enabled and
-verified. Docker still defaults `GROK2API_RUNTIME=python`.
+Go owns the production public API in v2.0.1. Python remains only for the documented registration, SSO, and captcha sidecars.
 
 ## Preconditions
 
@@ -218,21 +217,12 @@ Usage ledger rows from Go should set:
 
 ## Rollback
 
-Fastest safe rollback is runtime cutover, not a rebuild:
+Roll back by deploying the previous known-good Go release. The Python public API runtime was removed in v2.0.1 and `GROK2API_RUNTIME=python` is no longer supported.
 
-```bash
-GROK2API_RUNTIME=python
-# optional explicit disable
-GROK2API_GO_MESSAGES=0
-```
-
-Then restart the process/container/service.
-
-Python continues to own:
+Python continues to own only:
 
 - registration captcha/browser execution
-- full admin write surfaces (unless separately enabled)
-- any route whose Go flag remains false
+- SSO import and documented sidecar tasks
 
 ## Known remaining gaps vs Python
 

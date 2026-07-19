@@ -1,10 +1,13 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -56,8 +59,18 @@ type Config struct {
 	OutboundMaxTools                int
 	OutboundMaxToolsOpenAI          int
 	OutboundMaxToolsResponsesNative int
+	OutboundProxyConfigured         bool
+	OutboundProxyEnabled            bool
+	OutboundProxy                   string
+	OutboundProxyUsername           string
+	OutboundProxyPassword           string
+	OutboundProxyStrategy           string
 	OutboundToolGap                 time.Duration
 	OutboundToolGapNative           time.Duration
+	StickyFirstOnly                 bool
+	FirstByteProbeWorkers           int // parallel failover first-byte probes (after sticky miss)
+	MaxFailoverAttempts             int
+	CodexForceReasoningLow          bool
 	Workers                         int
 	MaintainerLeader                string
 	MaintainerLeaderTTL             time.Duration
@@ -85,35 +98,35 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	goPublicRead, err := envBool("GROK2API_GO_PUBLIC_READ", false)
+	goPublicRead, err := envBool("GROK2API_GO_PUBLIC_READ", true)
 	if err != nil {
 		return Config{}, err
 	}
-	goChat, err := envBool("GROK2API_GO_CHAT", false)
+	goChat, err := envBool("GROK2API_GO_CHAT", true)
 	if err != nil {
 		return Config{}, err
 	}
-	goMessages, err := envBool("GROK2API_GO_MESSAGES", false)
+	goMessages, err := envBool("GROK2API_GO_MESSAGES", true)
 	if err != nil {
 		return Config{}, err
 	}
-	goResponses, err := envBool("GROK2API_GO_RESPONSES", false)
+	goResponses, err := envBool("GROK2API_GO_RESPONSES", true)
 	if err != nil {
 		return Config{}, err
 	}
-	goAdminRead, err := envBool("GROK2API_GO_ADMIN_READ", false)
+	goAdminRead, err := envBool("GROK2API_GO_ADMIN_READ", true)
 	if err != nil {
 		return Config{}, err
 	}
-	goAdminWrite, err := envBool("GROK2API_GO_ADMIN_WRITE", false)
+	goAdminWrite, err := envBool("GROK2API_GO_ADMIN_WRITE", true)
 	if err != nil {
 		return Config{}, err
 	}
-	goMaintainer, err := envBool("GROK2API_GO_MAINTAINER", false)
+	goMaintainer, err := envBool("GROK2API_GO_MAINTAINER", true)
 	if err != nil {
 		return Config{}, err
 	}
-	goWrites, err := envBool("GROK2API_GO_WRITES", false)
+	goWrites, err := envBool("GROK2API_GO_WRITES", true)
 	if err != nil {
 		return Config{}, err
 	}
@@ -137,16 +150,31 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	stickyFirstOnly, err := envBool("GROK2API_STICKY_FIRST_ONLY", true)
+	if err != nil {
+		return Config{}, err
+	}
+	firstByteProbeWorkers, err := envInt("GROK2API_FIRST_BYTE_PROBE_WORKERS", 3, 1, 8)
+	if err != nil {
+		return Config{}, err
+	}
+	codexForceReasoningLow, err := envBool("GROK2API_CODEX_FORCE_REASONING_LOW", true)
+	if err != nil {
+		return Config{}, err
+	}
+	outboundProxy := envAlias([]string{"GROK2API_XAI_PROXY_POOL", "GROK2API_XAI_PROXY"}, "")
+	outboundProxyStrategy := normalizeOutboundProxyStrategy(envString("GROK2API_XAI_PROXY_STRATEGY", "round_robin"))
 
 	storeBackend, err := envEnum("GROK2API_STORE_BACKEND", "hybrid", "hybrid", "file")
 	if err != nil {
 		return Config{}, err
 	}
-	runtime, err := envEnum("GROK2API_RUNTIME", "go", "go", "python")
+	// Python public API runtime was removed; only "go" is accepted (entrypoint also rejects "python").
+	runtime, err := envEnum("GROK2API_RUNTIME", "go", "go")
 	if err != nil {
 		return Config{}, err
 	}
-	ownershipMode, err := envEnum("GROK2API_GO_OWNERSHIP_MODE", "disabled", "disabled", "canary", "all")
+	ownershipMode, err := envEnum("GROK2API_GO_OWNERSHIP_MODE", "all", "disabled", "canary", "all")
 	if err != nil {
 		return Config{}, err
 	}
@@ -200,8 +228,18 @@ func Load() (Config, error) {
 		OutboundMaxTools:                outboundMaxTools,
 		OutboundMaxToolsOpenAI:          outboundMaxToolsOpenAI,
 		OutboundMaxToolsResponsesNative: outboundMaxToolsResponsesNative,
+		OutboundProxyConfigured:         outboundProxy != "",
+		OutboundProxyEnabled:            outboundProxy != "",
+		OutboundProxy:                   outboundProxy,
+		OutboundProxyUsername:           envString("GROK2API_XAI_PROXY_USERNAME", ""),
+		OutboundProxyPassword:           envString("GROK2API_XAI_PROXY_PASSWORD", ""),
+		OutboundProxyStrategy:           outboundProxyStrategy,
 		OutboundToolGap:                 outboundToolGap,
 		OutboundToolGapNative:           outboundToolGapNative,
+		StickyFirstOnly:                 stickyFirstOnly,
+		FirstByteProbeWorkers:           firstByteProbeWorkers,
+		MaxFailoverAttempts:             4,
+		CodexForceReasoningLow:          codexForceReasoningLow,
 		Workers:                         workers,
 		MaintainerLeader:                strings.ToLower(strings.TrimSpace(envString("GROK2API_MAINTAINER_LEADER", "auto"))),
 		MaintainerLeaderTTL:             leaderTTL,
@@ -286,4 +324,130 @@ func envSeconds(name string, fallback, minimum, maximum time.Duration) (time.Dur
 		return 0, fmt.Errorf("%s must be between %s and %s", name, minimum, maximum)
 	}
 	return value, nil
+}
+
+type RuntimeConfig struct {
+	mu      sync.Mutex
+	initial Config
+	current atomic.Pointer[Config]
+}
+
+func NewRuntimeConfig(initial Config) *RuntimeConfig {
+	runtime := &RuntimeConfig{initial: initial}
+	runtime.current.Store(&initial)
+	return runtime
+}
+
+func (r *RuntimeConfig) Load() Config {
+	if r == nil {
+		return Config{}
+	}
+	if current := r.current.Load(); current != nil {
+		return *current
+	}
+	return Config{}
+}
+
+func (r *RuntimeConfig) ApplyStoreSettings(settings map[string]any) {
+	if r == nil || settings == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	next := r.Load()
+	next.ApplyStoreSettings(settings)
+	if value, ok := settings["default_model"].(string); ok && strings.TrimSpace(value) == "" {
+		next.DefaultModel = r.initial.DefaultModel
+	}
+	r.current.Store(&next)
+}
+
+// ApplyStoreSettings overlays durable app_settings values onto the process config.
+// Only keys that affect live request routing / streaming are applied; maintainer
+// enable flags are read dynamically via PublicSettings and are not required here.
+func (c *Config) ApplyStoreSettings(settings map[string]any) {
+	if c == nil || settings == nil {
+		return
+	}
+	if v, ok := settings["default_model"].(string); ok {
+		if s := strings.TrimSpace(v); s != "" {
+			c.DefaultModel = s
+		}
+	}
+	if v, ok := asSettingsFloat(settings["sse_keepalive"]); ok && v >= 2 && v <= 120 {
+		c.SSEKeepalive = time.Duration(v * float64(time.Second))
+	}
+	if v, ok := asSettingsInt(settings["outbound_max_tools"]); ok && v >= 0 && v <= 64 {
+		c.OutboundMaxTools = v
+	}
+	if v, ok := asSettingsInt(settings["outbound_max_tools_openai"]); ok && v >= 0 && v <= 64 {
+		c.OutboundMaxToolsOpenAI = v
+	}
+	if v, ok := asSettingsFloat(settings["outbound_tool_gap_sec"]); ok && v >= 0 && v <= 2 {
+		c.OutboundToolGap = time.Duration(v * float64(time.Second))
+	}
+	if v, ok := asSettingsInt(settings["max_failover_attempts"]); ok && v >= 1 && v <= 64 {
+		c.MaxFailoverAttempts = v
+	}
+	if proxy, ok := settings["outbound_proxy_config"].(map[string]any); ok && len(proxy) > 0 {
+		c.OutboundProxyConfigured = true
+		c.OutboundProxyEnabled = true
+		if enabled, ok := proxy["enabled"].(bool); ok {
+			c.OutboundProxyEnabled = enabled
+		}
+		c.OutboundProxy = settingsString(proxy["proxy"])
+		c.OutboundProxyUsername = settingsString(proxy["proxy_username"])
+		c.OutboundProxyPassword = settingsString(proxy["proxy_password"])
+		c.OutboundProxyStrategy = normalizeOutboundProxyStrategy(settingsString(proxy["proxy_strategy"]))
+	}
+}
+
+func settingsString(value any) string {
+	if value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text)
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func normalizeOutboundProxyStrategy(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "sticky":
+		return "sticky"
+	case "random":
+		return "random"
+	default:
+		return "round_robin"
+	}
+}
+
+func asSettingsFloat(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		f, err := v.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func asSettingsInt(value any) (int, bool) {
+	f, ok := asSettingsFloat(value)
+	if !ok {
+		return 0, false
+	}
+	return int(f), true
 }

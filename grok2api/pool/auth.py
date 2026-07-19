@@ -468,9 +468,9 @@ def load_credentials_by_id(account_id: str, path: Path | None = None) -> GrokCre
     return creds
 
 
-def upstream_headers(token: str, model: str) -> dict[str, str]:
-    """Headers required by cli-chat-proxy (mirror Grok CLI)."""
-    return {
+def upstream_headers(token: str, model: str, conv_id: str | None = None) -> dict[str, str]:
+    """Headers required by cli-chat-proxy (mirror Grok CLI / CPA)."""
+    headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
         "X-XAI-Token-Auth": "xai-grok-cli",
@@ -482,3 +482,8 @@ def upstream_headers(token: str, model: str) -> dict[str, str]:
         "User-Agent": f"grok-cli/{CLI_VERSION}",
         "Accept": "text/event-stream, application/json",
     }
+    cid = (conv_id or "").strip()
+    if cid:
+        # CPA sets x-grok-conv-id for Grok prompt-cache locality.
+        headers["x-grok-conv-id"] = cid
+    return headers

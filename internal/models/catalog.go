@@ -11,12 +11,17 @@ import (
 )
 
 type Catalog struct {
-	cfg   config.Config
-	store *postgres.Connector
+	cfg      config.Config
+	configFn func() config.Config
+	store    *postgres.Connector
 }
 
 func NewCatalog(cfg config.Config, store *postgres.Connector) *Catalog {
 	return &Catalog{cfg: cfg, store: store}
+}
+
+func NewDynamicCatalog(configFn func() config.Config, store *postgres.Connector) *Catalog {
+	return &Catalog{configFn: configFn, store: store}
 }
 
 func (c *Catalog) OpenAIList(ctx context.Context) map[string]any {
@@ -24,6 +29,7 @@ func (c *Catalog) OpenAIList(ctx context.Context) map[string]any {
 }
 
 func (c *Catalog) PublicModels(ctx context.Context) []map[string]any {
+	defaultModel := c.defaultModel()
 	if c != nil && c.store != nil {
 		rows, err := c.store.ListModels(ctx, false)
 		if err == nil && len(rows) > 0 {
@@ -35,39 +41,47 @@ func (c *Catalog) PublicModels(ctx context.Context) []map[string]any {
 				}
 				models = append(models, publicModelEntry(row, now))
 			}
-			models = mergeExtraModels(models, c.defaultModel())
+			models = mergeExtraModels(models, defaultModel)
 			sort.SliceStable(models, func(i, j int) bool {
-				return modelSortKey(models[i], c.defaultModel()) < modelSortKey(models[j], c.defaultModel())
+				return modelSortKey(models[i], defaultModel) < modelSortKey(models[j], defaultModel)
 			})
 			return models
 		}
 	}
-	return fallbackModels(c.defaultModel())
+	return fallbackModels(defaultModel)
 }
 
 func (c *Catalog) Resolve(model string) string {
+	defaultModel := c.defaultModel()
 	m := strings.TrimSpace(model)
 	if m == "" {
-		return c.defaultModel()
+		return defaultModel
 	}
 	low := strings.ToLower(m)
 	if low == "grok-search" || low == "web-search" {
-		return c.defaultModel()
+		return defaultModel
 	}
-	if resolved, ok := aliases(c.defaultModel())[m]; ok {
+	if resolved, ok := aliases(defaultModel)[m]; ok {
 		return resolved
 	}
-	if resolved, ok := aliases(c.defaultModel())[low]; ok {
+	if resolved, ok := aliases(defaultModel)[low]; ok {
 		return resolved
 	}
 	return m
 }
 
 func (c *Catalog) defaultModel() string {
-	if c == nil || strings.TrimSpace(c.cfg.DefaultModel) == "" {
+	if c == nil {
 		return "grok-4.5"
 	}
-	return strings.TrimSpace(c.cfg.DefaultModel)
+	cfg := c.cfg
+	if c.configFn != nil {
+		cfg = c.configFn()
+	}
+	if strings.TrimSpace(cfg.DefaultModel) == "" {
+		return "grok-4.5"
+	}
+	return strings.TrimSpace(cfg.DefaultModel)
 }
 
 func publicModelEntry(row postgres.ModelRecord, now int64) map[string]any {

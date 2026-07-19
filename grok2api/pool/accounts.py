@@ -1178,7 +1178,13 @@ def export_cliproxyapi_payload(
 def merge_normalized_accounts(
     normalized: dict[str, dict[str, Any]], *, merge: bool = True
 ) -> dict[str, Any]:
-    """Write normalized accounts once (single read/modify/write)."""
+    """Write normalized accounts once (single read/modify/write).
+
+    Prefer row-level PostgreSQL upserts so registration/SSO/OAuth imports do not
+    rewrite the whole accounts table (safer under concurrent imports and less
+    likely to drop concurrent writers' rows). Fall back to full-map write for
+    file-only mode or replace imports.
+    """
     if not normalized:
         return {
             "ok": False,
@@ -1186,6 +1192,66 @@ def merge_normalized_accounts(
             "imported": [],
             "total_accounts": len(read_auth_map()),
         }
+
+    storage = _accounts_store_source()
+    imported_rows: list[dict[str, Any]] = []
+
+    # Fast path: PostgreSQL row-level upsert (merge mode).
+    if merge and storage == "postgres":
+        try:
+            from grok2api.pool.auth_store import upsert_auth_entry
+        except Exception:
+            upsert_auth_entry = None  # type: ignore[assignment]
+        if upsert_auth_entry is not None:
+            errors: list[str] = []
+            for aid, nent in normalized.items():
+                if not isinstance(nent, dict):
+                    continue
+                try:
+                    # Ensure durable SSO/password aliases before write.
+                    merge_durable_account_fields(nent, None)
+                    if get_sso_value(nent):
+                        nent["sso"] = get_sso_value(nent)
+                        nent.setdefault("sso_cookie", nent["sso"])
+                    upsert_auth_entry(str(aid), nent, merge_same_user=True)
+                    imported_rows.append(
+                        {
+                            "id": str(aid),
+                            "email": nent.get("email"),
+                            "user_id": nent.get("user_id"),
+                            "expires_at": nent.get("expires_at"),
+                            "has_refresh_token": bool(nent.get("refresh_token")),
+                            "has_sso": bool(get_sso_value(nent)),
+                        }
+                    )
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{aid}: {e}")
+            try:
+                from grok2api.pool.account_pool import invalidate_pool_summary_cache
+
+                invalidate_pool_summary_cache()
+            except Exception:
+                pass
+            total = len(read_auth_map())
+            ok = len(imported_rows) > 0 and not errors
+            out = {
+                "ok": ok or (len(imported_rows) > 0 and len(errors) < len(normalized)),
+                "message": f"已导入 {len(imported_rows)} 个账号",
+                "imported": imported_rows,
+                "count": len(imported_rows),
+                "auth_file": str(AUTH_FILE),
+                "total_accounts": total,
+                "merged": True,
+                "storage": storage,
+                "write_mode": "row_upsert",
+            }
+            if errors:
+                out["errors"] = errors[:20]
+                out["error_count"] = len(errors)
+                if not imported_rows:
+                    out["ok"] = False
+                    out["error"] = errors[0]
+            return out
 
     existing: dict[str, Any] = {}
     if merge:
@@ -1208,10 +1274,20 @@ def merge_normalized_accounts(
                     existing.pop(k, None)
         for aid, nent in normalized.items():
             merge_durable_account_fields(nent, existing.get(aid))
+            if get_sso_value(nent):
+                nent["sso"] = get_sso_value(nent)
+                nent.setdefault("sso_cookie", nent["sso"])
         existing.update(normalized)
         write_auth_map(existing)
         total = len(existing)
     else:
+        # Replace mode: still normalize durable aliases before full rewrite.
+        for aid, nent in list(normalized.items()):
+            if isinstance(nent, dict):
+                merge_durable_account_fields(nent, None)
+                if get_sso_value(nent):
+                    nent["sso"] = get_sso_value(nent)
+                    nent.setdefault("sso_cookie", nent["sso"])
         write_auth_map(normalized)
         total = len(normalized)
 
@@ -1229,9 +1305,12 @@ def merge_normalized_accounts(
             "user_id": nent.get("user_id"),
             "expires_at": nent.get("expires_at"),
             "has_refresh_token": bool(nent.get("refresh_token")),
+            "has_sso": bool(get_sso_value(nent)) if isinstance(nent, dict) else False,
         }
         for aid, nent in normalized.items()
     ]
+    # Report durable backend so registration/SSO paths can assert PG writes.
+    storage = _accounts_store_source()
     return {
         "ok": True,
         "message": f"已导入 {len(imported)} 个账号",
@@ -1240,6 +1319,8 @@ def merge_normalized_accounts(
         "auth_file": str(AUTH_FILE),
         "total_accounts": total,
         "merged": bool(merge),
+        "storage": storage,
+        "write_mode": "full_map",
     }
 
 

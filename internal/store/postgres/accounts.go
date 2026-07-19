@@ -23,6 +23,11 @@ type AccountList struct {
 	Sort       string           `json:"sort"`
 	Status     string           `json:"status,omitempty"`
 	HasSSO     *bool            `json:"has_sso,omitempty"`
+	// Pool is the mutually-exclusive DB account_pool summary (same as /status pool).
+	Pool         *PoolSummary `json:"pool,omitempty"`
+	StoreSource  string       `json:"store_source,omitempty"`
+	StoreBackend string       `json:"store_backend,omitempty"`
+	AuthFileRole string       `json:"auth_file_role,omitempty"`
 }
 
 // AccountListFilter controls server-side account list filters.
@@ -147,14 +152,19 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 		cdRemain := cooldownRemaining(now, cooldownUntil)
 		cdCount := int64OrZero(cooldownCount)
 		statusStack := statusStackFromExtra(extra)
+		// Keep historical stack depth for UI (progressive kick), but do NOT treat
+		// count/stack as "still cooling" after wall-clock cooldown_until elapsed.
 		if cdCount <= 0 && len(statusStack) > 0 {
 			cdCount = int64(len(statusStack))
 		}
-		// Count-based cooling (Python parity) OR wall-clock cooldown_until.
-		inCooldown := cdRemain > 0 || cdCount > 0 || len(statusStack) > 0
+		inCooldown := cdRemain > 0
 		rawStatus := ""
 		if poolStatus != nil {
 			rawStatus = strings.TrimSpace(*poolStatus)
+		}
+		// Stale pool_status='cooldown' with expired until must not pin the row.
+		if rawStatus == "cooldown" && !inCooldown {
+			rawStatus = "normal"
 		}
 		status := derivePoolStatus(map[string]any{
 			"pool_status":        rawStatus,
@@ -230,6 +240,11 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 	out := AccountList{
 		Accounts: accounts, Total: total, Page: pageOut, PageSize: pageSizeOut,
 		TotalPages: totalPages, Query: query, Sort: sort, Status: status, HasSSO: filter.HasSSO,
+		StoreSource: "postgres", StoreBackend: "postgres", AuthFileRole: "mirror",
+	}
+	// Always attach DB pool counters so admin chips/overview stay in sync with list filters.
+	if sum, err := c.PoolSummary(ctx); err == nil {
+		out.Pool = &sum
 	}
 	if filter.IDsOnly {
 		ids := make([]string, 0, len(accounts))
@@ -325,7 +340,10 @@ func buildAccountListWhere(query, status string, hasSSO *bool) (string, []any) {
 		expiredExpr := `((a.expires_at IS NOT NULL AND a.expires_at <= now()) OR COALESCE(ap.pool_status,'') = 'expired')`
 		quotaExpr := `(COALESCE(ap.disabled_for_quota, false) = true OR COALESCE(ap.pool_status,'') = 'quota_disabled')`
 		disabledExpr := `(COALESCE(ap.enabled, true) = false OR COALESCE(ap.pool_status,'') = 'disabled')`
-		cooldownExpr := `((ap.cooldown_until IS NOT NULL AND ap.cooldown_until > now()) OR COALESCE(ap.cooldown_count,0) > 0 OR COALESCE(ap.pool_status,'') = 'cooldown')`
+		// Only wall-clock cooldown_until keeps an account out of rotation / in the
+		// "cooldown" filter. Historical cooldown_count / leftover pool_status are
+		// display/stack metadata and must not permanently hide accounts.
+		cooldownExpr := `(ap.cooldown_until IS NOT NULL AND ap.cooldown_until > now())`
 		// Active model block: non-empty blocked_models with at least one entry that is
 		// permanent (true/object without expired until) or until > now().
 		modelBlockExpr := `(
@@ -1077,6 +1095,7 @@ func (c *Connector) ImportNormalizedAccounts(ctx context.Context, normalized map
 			"user_id":           entry["user_id"],
 			"expires_at":        entry["expires_at"],
 			"has_refresh_token": stringFromMap(entry, "refresh_token") != "",
+			"has_sso":           accounts.GetSSOValue(entry) != "",
 		})
 	}
 
@@ -1091,6 +1110,7 @@ func (c *Connector) ImportNormalizedAccounts(ctx context.Context, normalized map
 		"count":          len(imported),
 		"total_accounts": total,
 		"merged":         merge,
+		"storage":        "postgres",
 	}, nil
 }
 
@@ -1210,19 +1230,33 @@ type AccountRefreshRow struct {
 }
 
 // ListRefreshableAccounts returns accounts that have a refresh_token (or are near expiry).
+// Prefers soon-to-expire / already-expired rows so maintainer cycles stay hot-path focused.
 func (c *Connector) ListRefreshableAccounts(ctx context.Context, limit int) ([]AccountRefreshRow, error) {
 	if limit <= 0 {
-		limit = 40
+		limit = 80
 	}
-	if limit > 500 {
-		limit = 500
+	if limit > 1000 {
+		limit = 1000
 	}
 	rows, err := c.Pool.Query(ctx, `
-		SELECT id, email, payload
-		FROM accounts
-		WHERE payload ? 'refresh_token'
-		   OR (expires_at IS NOT NULL AND expires_at <= now() + interval '1 hour')
-		ORDER BY expires_at ASC NULLS FIRST, updated_at ASC
+		SELECT a.id, a.email, a.payload
+		FROM accounts a
+		LEFT JOIN account_pool ap ON ap.account_id = a.id
+		WHERE (
+		        COALESCE(a.payload->>'refresh_token', '') <> ''
+		     OR (a.expires_at IS NOT NULL AND a.expires_at <= now() + interval '2 hours')
+		  )
+		  AND COALESCE(a.payload->>'refresh_invalid', 'false') NOT IN ('true', '1', 'yes')
+		ORDER BY
+		  CASE
+		    WHEN a.expires_at IS NULL THEN 0
+		    WHEN a.expires_at <= now() THEN 0
+		    WHEN a.expires_at <= now() + interval '10 minutes' THEN 1
+		    WHEN a.expires_at <= now() + interval '1 hour' THEN 2
+		    ELSE 3
+		  END ASC,
+		  a.expires_at ASC NULLS FIRST,
+		  a.updated_at ASC
 		LIMIT $1
 	`, limit)
 	if err != nil {
@@ -1238,6 +1272,14 @@ func (c *Connector) ListRefreshableAccounts(ctx context.Context, limit int) ([]A
 			return nil, err
 		}
 		payload := decodeMap(payloadBytes)
+		// Skip permanently invalid refresh tokens even if SQL filter missed variants.
+		if truthyAny(payload["refresh_invalid"]) {
+			continue
+		}
+		if strings.TrimSpace(stringFromMap(payload, "refresh_token")) == "" {
+			// Near-expiry without RT is not refreshable.
+			continue
+		}
 		row := AccountRefreshRow{ID: id, Payload: payload}
 		if email != nil {
 			row.Email = *email
@@ -1472,7 +1514,15 @@ func (c *Connector) ExpireDueCooldowns(ctx context.Context, limit int) (int64, e
 		    cooldown_reason = NULL,
 		    cooldown_code = NULL,
 		    cooldown_model = NULL,
-		    pool_status = CASE WHEN enabled = false OR disabled_for_quota = true THEN 'disabled' ELSE 'normal' END,
+		    cooldown_tokens_actual = NULL,
+		    cooldown_tokens_limit = NULL,
+		    cooldown_count = 0,
+		    pool_status = CASE
+			WHEN enabled = false OR disabled_for_quota = true THEN 'disabled'
+			WHEN COALESCE(blocked_models, '{}'::jsonb) <> '{}'::jsonb THEN 'model_blocked'
+			ELSE 'normal'
+		    END,
+		    extra = (COALESCE(extra, '{}'::jsonb) - 'status_stack' - 'cooldown_count'),
 		    updated_at = now()
 		WHERE cooldown_until IS NOT NULL AND cooldown_until <= now()
 		  AND account_id IN (
@@ -1641,20 +1691,458 @@ func (c *Connector) ListCachedQuotas(ctx context.Context) (map[string]any, error
 	}, nil
 }
 
-// SaveQuotaSnapshot persists last_quota for an account.
+// SaveQuotaSnapshot persists last_quota and keeps pool status coherent in real time.
+// Exhausted/auto-disabled → disabled_for_quota + pool_status=quota_disabled.
+// Healthy billing → clear quota-disable flags so the account re-enters rotation.
 func (c *Connector) SaveQuotaSnapshot(ctx context.Context, accountID string, quota map[string]any) error {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return nil
 	}
-	payload, err := json.Marshal(quota)
+	snap := compactQuotaSnapshot(accountID, quota)
+	payload, err := json.Marshal(snap)
 	if err != nil {
 		return err
 	}
+	exhausted := truthyAny(snap["exhausted"]) || truthyAny(snap["auto_disabled"])
+	ok := truthyAny(snap["ok"]) && !exhausted
+	reason := firstNonEmptyString(
+		stringFromAny(snap["exhaust_reason"]),
+		stringFromAny(snap["summary"]),
+		stringFromAny(mapFromAny(snap["display"])["summary"]),
+		"额度已耗尽",
+	)
+	if len(reason) > 300 {
+		reason = reason[:300]
+	}
+	source := firstNonEmptyString(stringFromAny(snap["source"]), "billing")
+	if exhausted {
+		c.InvalidateCandidateCache()
+		_, err = c.Pool.Exec(ctx, `
+			INSERT INTO account_pool (
+				account_id, last_quota, enabled, disabled_for_quota, disabled_reason,
+				quota_disabled_at, quota_source, pool_status, last_error, extra, updated_at
+			) VALUES (
+				$1, $2::jsonb, false, true, $3,
+				now(), $4, 'quota_disabled', $3, '{}'::jsonb, now()
+			)
+			ON CONFLICT (account_id) DO UPDATE SET
+				last_quota = EXCLUDED.last_quota,
+				enabled = false,
+				disabled_for_quota = true,
+				disabled_reason = EXCLUDED.disabled_reason,
+				quota_disabled_at = now(),
+				quota_source = EXCLUDED.quota_source,
+				pool_status = 'quota_disabled',
+				last_error = EXCLUDED.last_error,
+				updated_at = now()
+		`, accountID, payload, reason, source)
+		return err
+	}
+	if ok {
+		// Healthy snapshot: only re-enable when previously disabled for quota/billing.
+		c.InvalidateCandidateCache()
+		_, err = c.Pool.Exec(ctx, `
+			INSERT INTO account_pool (account_id, last_quota, extra, updated_at)
+			VALUES ($1, $2::jsonb, '{}'::jsonb, now())
+			ON CONFLICT (account_id) DO UPDATE SET
+				last_quota = EXCLUDED.last_quota,
+				enabled = CASE
+					WHEN account_pool.disabled_for_quota = true
+					  OR COALESCE(account_pool.quota_source, '') IN ('billing','upstream_error','model_health','quota')
+					  OR (account_pool.enabled = false AND COALESCE(account_pool.disabled_reason, '') LIKE '%额度%')
+					THEN true ELSE account_pool.enabled
+				END,
+				disabled_for_quota = CASE
+					WHEN account_pool.disabled_for_quota = true
+					  OR COALESCE(account_pool.quota_source, '') IN ('billing','upstream_error','model_health','quota')
+					  OR (account_pool.enabled = false AND COALESCE(account_pool.disabled_reason, '') LIKE '%额度%')
+					THEN false ELSE account_pool.disabled_for_quota
+				END,
+				disabled_reason = CASE
+					WHEN account_pool.disabled_for_quota = true
+					  OR COALESCE(account_pool.quota_source, '') IN ('billing','upstream_error','model_health','quota')
+					  OR (account_pool.enabled = false AND COALESCE(account_pool.disabled_reason, '') LIKE '%额度%')
+					THEN NULL ELSE account_pool.disabled_reason
+				END,
+				quota_disabled_at = CASE
+					WHEN account_pool.disabled_for_quota = true
+					  OR COALESCE(account_pool.quota_source, '') IN ('billing','upstream_error','model_health','quota')
+					  OR (account_pool.enabled = false AND COALESCE(account_pool.disabled_reason, '') LIKE '%额度%')
+					THEN NULL ELSE account_pool.quota_disabled_at
+				END,
+				quota_source = CASE
+					WHEN account_pool.disabled_for_quota = true
+					  OR COALESCE(account_pool.quota_source, '') IN ('billing','upstream_error','model_health','quota')
+					  OR (account_pool.enabled = false AND COALESCE(account_pool.disabled_reason, '') LIKE '%额度%')
+					THEN NULL ELSE account_pool.quota_source
+				END,
+				pool_status = CASE
+					WHEN account_pool.disabled_for_quota = true
+					  OR COALESCE(account_pool.quota_source, '') IN ('billing','upstream_error','model_health','quota')
+					  OR (account_pool.enabled = false AND COALESCE(account_pool.disabled_reason, '') LIKE '%额度%')
+					THEN CASE
+						WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN 'cooldown'
+						ELSE 'normal'
+					END
+					ELSE account_pool.pool_status
+				END,
+				updated_at = now()
+		`, accountID, payload)
+		return err
+	}
+	// Failed query: still cache last_quota so UI shows "上次失败".
 	_, err = c.Pool.Exec(ctx, `
 		INSERT INTO account_pool (account_id, last_quota, extra, updated_at)
 		VALUES ($1, $2::jsonb, '{}'::jsonb, now())
 		ON CONFLICT (account_id) DO UPDATE SET last_quota = EXCLUDED.last_quota, updated_at = now()
 	`, accountID, payload)
 	return err
+}
+
+// DisableForQuota hard-removes an account from rotation due to billing exhaustion.
+// Writes disabled_for_quota + pool_status=quota_disabled atomically with last_quota.
+func (c *Connector) DisableForQuota(ctx context.Context, accountID, reason, source string) (map[string]any, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, errors.New("account id required")
+	}
+	if err := c.ensureAccountExists(ctx, accountID); err != nil {
+		return nil, err
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "额度已耗尽"
+	}
+	if len(reason) > 300 {
+		reason = reason[:300]
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "billing"
+	}
+	nowUnix := time.Now().Unix()
+	snap, _ := json.Marshal(map[string]any{
+		"ok":            true,
+		"fetched_at":    nowUnix,
+		"account_id":    accountID,
+		"exhausted":     true,
+		"auto_disabled": true,
+		"summary":       "额度耗尽 · 已移出轮询（" + reason + "）",
+		"display":       map[string]any{"summary": "额度耗尽 · 已移出轮询（" + reason + "）"},
+		"source":        source,
+	})
+	c.InvalidateCandidateCache()
+	_, err := c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (
+			account_id, enabled, disabled_for_quota, disabled_reason,
+			quota_disabled_at, quota_source, pool_status, last_error, last_quota, extra, updated_at
+		) VALUES (
+			$1, false, true, $2,
+			now(), $3, 'quota_disabled', $2, $4::jsonb, '{}'::jsonb, now()
+		)
+		ON CONFLICT (account_id) DO UPDATE SET
+			enabled = false,
+			disabled_for_quota = true,
+			disabled_reason = EXCLUDED.disabled_reason,
+			quota_disabled_at = now(),
+			quota_source = EXCLUDED.quota_source,
+			pool_status = 'quota_disabled',
+			last_error = EXCLUDED.last_error,
+			last_quota = EXCLUDED.last_quota,
+			updated_at = now()
+	`, accountID, reason, source, snap)
+	if err != nil {
+		return nil, err
+	}
+	return c.GetAccountPoolView(ctx, accountID)
+}
+
+// ReenableForQuota clears quota-disable flags and returns the account to rotation.
+func (c *Connector) ReenableForQuota(ctx context.Context, accountID, reason, source string) (map[string]any, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, errors.New("account id required")
+	}
+	if err := c.ensureAccountExists(ctx, accountID); err != nil {
+		return nil, err
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "额度已恢复"
+	}
+	if len(reason) > 300 {
+		reason = reason[:300]
+	}
+	c.InvalidateCandidateCache()
+	_, err := c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (account_id, enabled, disabled_for_quota, pool_status, last_error, extra, updated_at)
+		VALUES ($1, true, false, 'normal', $2, '{}'::jsonb, now())
+		ON CONFLICT (account_id) DO UPDATE SET
+			enabled = true,
+			disabled_for_quota = false,
+			disabled_reason = NULL,
+			quota_disabled_at = NULL,
+			quota_source = NULL,
+			pool_status = CASE
+				WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN 'cooldown'
+				ELSE 'normal'
+			END,
+			last_error = $2,
+			updated_at = now()
+	`, accountID, reason)
+	if err != nil {
+		return nil, err
+	}
+	_ = source
+	return c.GetAccountPoolView(ctx, accountID)
+}
+
+// SaveRenewStatus stamps last renew outcome on account_pool.extra (and pool_status when expired).
+func (c *Connector) SaveRenewStatus(ctx context.Context, accountID string, ok bool, status, errText, source string) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		if ok {
+			status = "ok"
+		} else {
+			status = "fail"
+		}
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "token_maintainer"
+	}
+	errText = strings.TrimSpace(errText)
+	if len(errText) > 300 {
+		errText = errText[:300]
+	}
+	nowUnix := time.Now().Unix()
+	if ok {
+		_, err := c.Pool.Exec(ctx, `
+			INSERT INTO account_pool (account_id, extra, updated_at)
+			VALUES (
+				$1,
+				jsonb_build_object(
+					'last_renew_status', $2::text,
+					'last_renew_source', $3::text,
+					'last_renew_ok_at', $4::float8,
+					'renew_fail_count', 0
+				),
+				now()
+			)
+			ON CONFLICT (account_id) DO UPDATE SET
+				extra = (COALESCE(account_pool.extra, '{}'::jsonb)
+					- 'last_renew_error'
+					- 'last_renew_fail_at'
+					- 'token_expired_at'
+					- 'token_expired_reason')
+					|| jsonb_build_object(
+						'last_renew_status', $2::text,
+						'last_renew_source', $3::text,
+						'last_renew_ok_at', $4::float8,
+						'renew_fail_count', 0
+					),
+				pool_status = CASE
+					WHEN account_pool.enabled = false OR account_pool.disabled_for_quota = true THEN
+						CASE WHEN account_pool.disabled_for_quota = true THEN 'quota_disabled' ELSE 'disabled' END
+					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN 'cooldown'
+					WHEN account_pool.pool_status = 'expired' THEN 'normal'
+					ELSE account_pool.pool_status
+				END,
+				updated_at = now()
+		`, accountID, status, source, float64(nowUnix))
+		return err
+	}
+	_, err := c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (account_id, extra, last_error, pool_status, updated_at)
+		VALUES (
+			$1,
+			jsonb_build_object(
+				'last_renew_status', $2::text,
+				'last_renew_source', $3::text,
+				'last_renew_error', $4::text,
+				'last_renew_fail_at', $5::float8,
+				'renew_fail_count', 1,
+				'token_expired_at', $5::float8,
+				'token_expired_reason', $4::text
+			),
+			$4,
+			'expired',
+			now()
+		)
+		ON CONFLICT (account_id) DO UPDATE SET
+			extra = COALESCE(account_pool.extra, '{}'::jsonb) || jsonb_build_object(
+				'last_renew_status', $2::text,
+				'last_renew_source', $3::text,
+				'last_renew_error', $4::text,
+				'last_renew_fail_at', $5::float8,
+				'renew_fail_count', COALESCE((account_pool.extra->>'renew_fail_count')::int, 0) + 1,
+				'token_expired_at', COALESCE((account_pool.extra->>'token_expired_at')::float8, $5::float8),
+				'token_expired_reason', $4::text
+			),
+			last_error = COALESCE(NULLIF($4, ''), account_pool.last_error),
+			pool_status = CASE
+				WHEN account_pool.disabled_for_quota = true THEN 'quota_disabled'
+				WHEN account_pool.enabled = false THEN 'disabled'
+				ELSE 'expired'
+			END,
+			updated_at = now()
+	`, accountID, status, source, errText, float64(nowUnix))
+	return err
+}
+
+// SaveLastProbesBatch already upserts last_probe; ApplyProbeOutcomesBatch applies
+// kick/disable/recover status changes in one round-trip after concurrent probes.
+func (c *Connector) ApplyProbeOutcomesBatch(ctx context.Context, outcomes []ProbeOutcome) (int, error) {
+	if c == nil || c.Pool == nil || len(outcomes) == 0 {
+		return 0, nil
+	}
+	applied := 0
+	for _, o := range outcomes {
+		aid := strings.TrimSpace(o.AccountID)
+		if aid == "" {
+			continue
+		}
+		var err error
+		switch o.Action {
+		case "disable":
+			_, err = c.SetAccountEnabled(ctx, aid, false)
+		case "cooldown":
+			sec := o.CooldownSec
+			if sec <= 0 {
+				sec = 600
+			}
+			_, err = c.KickFromPool(ctx, aid, o.Reason, &sec)
+		case "model_block":
+			var until *time.Time
+			if o.BlockUntil != nil {
+				until = o.BlockUntil
+			} else {
+				t := time.Now().Add(2 * time.Hour)
+				until = &t
+			}
+			err = c.BlockPoolModel(ctx, aid, o.Model, until)
+		case "recover":
+			_, err = c.ClearAccountCooldown(ctx, aid)
+			if err == nil && o.Model != "" {
+				_ = c.UnblockPoolModel(ctx, aid, o.Model)
+			}
+		default:
+			continue
+		}
+		if err == nil {
+			applied++
+		}
+	}
+	if applied > 0 {
+		c.InvalidateCandidateCache()
+	}
+	return applied, nil
+}
+
+// ProbeOutcome is one deferred status mutation from model-health probe.
+type ProbeOutcome struct {
+	AccountID   string
+	Action      string // disable | cooldown | model_block | recover
+	Reason      string
+	Model       string
+	CooldownSec float64
+	BlockUntil  *time.Time
+}
+
+func compactQuotaSnapshot(accountID string, quota map[string]any) map[string]any {
+	if quota == nil {
+		return map[string]any{"account_id": accountID, "ok": false}
+	}
+	display, _ := quota["display"].(map[string]any)
+	summary := ""
+	if display != nil {
+		summary = stringFromAny(display["summary"])
+	}
+	if summary == "" {
+		summary = stringFromAny(quota["summary"])
+	}
+	snap := map[string]any{
+		"ok":                 truthyAny(quota["ok"]),
+		"fetched_at":         quota["fetched_at"],
+		"account_id":         firstNonEmptyString(stringFromAny(quota["account_id"]), accountID),
+		"email":              quota["email"],
+		"user_id":            quota["user_id"],
+		"monthly_limit":      quota["monthly_limit"],
+		"used":               quota["used"],
+		"remaining":          quota["remaining"],
+		"usage_percent":      quota["usage_percent"],
+		"unlimited_or_free":  quota["unlimited_or_free"],
+		"exhausted":          truthyAny(quota["exhausted"]),
+		"exhaust_reason":     quota["exhaust_reason"],
+		"auto_disabled":      truthyAny(quota["auto_disabled"]),
+		"summary":            summary,
+		"billing_period_end": quota["billing_period_end"],
+		"error":              quota["error"],
+		"status_code":        quota["status_code"],
+		"source":             firstNonEmptyString(stringFromAny(quota["source"]), "billing"),
+	}
+	if summary != "" {
+		snap["display"] = map[string]any{"summary": summary}
+	}
+	if snap["fetched_at"] == nil {
+		snap["fetched_at"] = time.Now().Unix()
+	}
+	// Drop nils for compact JSON.
+	out := make(map[string]any, len(snap))
+	for k, v := range snap {
+		if v == nil {
+			continue
+		}
+		if s, ok := v.(string); ok && s == "" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func truthyAny(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		s := strings.ToLower(strings.TrimSpace(t))
+		return s == "1" || s == "true" || s == "yes"
+	case float64:
+		return t != 0
+	case int:
+		return t != 0
+	case int64:
+		return t != 0
+	default:
+		return false
+	}
+}
+
+func stringFromAny(v any) string {
+	if s, ok := v.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
+func mapFromAny(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return map[string]any{}
+}
+
+func firstNonEmptyString(vals ...string) string {
+	for _, v := range vals {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
 }

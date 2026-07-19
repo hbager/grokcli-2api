@@ -22,6 +22,9 @@ func (c *Client) GetAffinity(ctx context.Context, fingerprint string, ttl time.D
 	if fingerprint == "" {
 		return nil, nil
 	}
+	if accountID, ok := affinityCacheGet(fingerprint); ok {
+		return &AffinityEntry{AccountID: accountID}, nil
+	}
 	raw, err := c.Get(ctx, c.key("affinity", fingerprint))
 	if err != nil || strings.TrimSpace(raw) == "" {
 		return nil, err
@@ -34,6 +37,7 @@ func (c *Client) GetAffinity(ctx context.Context, fingerprint string, ttl time.D
 	// Hits/last_seen are refreshed on BindAffinity after a successful pick.
 	// This saves a Redis write RTT before upstream request (TTFT critical path).
 	_ = ttl
+	affinityCacheSet(fingerprint, entry.AccountID)
 	return entry, nil
 }
 
@@ -45,6 +49,8 @@ func (c *Client) BindAffinity(ctx context.Context, fingerprint, accountID string
 	}
 	now := unixFloat(time.Now())
 	entry := AffinityEntry{AccountID: accountID, BoundAt: now, LastSeen: now, Hits: 1}
+	// Best-effort previous hits; miss is fine (avoids serializing GET on slow path).
+	// Keep a short GET only when pipeline/pool is healthy — still one pooled conn RTT.
 	raw, _ := c.Get(ctx, c.key("affinity", fingerprint))
 	if prev := parseAffinity(raw); prev != nil {
 		entry.BoundAt = prev.BoundAt
@@ -58,7 +64,11 @@ func (c *Client) BindAffinity(ctx context.Context, fingerprint, accountID string
 	}
 	entry.SessionFP = strings.TrimSpace(sessionFP)
 	entry.PromptCacheKey = strings.TrimSpace(promptCacheKey)
-	return c.setAffinity(ctx, fingerprint, entry, ttl)
+	if err := c.setAffinity(ctx, fingerprint, entry, ttl); err != nil {
+		return err
+	}
+	affinityCacheSet(fingerprint, accountID)
+	return nil
 }
 
 func (c *Client) ClearAffinity(ctx context.Context, fingerprint string) error {
@@ -71,7 +81,7 @@ func (c *Client) ClearAffinity(ctx context.Context, fingerprint string) error {
 
 func (c *Client) setAffinity(ctx context.Context, fingerprint string, entry AffinityEntry, ttl time.Duration) error {
 	if ttl <= 0 {
-		ttl = 2 * time.Hour
+		ttl = 24 * time.Hour
 	}
 	data, err := json.Marshal(entry)
 	if err != nil {
@@ -98,4 +108,41 @@ func unixFloat(t time.Time) float64 {
 
 func stringInt(value int) string {
 	return strconv.Itoa(value)
+}
+
+// BindResponseAccount maps a Responses API response_id to account + prompt_cache_key
+// so Codex multi-turn requests that only send previous_response_id can stick.
+func (c *Client) BindResponseAccount(ctx context.Context, responseID, accountID, promptCacheKey string, ttl time.Duration) error {
+	responseID = strings.TrimSpace(responseID)
+	accountID = strings.TrimSpace(accountID)
+	if responseID == "" || accountID == "" {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	entry := AffinityEntry{
+		AccountID:      accountID,
+		BoundAt:        unixFloat(time.Now()),
+		LastSeen:       unixFloat(time.Now()),
+		Hits:           1,
+		PromptCacheKey: strings.TrimSpace(promptCacheKey),
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	return c.SetEX(ctx, c.key("affinity", "response", responseID), string(data), int(ttl.Seconds()))
+}
+
+func (c *Client) GetResponseAccount(ctx context.Context, responseID string) (*AffinityEntry, error) {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return nil, nil
+	}
+	raw, err := c.Get(ctx, c.key("affinity", "response", responseID))
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return nil, err
+	}
+	return parseAffinity(raw), nil
 }

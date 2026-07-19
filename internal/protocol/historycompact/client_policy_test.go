@@ -51,3 +51,15 @@ func TestResolveOutboundToolGap(t *testing.T) {
 		t.Fatalf("claude gap=%v", got)
 	}
 }
+
+func TestIsCodexClient(t *testing.T) {
+	if !IsCodexClient("codex-tui/0.144.1") {
+		t.Fatal("codex-tui")
+	}
+	if IsCodexClient("OpenAI/Python 2.24.0") {
+		t.Fatal("generic openai python should not be codex")
+	}
+	if IsCodexClient("Go-http-client/1.1") {
+		t.Fatal("go client")
+	}
+}

@@ -332,6 +332,24 @@ def _hard_delete_invalid_refresh_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+_PUBLIC_OIDC_ERROR_CODES = frozenset(
+    {
+        "authorization_pending",
+        "slow_down",
+        "expired_token",
+        "access_denied",
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "invalid_scope",
+        "server_error",
+        "temporarily_unavailable",
+    }
+)
+
+
 def _summarize_refresh_error_body(status_code: int, body: str) -> str:
     """Compact upstream token-refresh errors before returning them to admin UI."""
     text = (body or "").strip()
@@ -342,9 +360,15 @@ def _summarize_refresh_error_body(status_code: int, body: str) -> str:
         else:
             kind = "HTML error page"
         return f"refresh failed {status_code}: upstream returned {kind}; check outbound proxy / xAI access"
-    if len(text) > 400:
-        text = text[:400]
-    return f"refresh failed {status_code}: {text}"
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        code = str(parsed.get("error") or "").strip().lower()
+        if code in _PUBLIC_OIDC_ERROR_CODES:
+            return f"refresh failed {status_code}: {code}"
+    return f"refresh failed {status_code}: upstream OIDC error"
 
 
 def _is_permanent_refresh_failure(status_code: int, body: str) -> bool:
@@ -784,7 +808,8 @@ def start_device_authorization(
     device_code = data.get("device_code")
     user_code = data.get("user_code")
     if not device_code or not user_code:
-        return {"ok": False, "error": f"unexpected device response: {data}"}
+        fields = sorted(str(key) for key in data)
+        return {"ok": False, "error": f"unexpected device response fields: {fields}"}
 
     session_id = uuid.uuid4().hex[:12]
     verification_url = (
@@ -812,7 +837,6 @@ def start_device_authorization(
             f"请在浏览器打开 {verification_url} ，输入设备码 {str(user_code).upper()}"
         ),
         "error": None,
-        "output": json.dumps(data, ensure_ascii=False),
         "account_id": None,
         "email": None,
     }
@@ -851,6 +875,13 @@ def _device_update(session_id: str, **fields: Any) -> dict[str, Any] | None:
     return snap
 
 
+def _public_device_poll_error(status_code: int, provider_error: Any) -> str:
+    code = str(provider_error or "").strip().lower()
+    if code in _PUBLIC_OIDC_ERROR_CODES:
+        return code
+    return f"device authorization failed (HTTP {status_code})"
+
+
 def _device_poll_worker(session_id: str) -> None:
     while True:
         with _lock:
@@ -881,13 +912,15 @@ def _device_poll_worker(session_id: str) -> None:
                     data=form,
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                 )
-                body_text = resp.text
                 try:
                     body = resp.json()
                 except Exception:
                     body = {}
         except Exception as e:  # noqa: BLE001
-            _device_update(session_id, message=f"轮询网络异常，重试中: {e}")
+            _device_update(
+                session_id,
+                message=f"轮询网络异常，重试中: {type(e).__name__}",
+            )
             time.sleep(interval)
             continue
 
@@ -914,7 +947,19 @@ def _device_poll_worker(session_id: str) -> None:
                                         entry["last_name"] = u["family_name"]
                     except Exception:
                         pass
+                # Mark durable source so admin UI/export can tell device-login rows apart.
+                entry.setdefault("source", "device-login")
+                entry.setdefault("auth_mode", entry.get("auth_mode") or "oidc")
+                # Ensure account_pool row + durable payload land via row-level upsert.
                 upsert_entry(account_id, entry)
+                # Verify the account is readable from durable store (PG-first).
+                try:
+                    from grok2api.pool.auth_store import read_auth_entry as _rae
+                    probe = _rae(account_id)
+                    if not probe:
+                        print(f"[oidc] WARN: device-login account {account_id} not readable after upsert")
+                except Exception as _ve:  # noqa: BLE001
+                    print(f"[oidc] WARN: post-upsert verify failed: {type(_ve).__name__}")
                 with _lock:
                     sess = _device_sessions.get(session_id)
                     if sess:
@@ -923,14 +968,20 @@ def _device_poll_worker(session_id: str) -> None:
                         sess["account_id"] = account_id
                         sess["email"] = entry.get("email")
                         sess["finished_at"] = time.time()
-                        sess["output"] = (sess.get("output") or "") + "\n" + body_text[:500]
+                        sess["storage"] = "postgres"
+                        try:
+                            from grok2api.pool.accounts import _accounts_store_source
+                            sess["storage"] = _accounts_store_source()
+                        except Exception:
+                            pass
                         _device_mirror(session_id, dict(sess))
             except Exception as e:  # noqa: BLE001
+                error_type = type(e).__name__
                 _device_update(
                     session_id,
                     status="error",
-                    error=str(e),
-                    message=f"保存凭证失败: {e}",
+                    error=f"credential save failed ({error_type})",
+                    message=f"保存凭证失败: {error_type}",
                     finished_at=time.time(),
                 )
             return
@@ -969,7 +1020,7 @@ def _device_poll_worker(session_id: str) -> None:
                 # keep waiting on transient unknown if still 4xx authorization_pending style
                 if resp.status_code in (400, 401) and err:
                     sess["status"] = "error"
-                    sess["error"] = f"{err}: {body.get('error_description') or body_text[:200]}"
+                    sess["error"] = _public_device_poll_error(resp.status_code, err)
                     sess["message"] = sess["error"]
                     sess["finished_at"] = time.time()
                     _device_mirror(session_id, dict(sess))
@@ -979,10 +1030,7 @@ def _device_poll_worker(session_id: str) -> None:
         time.sleep(interval)
 
 
-def get_device_session(session_id: str) -> dict[str, Any] | None:
-    sess = _device_load(session_id)
-    if not sess:
-        return None
+def _public_device_session(sess: dict[str, Any], session_id: str) -> dict[str, Any]:
     return {
         "session_id": sess.get("id") or session_id,
         "mode": sess.get("mode"),
@@ -991,7 +1039,6 @@ def get_device_session(session_id: str) -> dict[str, Any] | None:
         "verification_url": sess.get("verification_url"),
         "message": sess.get("message"),
         "error": sess.get("error"),
-        "output_tail": (sess.get("output") or "")[-2000:],
         "started_at": sess.get("started_at"),
         "finished_at": sess.get("finished_at"),
         "account_id": sess.get("account_id"),
@@ -999,6 +1046,13 @@ def get_device_session(session_id: str) -> dict[str, Any] | None:
         "ok": sess.get("status") in ("running", "waiting_user", "success"),
         "native_oidc": True,
     }
+
+
+def get_device_session(session_id: str) -> dict[str, Any] | None:
+    sess = _device_load(session_id)
+    if not sess:
+        return None
+    return _public_device_session(sess, session_id)
 
 
 def list_device_sessions() -> list[dict[str, Any]]:

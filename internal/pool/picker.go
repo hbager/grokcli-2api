@@ -84,9 +84,13 @@ func sortCandidates(candidates []Candidate, mode string) {
 			if a.Weight != b.Weight {
 				return a.Weight > b.Weight
 			}
-		default: // round_robin initial read-only foundation: stable weighted order.
+		default: // round_robin: higher weight, then least used, then stable id.
+			// Sticky is force-pinned first by callers; this only ranks the rest.
 			if a.Weight != b.Weight {
 				return a.Weight > b.Weight
+			}
+			if a.RequestCount != b.RequestCount {
+				return a.RequestCount < b.RequestCount
 			}
 		}
 		return a.ID < b.ID

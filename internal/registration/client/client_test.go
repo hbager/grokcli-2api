@@ -27,6 +27,25 @@ func TestStartUsesVersionedInternalContract(t *testing.T) {
 	}
 }
 
+func TestSessionUsesCompactContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/internal/registration/v1/sessions/session-1" {
+			t.Fatalf("method=%s path=%s", r.Method, r.URL.Path)
+		}
+		if r.URL.RawQuery != "" {
+			t.Fatalf("unexpected session query=%q", r.URL.RawQuery)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "session-1", "status": "running"})
+	}))
+	defer server.Close()
+
+	client := &Client{BaseURL: server.URL, HTTP: server.Client()}
+	result, err := client.Session(context.Background(), "session-1")
+	if err != nil || result["status"] != "running" {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}
+
 func TestSSOImportUsesAbsoluteSSOPath(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/internal/sso/v1/import" {

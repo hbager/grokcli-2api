@@ -6,12 +6,32 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 )
+
+func TestSetProxyConfiguresProbeTransport(t *testing.T) {
+	service := New(nil, nil, "http://example.invalid", []string{"grok-4.5"})
+	var calls atomic.Int64
+	service.SetProxy(func(*http.Request) (*url.URL, error) {
+		calls.Add(1)
+		return nil, nil
+	})
+	transport, ok := service.probeHTTP().Transport.(*http.Transport)
+	if !ok || transport.Proxy == nil {
+		t.Fatalf("transport=%T", service.probeHTTP().Transport)
+	}
+	if _, err := transport.Proxy(httptest.NewRequest("GET", "https://upstream.example", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("proxy calls=%d", calls.Load())
+	}
+}
 
 func TestNormalizeModels(t *testing.T) {
 	got := normalizeModels([]string{" grok-4.5 ", "GROK-4.5", "grok-3", "", "grok-3"})
@@ -68,7 +88,7 @@ func TestProbeAccountsConcurrentUsesWorkers(t *testing.T) {
 		Models:      []string{"grok-4.5"},
 		Workers:     4,
 		AutoDisable: false,
-		httpClient:  newProbeHTTPClient(),
+		httpClient:  newProbeHTTPClient(nil),
 	}
 
 	auths := make([]postgres.AccountAuth, 12)
@@ -110,7 +130,7 @@ func TestProbeAccountBudgetCutDoesNotDisable(t *testing.T) {
 		Upstream:    srv.URL,
 		Models:      []string{"grok-4.5"},
 		AutoDisable: true,
-		httpClient:  newProbeHTTPClient(),
+		httpClient:  newProbeHTTPClient(nil),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()

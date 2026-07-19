@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,13 +32,16 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/pool"
 	"github.com/hm2899/grokcli-2api/internal/protocol/anthropic"
 	"github.com/hm2899/grokcli-2api/internal/protocol/historycompact"
+	"github.com/hm2899/grokcli-2api/internal/protocol/reasoning"
 	"github.com/hm2899/grokcli-2api/internal/protocol/responses"
+	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
 	"github.com/hm2899/grokcli-2api/internal/proxy"
 	"github.com/hm2899/grokcli-2api/internal/quota"
 	regclient "github.com/hm2899/grokcli-2api/internal/registration/client"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/store/redis"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
+	"github.com/hm2899/grokcli-2api/internal/upstream/outboundproxy"
 )
 
 type Options struct {
@@ -61,16 +65,33 @@ type Options struct {
 	AffinityStore proxy.AffinityStore
 	// Upstream is a shared Grok HTTP client (connection pool). Prefer this over
 	// constructing a new client on every request.
-	Upstream           *grok.Client
-	Redis              *redis.Client
-	Leader             *redis.Leader
-	Maintainer         *maintainer.Service
-	ModelHealth        *modelhealth.Service
-	Quota              *quota.Service
-	Config             config.Config
-	RegistrationURL    string
-	RegistrationToken  string
-	UpstreamRetryCount func(context.Context) int
+	Upstream    *grok.Client
+	Redis       *redis.Client
+	Leader      *redis.Leader
+	Maintainer  *maintainer.Service
+	ModelHealth *modelhealth.Service
+	Quota       *quota.Service
+	Config      config.Config
+	// RuntimeConfig is the live process config. When non-nil, request handlers
+	// read streaming/tool policy from it so admin settings writes take effect
+	// without restart. Config remains the startup snapshot.
+	RuntimeConfig     *config.RuntimeConfig
+	RegistrationURL   string
+	RegistrationToken string
+}
+
+func (o Options) runtimeConfig() config.Config {
+	if o.RuntimeConfig != nil {
+		return o.RuntimeConfig.Load()
+	}
+	return o.Config
+}
+
+func (o Options) applySettingsToRuntime(settings map[string]any) {
+	if o.RuntimeConfig == nil || settings == nil {
+		return
+	}
+	o.RuntimeConfig.ApplyStoreSettings(settings)
 }
 
 // NewMigrationMux exposes migration-safe process probes plus low-risk read-only
@@ -254,6 +275,12 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/cooldown/clear", func(w http.ResponseWriter, r *http.Request) {
 		serveAdminClearCooldown(w, r, options)
 	})
+	mux.HandleFunc("PATCH /admin/api/accounts/{account_id}/status", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminSetAccountStatus(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/{account_id}/status", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminSetAccountStatus(w, r, options)
+	})
 	mux.HandleFunc("PUT /admin/api/settings", func(w http.ResponseWriter, r *http.Request) {
 		serveAdminUpdateSettings(w, r, options)
 	})
@@ -268,6 +295,18 @@ func NewMux(options Options) http.Handler {
 	})
 	mux.HandleFunc("GET /admin/api/accounts/register-email/availability", func(w http.ResponseWriter, r *http.Request) {
 		serveRegistrationAvailability(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/register-email/config", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationConfigGet(w, r, options)
+	})
+	mux.HandleFunc("PUT /admin/api/accounts/register-email/config", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationConfigPut(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/register-email/test-proxy", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationProxyTest(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/register-email/test-proxy", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationProxyTest(w, r, options)
 	})
 	mux.HandleFunc("GET /admin/api/accounts/register-email/sessions", func(w http.ResponseWriter, r *http.Request) {
 		serveRegistrationSessions(w, r, options)
@@ -298,6 +337,15 @@ func NewMux(options Options) http.Handler {
 	})
 	mux.HandleFunc("POST /admin/api/accounts/import-sso", func(w http.ResponseWriter, r *http.Request) {
 		serveSSOImportStart(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/login", func(w http.ResponseWriter, r *http.Request) {
+		serveDeviceLoginStart(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/login/sessions/{session_id}", func(w http.ResponseWriter, r *http.Request) {
+		serveDeviceLoginSession(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/login/sessions", func(w http.ResponseWriter, r *http.Request) {
+		serveDeviceLoginSessions(w, r, options)
 	})
 	mux.HandleFunc("GET /admin/api/accounts/import-sso/jobs/{job_id}", func(w http.ResponseWriter, r *http.Request) {
 		serveSSOImportJob(w, r, options)
@@ -480,36 +528,50 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
+	// Codex shell schema uses "cmd"; remember preferred keys from the client tools
+	// so outbound tool_calls project command→cmd (or honor pure command-only schemas).
+	keys := toolcall.ShellArgKeyMap(chatReq.Raw["tools"])
+	keys = ensureCodexShellCmdKeys(chatReq.Raw["tools"], keys)
+	if keys == nil {
+		keys = map[string]string{}
+	}
+	if len(keys) == 0 && (historycompact.IsCodexClient(r.UserAgent()) || historycompact.IsOpenAINativeClient(r.UserAgent())) {
+		for _, name := range []string{"exec_command", "run_command", "shell", "bash", "local_shell", "shell_command"} {
+			keys[name] = "cmd"
+			keys[strings.ToLower(name)] = "cmd"
+			if nk := toolcall.NameKey(name); nk != "" {
+				keys[nk] = "cmd"
+			}
+		}
+	}
+	if len(keys) > 0 {
+		r = r.WithContext(withShellArgKeys(r.Context(), keys))
+	}
+	// Client-registered tools for Update/StrReplace → Edit remap on chat path.
+	if allowed := allowedAnthropicToolNames(chatReq.Raw); len(allowed) > 0 {
+		r = r.WithContext(withAllowedTools(r.Context(), allowed))
+	}
 	candidates, err := listCandidatesForRequest(r.Context(), options, chatReq, r.Header)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
-	service := proxy.ChatService{
-		Catalog:         modelCatalog(options),
-		Client:          upstreamClient(options),
-		MaxAttempts:     upstreamMaxAttempts(r.Context(), options),
-		PickObserver:    options.PickObserver,
-		AffinityStore:   options.AffinityStore,
-		FailureObserver: failedAttemptObserver(options, chatReq.Model),
-	}
+	service := newChatService(options)
 	started := time.Now()
 	if chatReq.Stream {
-		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, "least_used")
+		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
 		if err != nil {
-			recordChatUsage(r, options, apiKey, "", chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
-			if errors.Is(err, proxy.ErrAllAccountsFailed) {
-				writeChatUpstreamSSEError(w)
-			} else {
-				writeProxyError(w, err)
-			}
+			// Intermediate + final open failures are already classified into the
+			// cooldown pool via ChatService.FailureReporter (text-based 额度用完).
+			recordChatUsage(r, options, apiKey, opened.AccountID, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
+			writeProxyError(w, err)
 			return
 		}
 		defer opened.Body.Close()
 		defer releaseServerPick(options, opened.AccountID)
 		req := r
-		if options.Config.SSEKeepalive > 0 {
-			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.Config.SSEKeepalive))
+		if options.runtimeConfig().SSEKeepalive > 0 {
+			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.runtimeConfig().SSEKeepalive))
 		}
 		setProtocolObservationHeaders(w, protocolObservation{
 			Protocol: "openai_chat", AccountID: opened.AccountID, PreferAccount: opened.PreferAccount,
@@ -522,25 +584,122 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 			status = http.StatusBadGateway
 		}
 		recordChatUsage(r, options, apiKey, opened.AccountID, opened.Model, chatReq.Stream, ok, status, started, stats.Usage, err, stats.FirstTokenMS, chatReq.Raw)
-		reportChatPool(r, options, opened.AccountID, ok, err, status)
+		reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
 		return
 	}
-	result, err := service.CompleteWithResult(r.Context(), chatReq, candidates, "least_used")
-	if result.AccountID != "" {
+	result, err := service.CompleteWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
+	if result.PickHeld && result.AccountID != "" {
 		defer releaseServerPick(options, result.AccountID)
 	}
 	if err != nil {
+		// Failures already reported per-account via FailureReporter.
 		recordChatUsage(r, options, apiKey, result.AccountID, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
 		writeProxyError(w, err)
 		return
 	}
+	// Project shell args for non-stream chat completions (Codex cmd / OpenAI command).
+	if result.Payload != nil && len(keys) > 0 {
+		projectChatPayloadShellArgs(result.Payload, keys)
+	} else if result.Payload != nil {
+		// Default shell-family tools to cmd even without an explicit map.
+		projectChatPayloadShellArgs(result.Payload, nil)
+	}
 	recordChatUsage(r, options, apiKey, result.AccountID, result.Model, chatReq.Stream, true, http.StatusOK, started, result.Usage, nil, 0, chatReq.Raw)
-	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK)
+	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, result.Model)
 	setProtocolObservationHeaders(w, protocolObservation{
 		Protocol: "openai_chat", AccountID: result.AccountID, PreferAccount: result.PreferAccount,
 		Failover: result.Failover, Fingerprint: result.Fingerprint, Accounts: result.Accounts, Prep: result.Prep,
 	})
 	writeJSON(w, http.StatusOK, result.Payload)
+}
+
+// projectChatPayloadShellArgs rewrites shell tool_calls / function_call arguments
+// in a non-stream chat.completion payload to the client preferred key (cmd/command).
+func projectChatPayloadShellArgs(payload map[string]any, keys map[string]string) {
+	if payload == nil {
+		return
+	}
+	choices, _ := payload["choices"].([]any)
+	if choices == nil {
+		// collector uses []map[string]any
+		if typed, ok := payload["choices"].([]map[string]any); ok {
+			for _, ch := range typed {
+				projectChatChoiceShellArgs(ch, keys)
+			}
+		}
+		return
+	}
+	for _, item := range choices {
+		ch, _ := item.(map[string]any)
+		projectChatChoiceShellArgs(ch, keys)
+	}
+}
+
+func projectChatChoiceShellArgs(choice map[string]any, keys map[string]string) {
+	if choice == nil {
+		return
+	}
+	msg, _ := choice["message"].(map[string]any)
+	if msg == nil {
+		return
+	}
+	if calls, ok := msg["tool_calls"].([]any); ok {
+		for _, raw := range calls {
+			call, _ := raw.(map[string]any)
+			projectOneChatToolCall(call, keys)
+		}
+	} else if typed, ok := msg["tool_calls"].([]map[string]any); ok {
+		for _, call := range typed {
+			projectOneChatToolCall(call, keys)
+		}
+	}
+	if fn, ok := msg["function_call"].(map[string]any); ok && fn != nil {
+		name := strings.TrimSpace(fmt.Sprint(fn["name"]))
+		args := strings.TrimSpace(fmt.Sprint(fn["arguments"]))
+		if name != "" && args != "" && toolcall.IsShellTool(name) {
+			pref := "cmd"
+			if keys != nil {
+				if v := strings.TrimSpace(keys[name]); v != "" {
+					pref = v
+				} else if v := strings.TrimSpace(keys[strings.ToLower(name)]); v != "" {
+					pref = v
+				} else if nk := toolcall.NameKey(name); nk != "" {
+					if v := strings.TrimSpace(keys[nk]); v != "" {
+						pref = v
+					}
+				}
+			}
+			fn["arguments"] = toolcall.ProjectShellArgsForClient(args, name, pref)
+		}
+	}
+}
+
+func projectOneChatToolCall(call map[string]any, keys map[string]string) {
+	if call == nil {
+		return
+	}
+	fn, _ := call["function"].(map[string]any)
+	if fn == nil {
+		return
+	}
+	name := strings.TrimSpace(fmt.Sprint(fn["name"]))
+	args := strings.TrimSpace(fmt.Sprint(fn["arguments"]))
+	if name == "" || args == "" || !toolcall.IsShellTool(name) {
+		return
+	}
+	pref := "cmd"
+	if keys != nil {
+		if v := strings.TrimSpace(keys[name]); v != "" {
+			pref = v
+		} else if v := strings.TrimSpace(keys[strings.ToLower(name)]); v != "" {
+			pref = v
+		} else if nk := toolcall.NameKey(name); nk != "" {
+			if v := strings.TrimSpace(keys[nk]); v != "" {
+				pref = v
+			}
+		}
+	}
+	fn["arguments"] = toolcall.ProjectShellArgsForClient(args, name, pref)
 }
 
 func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reader, keepalive time.Duration) (proxy.StreamStats, error) {
@@ -556,6 +715,13 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 	w.WriteHeader(http.StatusOK)
 	var stats proxy.StreamStats
 	started := time.Now()
+	// Assemble tool_calls across chunks so we can emit normalized args once complete
+	// (alias rewrite + drop incomplete tools) without breaking partial JSON streams.
+	assembler := proxy.NewChatToolStreamAssembler()
+	// Project shell args to client schema (Codex: cmd) using keys from serveChatCompletions.
+	assembler.SetShellArgKeys(shellArgKeysFrom(r.Context()))
+	// Remap Grok Update/StrReplace → client Edit when tools are known.
+	assembler.SetAllowedTools(allowedToolNamesFrom(r.Context()))
 	write := func(data []byte, force bool) error {
 		if !force {
 			select {
@@ -570,9 +736,37 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 		flusher.Flush()
 		return nil
 	}
+	writeJSONFrame := func(payload map[string]any, force bool) error {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		return write(append(append([]byte("data: "), encoded...), '\n', '\n'), force)
+	}
+	clientSoftGone := false
+	terminalFlushed := false
+	flushAssemblerTerminal := func() error {
+		if terminalFlushed {
+			return nil
+		}
+		terminalFlushed = true
+		// End-of-stream / soft disconnect: force-finish incomplete tools and always
+		// emit a finish_reason frame so clients do not hang as "Tool use interrupted".
+		for _, frame := range assembler.Finish() {
+			if err := writeJSONFrame(frame, true); err != nil {
+				return err
+			}
+		}
+		if frame := assembler.FinishReasonFrame(); frame != nil {
+			if err := writeJSONFrame(frame, true); err != nil {
+				return err
+			}
+		}
+		return write([]byte("data: [DONE]\n\n"), true)
+	}
 	err := grok.ReadSSEWithIdle(body, keepalive, func(event grok.Event) error {
 		if event.Done {
-			return write([]byte("data: [DONE]\n\n"), true)
+			return flushAssemblerTerminal()
 		}
 		if stats.FirstTokenMS == 0 && len(event.Data) > 0 {
 			stats.FirstTokenMS = int(time.Since(started).Milliseconds())
@@ -584,71 +778,53 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 		if err == nil && delta.Usage != nil {
 			stats.Usage = delta.Usage
 		}
+		// When tool deltas present (or assembler is already buffering tools), rewrite
+		// through assembler; pure text/finish frames passthrough unchanged.
+		if err == nil && (len(delta.ToolCalls) > 0 || delta.FunctionCall != nil || assembler.Holding()) {
+			frames, passthrough := assembler.Feed(event.Data, delta)
+			if !passthrough {
+				// Once tools are in flight, force writes so a soft disconnect still
+				// delivers complete tool_calls + finish_reason rather than half frames.
+				writeForce := assembler.Holding() || assembler.EmittedAny()
+				for _, frame := range frames {
+					if err := writeJSONFrame(frame, writeForce); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+		}
 		data := append([]byte("data: "), event.Data...)
 		data = append(data, '\n', '\n')
 		return write(data, false)
 	}, func() error {
+		select {
+		case <-r.Context().Done():
+			// Soft disconnect: keep SSE warm; terminal frames still flush after ReadSSE.
+			clientSoftGone = true
+			return write([]byte(": keepalive\n\n"), true)
+		default:
+		}
 		return write([]byte(": keepalive\n\n"), false)
 	})
+	// Soft disconnect / write abort after tools started: still force-finish if we
+	// never saw [DONE] (upstream may have closed without finish_reason).
+	if assembler.Holding() || assembler.EmittedAny() {
+		soft := err == nil || clientSoftGone || errors.Is(err, r.Context().Err()) || isSoftClientWriteError(err)
+		if soft {
+			_ = flushAssemblerTerminal()
+			if clientSoftGone || errors.Is(err, r.Context().Err()) || isSoftClientWriteError(err) {
+				return stats, nil
+			}
+		}
+	}
 	if err != nil && !errors.Is(err, r.Context().Err()) {
-		encoded, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": "api_error"}})
+		msg, errType := openAIErrorFromCause(err)
+		encoded, _ := json.Marshal(map[string]any{"error": map[string]any{"message": msg, "type": errType}})
 		_ = write(append(append([]byte("data: "), encoded...), '\n', '\n'), true)
 		_ = write([]byte("data: [DONE]\n\n"), true)
 	}
-	if err == nil || errors.Is(err, r.Context().Err()) {
-		// Ensure terminal DONE if upstream ended without it (soft disconnect).
-	}
 	return stats, err
-}
-
-func upstreamMaxAttempts(ctx context.Context, options Options) int {
-	retries := 3
-	if options.UpstreamRetryCount != nil {
-		retries = options.UpstreamRetryCount(ctx)
-	} else if options.Store != nil {
-		if value, err := options.Store.UpstreamRetryCount(ctx); err == nil {
-			retries = value
-		}
-	}
-	if retries < 0 {
-		retries = 0
-	}
-	if retries > 63 {
-		retries = 63
-	}
-	return retries + 1
-}
-
-func failedAttemptObserver(options Options, model string) func(context.Context, string, error) {
-	return func(_ context.Context, accountID string, cause error) {
-		if strings.TrimSpace(accountID) == "" || cause == nil {
-			return
-		}
-		status := http.StatusBadGateway
-		summary := "upstream request failed"
-		var upstreamErr *grok.UpstreamError
-		if errors.As(cause, &upstreamErr) {
-			status = upstreamErr.Status
-			summary = fmt.Sprintf("upstream request failed (status %d)", status)
-		}
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			var cooldown *time.Time
-			if status == http.StatusTooManyRequests || status >= 500 {
-				until := time.Now().Add(15 * time.Minute)
-				cooldown = &until
-			}
-			if options.Store != nil {
-				_ = options.Store.ReportPoolFailure(ctx, postgres.PoolFailure{
-					AccountID: accountID, Error: summary, StatusCode: &status,
-					CooldownUntil: cooldown, CooldownReason: summary,
-					Detail: map[string]any{"source": "go_chat_attempt", "model": model},
-				})
-			}
-			touchRedisPool(options, accountID, false, summary, cooldown, status)
-		}()
-	}
 }
 
 func releaseServerPick(options Options, accountID string) {
@@ -682,7 +858,7 @@ func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if options.Store != nil {
-			_, _, _ = options.Store.RecordUsage(ctx, postgres.UsageRecord{
+			if _, _, err := options.Store.RecordUsage(ctx, postgres.UsageRecord{
 				RequestID:           requestID(r),
 				Implementation:      "go",
 				APIKeyID:            apiKeyID,
@@ -705,15 +881,21 @@ func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord
 				TTFTMS:              ttftPtr,
 				Error:               errText,
 				Detail:              usageDetail("go_chat", requestBody, ttftMS, latency),
-			})
+			}); err != nil {
+				slog.Warn("record usage failed", "error", err, "account_id", accountID, "model", model, "ok", ok)
+			}
 		}
 		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
 	}()
 }
 
-func reportChatPool(r *http.Request, options Options, accountID string, ok bool, cause error, status int) {
+func reportChatPool(r *http.Request, options Options, accountID string, ok bool, cause error, status int, requestedModel ...string) {
 	if strings.TrimSpace(accountID) == "" {
 		return
+	}
+	modelHint := ""
+	if len(requestedModel) > 0 {
+		modelHint = strings.TrimSpace(requestedModel[0])
 	}
 	// Fire-and-forget pool reporting - should not block response
 	go func() {
@@ -721,25 +903,118 @@ func reportChatPool(r *http.Request, options Options, accountID string, ok bool,
 		defer cancel()
 		if ok {
 			if options.Store != nil {
+				// preserve still-active free-usage windows, but heal stale markers.
 				_ = options.Store.ReportPoolSuccess(ctx, accountID, true)
 			}
 			touchRedisPool(options, accountID, true, "", nil, status)
 			return
 		}
-		var cooldown *time.Time
-		if status == http.StatusTooManyRequests || status >= 500 {
-			until := time.Now().Add(15 * time.Minute)
-			cooldown = &until
-		}
 		var errText string
 		if cause != nil {
 			errText = cause.Error()
 		}
+		// Prefer upstream status/body when present (failover wraps).
+		var upstream *grok.UpstreamError
+		if errors.As(cause, &upstream) && upstream != nil {
+			if upstream.Status > 0 {
+				status = upstream.Status
+			}
+			if strings.TrimSpace(upstream.Body) != "" {
+				errText = upstream.Body
+			}
+		}
+		// Text-first classifier: free-usage / 额度用完 / rate-limit wording decides
+		// whether the account enters the cooldown pool (and optionally soft-blocks a model).
+		decision := pool.ClassifyUpstreamFailure(status, errText, modelHint)
+		var cooldown *time.Time
+		if decision.ShouldCooldown {
+			cooldown = decision.Until
+		}
+		// Prefer body-extracted model, fall back to requested model for soft-block.
+		coolModel := strings.TrimSpace(decision.Model)
+		if coolModel == "" {
+			coolModel = modelHint
+		}
+		failure := postgres.PoolFailure{
+			AccountID:      accountID,
+			Error:          errText,
+			StatusCode:     &status,
+			CooldownUntil:  cooldown,
+			CooldownReason: firstNonEmptyStr(decision.Reason, errText),
+			CooldownCode:   decision.Code,
+			CooldownModel:  coolModel,
+			Detail: map[string]any{
+				"source":           "go_chat",
+				"failure_class":    string(decision.Class),
+				"should_cooldown":  decision.ShouldCooldown,
+				"requested_model":  modelHint,
+				"classified_model": decision.Model,
+			},
+		}
+		if decision.TokensActual != nil {
+			failure.CooldownTokensActual = decision.TokensActual
+		}
+		if decision.TokensLimit != nil {
+			failure.CooldownTokensLimit = decision.TokensLimit
+		}
+		// Soft-block model only when classifier sets BlockModel (not free-usage cool).
+		if decision.BlockModel && coolModel != "" && cooldown != nil {
+			failure.BlockedModel = coolModel
+			failure.BlockedUntil = cooldown
+		}
 		if options.Store != nil {
-			_ = options.Store.ReportPoolFailure(ctx, postgres.PoolFailure{AccountID: accountID, Error: errText, StatusCode: &status, CooldownUntil: cooldown, CooldownReason: errText, Detail: map[string]any{"source": "go_chat"}})
+			// Only record durable failure/cooldown when classifier says so.
+			// Still bump fail stats for non-cooldown errors without setting until.
+			_ = options.Store.ReportPoolFailure(ctx, failure)
 		}
 		touchRedisPool(options, accountID, false, errText, cooldown, status)
 	}()
+}
+
+// chatFailureCooldown is kept as a thin wrapper around pool.ClassifyUpstreamFailure
+// for unit tests and call sites that still use the old signature.
+func chatFailureCooldown(status int, errText string, requestedModel ...string) (until *time.Time, code, model string, tokensActual, tokensLimit *int64) {
+	d := pool.ClassifyUpstreamFailure(status, errText, requestedModel...)
+	if !d.ShouldCooldown {
+		return nil, d.Code, d.Model, d.TokensActual, d.TokensLimit
+	}
+	return d.Until, d.Code, d.Model, d.TokensActual, d.TokensLimit
+}
+
+// chatPoolFailureReporter implements proxy.AccountFailureReporter so intermediate
+// failover losers (quota-exhausted accounts) still enter the cooldown pool even
+// when a later account eventually serves the request.
+type chatPoolFailureReporter struct {
+	options Options
+}
+
+func (r chatPoolFailureReporter) ReportAccountFailure(accountID, model string, err error) {
+	if err == nil || strings.TrimSpace(accountID) == "" {
+		return
+	}
+	status := http.StatusBadGateway
+	reportChatPool(nil, r.options, accountID, false, err, status, model)
+}
+
+func newChatService(options Options) proxy.ChatService {
+	return proxy.ChatService{
+		Catalog:               modelCatalog(options),
+		Client:                upstreamClient(options),
+		PickObserver:          options.PickObserver,
+		AffinityStore:         options.AffinityStore,
+		FailureReporter:       chatPoolFailureReporter{options: options},
+		StickyFirstOnly:       options.runtimeConfig().StickyFirstOnly,
+		FirstByteProbeWorkers: options.runtimeConfig().FirstByteProbeWorkers,
+		MaxFailoverAttempts:   options.runtimeConfig().MaxFailoverAttempts,
+	}
+}
+
+func extractGrokModelFromError(errText string) string {
+	return pool.ExtractModelName(errText)
+}
+
+func parseTokenPair(errText string) (actual, limit int64, ok bool) {
+	return pool.ParseTokenPair(errText)
 }
 
 func requestID(r *http.Request) string {
@@ -766,30 +1041,129 @@ func clientIP(r *http.Request) string {
 }
 
 func writeProxyError(w http.ResponseWriter, err error) {
-	if errors.Is(err, proxy.ErrAllAccountsFailed) {
-		writeOpenAIUpstreamError(w)
-		return
-	}
+	// Keep OpenAI chat /v1/chat/completions error shape for this route.
+	writeOpenAIProxyError(w, err)
+}
+
+// writeOpenAIProxyError maps upstream/proxy failures onto OpenAI error JSON
+// with useful status codes and unwrapped human/quota messages.
+func writeOpenAIProxyError(w http.ResponseWriter, err error) {
 	status := http.StatusBadGateway
-	message := err.Error()
+	message, errorType := openAIErrorFromCause(err)
 	if errors.Is(err, pool.ErrNoEligibleAccounts) {
 		status = http.StatusServiceUnavailable
-		message = "No eligible accounts available. All accounts may be in cooldown or disabled."
 	}
-	// 检查是否为上游错误并保留正确的状态码
-	var upstreamErr *grok.UpstreamError
-	if errors.As(err, &upstreamErr) {
-		// 对于 429/503 等上游错误，使用原始状态码
-		if upstreamErr.Status == http.StatusTooManyRequests || upstreamErr.Status == http.StatusServiceUnavailable {
-			status = upstreamErr.Status
-			message = upstreamErr.Body
-		} else if upstreamErr.Status >= 500 {
-			status = http.StatusBadGateway
-		} else if upstreamErr.Status >= 400 && upstreamErr.Status < 500 {
-			status = upstreamErr.Status
+	var upstream *grok.UpstreamError
+	if errors.As(err, &upstream) && upstream != nil {
+		status = mapUpstreamStatusToOpenAI(upstream.Status)
+	} else if unwrappedStatus, _, ok := unwrapAnthropicUpstreamMessage(errString(err)); ok && unwrappedStatus > 0 {
+		// Reuse the same upstream-status peel helper (shared wrapper format).
+		status = mapUpstreamStatusToOpenAI(unwrappedStatus)
+	}
+	writeOpenAIError(w, status, message, errorType)
+}
+
+func writeOpenAIError(w http.ResponseWriter, status int, message, errorType string) {
+	if status <= 0 {
+		status = http.StatusBadGateway
+	}
+	// Unwrap "upstream status N: {...}" and nested JSON error bodies.
+	if unwrappedStatus, unwrappedBody, ok := unwrapAnthropicUpstreamMessage(message); ok {
+		if unwrappedStatus > 0 {
+			status = mapUpstreamStatusToOpenAI(unwrappedStatus)
+		}
+		if strings.TrimSpace(unwrappedBody) != "" {
+			message = unwrappedBody
+		}
+		if errorType == "" || errorType == "server_error" || errorType == "api_error" {
+			errorType = openAIErrorTypeForStatus(status)
 		}
 	}
-	writeJSON(w, status, map[string]any{"detail": message})
+	if errorType == "" {
+		errorType = openAIErrorTypeForStatus(status)
+	}
+	if strings.TrimSpace(message) == "" {
+		message = "request failed"
+	}
+	// OpenAI wire shape: { "error": { "message":"...", "type":"..." } }
+	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": errorType}})
+}
+
+func openAIErrorTypeForStatus(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "invalid_request_error"
+	case http.StatusForbidden:
+		return "invalid_request_error"
+	case http.StatusNotFound:
+		return "invalid_request_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
+		return "invalid_request_error"
+	default:
+		return "server_error"
+	}
+}
+
+func mapUpstreamStatusToOpenAI(status int) int {
+	switch {
+	case status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable:
+		return status
+	case status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound:
+		return status
+	case status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge:
+		return status
+	case status >= 500:
+		return http.StatusBadGateway
+	case status >= 400:
+		return status
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+func openAIErrorFromCause(err error) (message, errorType string) {
+	if err == nil {
+		return "request failed", "server_error"
+	}
+	message = strings.TrimSpace(err.Error())
+	errorType = "server_error"
+	var upstream *grok.UpstreamError
+	if errors.As(err, &upstream) && upstream != nil {
+		if strings.TrimSpace(upstream.Body) != "" {
+			message = preferAnthropicErrorBody(upstream.Body)
+		}
+		status := mapUpstreamStatusToOpenAI(upstream.Status)
+		errorType = openAIErrorTypeForStatus(status)
+		return firstNonEmptyStr(message, err.Error()), errorType
+	}
+	if status, body, ok := unwrapAnthropicUpstreamMessage(message); ok {
+		if strings.TrimSpace(body) != "" {
+			message = body
+		}
+		if status > 0 {
+			errorType = openAIErrorTypeForStatus(mapUpstreamStatusToOpenAI(status))
+		}
+	}
+	low := strings.ToLower(message)
+	if strings.Contains(low, "empty model output") || strings.Contains(low, "no content/tool_calls") {
+		errorType = "server_error"
+	}
+	if errors.Is(err, pool.ErrNoEligibleAccounts) {
+		errorType = "server_error"
+		if message == "" || strings.Contains(low, "no eligible") {
+			message = "No eligible accounts available. All accounts may be in cooldown or disabled."
+		}
+	}
+	return firstNonEmptyStr(message, "request failed"), errorType
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
@@ -799,11 +1173,13 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	// Accepted for client compatibility (Claude SDKs send it); not enforced.
 	_ = r.Header.Get("anthropic-version")
+	// anthropic-beta: prompt-caching-* is accepted (sticky routing + usage fields).
+	_ = r.Header.Get("anthropic-beta")
 	var raw map[string]any
 	decoder := json.NewDecoder(r.Body)
 	decoder.UseNumber()
 	if err := decoder.Decode(&raw); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		writeAnthropicError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
 	messages, _ := raw["messages"].([]any)
@@ -822,6 +1198,10 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		writeAnthropicError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
+	// Echo sticky cache key so clients / relays can reuse it next turn.
+	if pck := strings.TrimSpace(stringValue(body["prompt_cache_key"])); pck != "" {
+		w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
+	}
 	allowedTools := allowedAnthropicToolNames(body)
 	chatReq := proxy.ChatRequest{Model: model, Stream: false, Raw: body}
 	candidates, err := listCandidatesForRequest(r.Context(), options, chatReq, r.Header)
@@ -829,25 +1209,18 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		writeAnthropicError(w, http.StatusInternalServerError, err.Error(), "api_error")
 		return
 	}
-	service := proxy.ChatService{
-		Catalog:         modelCatalog(options),
-		Client:          upstreamClient(options),
-		MaxAttempts:     upstreamMaxAttempts(r.Context(), options),
-		PickObserver:    options.PickObserver,
-		AffinityStore:   options.AffinityStore,
-		FailureObserver: failedAttemptObserver(options, model),
-	}
+	service := newChatService(options)
 	started := time.Now()
 	messageID := newAnthropicMessageID()
 	// Match Python resolve_outbound_max_tools for anthropic (Claude/sub2api-safe).
 	policy := historycompact.ResolveOutboundToolPolicy(
 		"anthropic",
 		r.UserAgent(),
-		options.Config.OutboundMaxTools,
-		options.Config.OutboundMaxToolsOpenAI,
-		options.Config.OutboundMaxToolsResponsesNative,
-		options.Config.OutboundToolGap,
-		options.Config.OutboundToolGapNative,
+		options.runtimeConfig().OutboundMaxTools,
+		options.runtimeConfig().OutboundMaxToolsOpenAI,
+		options.runtimeConfig().OutboundMaxToolsResponsesNative,
+		options.runtimeConfig().OutboundToolGap,
+		options.runtimeConfig().OutboundToolGapNative,
 	)
 	maxTools := policy.MaxTools
 	if maxTools < 0 {
@@ -855,25 +1228,18 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	if stream {
 		chatReq.Stream = true
-		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, "least_used")
+		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
 		if err != nil {
-			status := http.StatusBadGateway
-			if errors.Is(err, proxy.ErrAllAccountsFailed) {
-				status = http.StatusServiceUnavailable
-			}
-			recordAnthropicUsage(r, options, apiKey, "", model, true, false, status, started, nil, err, 0, raw)
-			if errors.Is(err, proxy.ErrAllAccountsFailed) {
-				writeAnthropicUpstreamSSEError(w)
-			} else {
-				writeAnthropicError(w, status, err.Error(), "api_error")
-			}
+			// Per-account free-usage / 额度用完 already kicked via FailureReporter.
+			recordAnthropicUsage(r, options, apiKey, opened.AccountID, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
+			writeAnthropicProxyError(w, err)
 			return
 		}
 		defer opened.Body.Close()
 		defer releaseServerPick(options, opened.AccountID)
 		req := r
-		if options.Config.SSEKeepalive > 0 {
-			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.Config.SSEKeepalive))
+		if options.runtimeConfig().SSEKeepalive > 0 {
+			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.runtimeConfig().SSEKeepalive))
 		}
 		if policy.ToolGap > 0 {
 			req = req.WithContext(withOutboundToolGap(req.Context(), policy.ToolGap))
@@ -882,35 +1248,49 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 			AccountID: opened.AccountID, PreferAccount: opened.PreferAccount, Failover: opened.Failover,
 			Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep, Stream: true,
 		})
+		if pck := strings.TrimSpace(stringValue(body["prompt_cache_key"])); pck != "" {
+			w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
+		}
 		usage, firstTokenMS, err := streamAnthropicMessages(w, req, opened.Body, messageID, opened.Model, len(allowedTools) > 0, allowedTools, maxTools)
-		ok := err == nil || errors.Is(err, r.Context().Err())
+		// Empty upstream / tool-vanished returns an error; soft disconnect without
+		// payload also returns empty error (see streamAnthropicMessagesWithOptions).
+		// Only pure client-cancel AFTER payload is treated as ok.
+		ok := err == nil
+		if !ok && errors.Is(err, r.Context().Err()) {
+			ok = true
+		}
 		status := http.StatusOK
 		if !ok {
 			status = http.StatusBadGateway
 		}
+		// Guard: never record successful zero-token sub-second streams as ok when
+		// no TTFT was observed (classic intermittent empty envelope).
+		if ok && firstTokenMS <= 0 {
+			p, c, tot, _, _, _ := postgres.UsageFromOpenAI(usage)
+			if p == 0 && c == 0 && tot == 0 && time.Since(started) < 3*time.Second {
+				ok = false
+				status = http.StatusBadGateway
+				if err == nil {
+					err = errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+				}
+			}
+		}
 		recordAnthropicUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS, raw)
-		reportChatPool(r, options, opened.AccountID, ok, err, status)
+		reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
 		return
 	}
-	result, err := service.CompleteWithResult(r.Context(), chatReq, candidates, "least_used")
-	if result.AccountID != "" {
+	result, err := service.CompleteWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
+	if result.PickHeld && result.AccountID != "" {
 		defer releaseServerPick(options, result.AccountID)
 	}
 	if err != nil {
-		status := http.StatusBadGateway
-		if errors.Is(err, proxy.ErrAllAccountsFailed) {
-			status = http.StatusServiceUnavailable
-		}
-		recordAnthropicUsage(r, options, apiKey, result.AccountID, model, false, false, status, started, nil, err, 0, raw)
-		if errors.Is(err, proxy.ErrAllAccountsFailed) {
-			writeAnthropicUpstreamError(w)
-		} else {
-			writeAnthropicError(w, status, err.Error(), "api_error")
-		}
+		// Per-account free-usage / 额度用完 already kicked via FailureReporter.
+		recordAnthropicUsage(r, options, apiKey, result.AccountID, model, false, false, http.StatusBadGateway, started, nil, err, 0, raw)
+		writeAnthropicProxyError(w, err)
 		return
 	}
 	recordAnthropicUsage(r, options, apiKey, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil, 0, raw)
-	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK)
+	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, result.Model)
 	content, reasoning, finish, usage, toolCalls := anthropicCompletionParts(result.Payload)
 	if maxTools > 0 && len(toolCalls) > maxTools {
 		toolCalls = toolCalls[:maxTools]
@@ -919,7 +1299,15 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		AccountID: result.AccountID, PreferAccount: result.PreferAccount, Failover: result.Failover,
 		Fingerprint: result.Fingerprint, Accounts: result.Accounts, Prep: result.Prep, Stream: false,
 	})
-	writeJSON(w, http.StatusOK, anthropic.Completion(messageID, result.Model, content, reasoning, finish, toolCalls, usage, allowedTools))
+	if pck := strings.TrimSpace(stringValue(body["prompt_cache_key"])); pck != "" {
+		w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
+	}
+	payload := anthropic.Completion(messageID, result.Model, content, reasoning, finish, toolCalls, usage, allowedTools)
+	// Surface sticky key in body metadata for non-streaming clients.
+	if pck := strings.TrimSpace(stringValue(body["prompt_cache_key"])); pck != "" {
+		payload["prompt_cache_key"] = pck
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func serveMessagesCountTokens(w http.ResponseWriter, r *http.Request, options Options) {
@@ -943,11 +1331,12 @@ func serveMessagesCountTokens(w http.ResponseWriter, r *http.Request, options Op
 
 func messageRouteAllowed(w http.ResponseWriter, r *http.Request, options Options) (*auth.APIKeyRecord, bool) {
 	if !options.MessagesEnabled {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "Go messages route is not enabled"})
+		// Claude Code / Anthropic SDK parse type=error envelopes; plain detail breaks clients.
+		writeAnthropicError(w, http.StatusServiceUnavailable, "Go messages route is not enabled", "api_error")
 		return nil, false
 	}
 	if !isReady(options) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": readyReason(options)})
+		writeAnthropicError(w, http.StatusServiceUnavailable, readyReason(options), "api_error")
 		return nil, false
 	}
 	var apiKey *auth.APIKeyRecord
@@ -956,17 +1345,19 @@ func messageRouteAllowed(w http.ResponseWriter, r *http.Request, options Options
 		if err != nil {
 			status := http.StatusInternalServerError
 			message := err.Error()
+			errType := "api_error"
 			if errors.Is(err, auth.ErrInvalidAPIKey) {
 				status = http.StatusUnauthorized
 				message = "Invalid or missing API key"
+				errType = "authentication_error"
 			}
-			writeJSON(w, status, map[string]any{"detail": message})
+			writeAnthropicError(w, status, message, errType)
 			return nil, false
 		}
 		apiKey = verified
 	}
 	if options.Store == nil && len(options.Candidates) == 0 {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		writeAnthropicError(w, http.StatusServiceUnavailable, "PostgreSQL store unavailable", "api_error")
 		return nil, false
 	}
 	return apiKey, true
@@ -974,26 +1365,153 @@ func messageRouteAllowed(w http.ResponseWriter, r *http.Request, options Options
 
 func messageCountRouteAllowed(w http.ResponseWriter, r *http.Request, options Options) bool {
 	if !options.MessagesEnabled {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "Go messages route is not enabled"})
+		writeAnthropicError(w, http.StatusServiceUnavailable, "Go messages route is not enabled", "api_error")
 		return false
 	}
 	if !isReady(options) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": readyReason(options)})
+		writeAnthropicError(w, http.StatusServiceUnavailable, readyReason(options), "api_error")
 		return false
 	}
 	if options.APIKeys != nil {
 		if _, err := options.APIKeys.Require(r.Context(), r); err != nil {
 			status := http.StatusInternalServerError
 			message := err.Error()
+			errType := "api_error"
 			if errors.Is(err, auth.ErrInvalidAPIKey) {
 				status = http.StatusUnauthorized
 				message = "Invalid or missing API key"
+				errType = "authentication_error"
 			}
-			writeJSON(w, status, map[string]any{"detail": message})
+			writeAnthropicError(w, status, message, errType)
 			return false
 		}
 	}
 	return true
+}
+
+func clampCodexReasoning(raw, body map[string]any, userAgent string, enabled bool) {
+	if !enabled || body == nil {
+		return
+	}
+	if !historycompact.IsCodexClient(userAgent) {
+		return
+	}
+	// Force low effort for Codex/OpenAI-native TTFT. Explicit values are overwritten
+	// because xhigh/high dominate first-token latency on grok-4.5.
+	body["reasoning_effort"] = "low"
+	body["reasoning"] = map[string]any{"effort": "low", "summary": "auto"}
+	if raw != nil {
+		raw["reasoning_effort"] = "low"
+		if m, ok := raw["reasoning"].(map[string]any); ok && m != nil {
+			m["effort"] = "low"
+			if _, ok := m["summary"]; !ok {
+				m["summary"] = "auto"
+			}
+			raw["reasoning"] = m
+		} else {
+			raw["reasoning"] = map[string]any{"effort": "low", "summary": "auto"}
+		}
+	}
+}
+
+type shellArgKeysContextKey struct{}
+
+func withShellArgKeys(ctx context.Context, keys map[string]string) context.Context {
+	if len(keys) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, shellArgKeysContextKey{}, keys)
+}
+
+func shellArgKeysFrom(ctx context.Context) map[string]string {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(shellArgKeysContextKey{}).(map[string]string)
+	return v
+}
+
+type allowedToolsContextKey struct{}
+
+func withAllowedTools(ctx context.Context, names []string) context.Context {
+	if len(names) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, allowedToolsContextKey{}, append([]string(nil), names...))
+}
+
+func allowedToolNamesFrom(ctx context.Context) []string {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(allowedToolsContextKey{}).([]string)
+	return v
+}
+
+// ensureCodexShellCmdKeys forces shell-like tools to project args as "cmd" for
+// Codex clients. Codex validates against its local tool schema (cmd), while we
+// still send "command" upstream to Grok.
+func ensureCodexShellCmdKeys(tools any, keys map[string]string) map[string]string {
+	if keys == nil {
+		keys = map[string]string{}
+	}
+	items, _ := tools.([]any)
+	for _, item := range items {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := ""
+		if fn, ok := tool["function"].(map[string]any); ok {
+			name = strings.TrimSpace(fmt.Sprint(fn["name"]))
+		}
+		if name == "" {
+			name = strings.TrimSpace(fmt.Sprint(tool["name"]))
+		}
+		if name == "" {
+			continue
+		}
+		// Only shell family (include Codex exec_command / run_command / shell_command).
+		if !toolcall.IsShellTool(name) {
+			continue
+		}
+		// If client schema explicitly prefers command-only, keep it.
+		pref := toolcall.PreferredShellArgKeyFromTool(tool)
+		if pref == "command" {
+			// Detect pure-command schema (no cmd property).
+			params := any(nil)
+			if fn, ok := tool["function"].(map[string]any); ok {
+				params = fn["parameters"]
+				if params == nil {
+					params = fn["input_schema"]
+				}
+			}
+			if params == nil {
+				params = tool["parameters"]
+			}
+			if pm, ok := params.(map[string]any); ok {
+				if props, ok := pm["properties"].(map[string]any); ok {
+					_, hasCmd := props["cmd"]
+					_, hasCommand := props["command"]
+					if hasCommand && !hasCmd {
+						keys[name] = "command"
+						keys[strings.ToLower(name)] = "command"
+						if nk := toolcall.NameKey(name); nk != "" {
+							keys[nk] = "command"
+						}
+						continue
+					}
+				}
+			}
+		}
+		// Default Codex shell → cmd (Codex local schema field name).
+		keys[name] = "cmd"
+		keys[strings.ToLower(name)] = "cmd"
+		if nk := toolcall.NameKey(name); nk != "" {
+			keys[nk] = "cmd"
+		}
+	}
+	return keys
 }
 
 func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
@@ -1034,59 +1552,160 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	stream, _ := raw["stream"].(bool)
 	model := modelCatalog(options).Resolve(stringValue(raw["model"]))
 	body := responses.BuildChatBody(raw, model)
+	// Codex shell schema uses "cmd"; remember preferred keys from the *client* tools
+	// before sanitize rewrites them to "command" for upstream Grok.
+	keys := toolcall.ShellArgKeyMap(raw["tools"])
+	// Always force shell-family tools onto "cmd". Codex validates local schema with
+	// "cmd", not "command". Pure OpenAI command-only schemas are preserved by
+	// ensureCodexShellCmdKeys when properties.command is exclusive and no cmd prop.
+	// Do this even without UA detection — many proxies strip User-Agent.
+	keys = ensureCodexShellCmdKeys(raw["tools"], keys)
+	// If client sent no tools list (or empty map) but is Codex, still seed common shell names.
+	if len(keys) == 0 && (historycompact.IsCodexClient(r.UserAgent()) || historycompact.IsOpenAINativeClient(r.UserAgent())) {
+		for _, name := range []string{
+			"shell", "Shell", "bash", "Bash",
+			"local_shell", "localShell", "exec", "run",
+			"exec_command", "exec-command", "ExecCommand",
+			"run_command", "shell_command", "ShellCommand",
+		} {
+			keys[name] = "cmd"
+			keys[strings.ToLower(name)] = "cmd"
+			keys[toolcall.NameKey(name)] = "cmd"
+		}
+	}
+	if len(keys) > 0 {
+		r = r.WithContext(withShellArgKeys(r.Context(), keys))
+	}
+	clampCodexReasoning(raw, body, r.UserAgent(), options.runtimeConfig().CodexForceReasoningLow)
 	messages, _ := body["messages"].([]map[string]any)
 	if len(messages) == 0 {
 		writeOpenAIError(w, http.StatusBadRequest, "input must contain at least one message", "invalid_request_error")
 		return
 	}
 	chatReq := proxy.ChatRequest{Model: model, Stream: stream, Raw: body}
-	// Preserve client prompt_cache_key on chatReq for sticky fingerprint (stripped later for upstream).
-	if pck := strings.TrimSpace(stringValue(raw["prompt_cache_key"])); pck != "" {
+	// Sticky keys for Codex multi-turn: prompt_cache_key first, then previous_response_id chain.
+	// CRITICAL: never mint a *new* pck each turn from previous_response_id — that kills upstream
+	// prompt cache. Always recover the same pck that produced the previous response when possible.
+	pck := strings.TrimSpace(stringValue(raw["prompt_cache_key"]))
+	if pck == "" {
+		if meta, _ := raw["metadata"].(map[string]any); meta != nil {
+			pck = strings.TrimSpace(stringValue(meta["prompt_cache_key"]))
+		}
+	}
+	prevResp := strings.TrimSpace(stringValue(raw["previous_response_id"]))
+	stickyFromPrev := ""
+	if prevResp != "" {
+		if acc, recoveredPCK := responseAffinityLookup(r.Context(), options, prevResp); acc != "" || recoveredPCK != "" {
+			stickyFromPrev = strings.TrimSpace(acc)
+			if pck == "" && recoveredPCK != "" {
+				pck = recoveredPCK
+			}
+		}
+	}
+	if pck == "" {
+		// Only mint a new session key for a fresh conversation root.
+		// Prefer stable client session/conv headers over previous_response_id so
+		// multi-turn without client pck still keeps one upstream cache key.
+		if sid := strings.TrimSpace(r.Header.Get("X-Session-Id")); sid != "" {
+			pck = "session:" + sid
+		} else if cid := strings.TrimSpace(r.Header.Get("X-Grok-Conv-Id")); cid != "" {
+			pck = "conv:" + cid
+		} else if prevResp != "" {
+			// Recovery missed (cold process / redis miss). Last resort only.
+			pck = "respchain:" + prevResp
+		}
+	}
+	if pck != "" {
 		if chatReq.Raw == nil {
 			chatReq.Raw = map[string]any{}
 		}
 		chatReq.Raw["prompt_cache_key"] = pck
+		body["prompt_cache_key"] = pck
+	}
+	if prevResp != "" {
+		if chatReq.Raw == nil {
+			chatReq.Raw = map[string]any{}
+		}
+		chatReq.Raw["previous_response_id"] = prevResp
 	}
 	candidates, err := listCandidatesForRequest(r.Context(), options, chatReq, r.Header)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
-	service := proxy.ChatService{
-		Catalog: modelCatalog(options), Client: upstreamClient(options), MaxAttempts: upstreamMaxAttempts(r.Context(), options),
-		PickObserver: options.PickObserver, AffinityStore: options.AffinityStore, FailureObserver: failedAttemptObserver(options, model),
+	// Hard-pin recovered previous_response account even when fingerprint lookup missed.
+	if stickyFromPrev != "" {
+		candidates = ensureStickyCandidate(r.Context(), options, candidates, stickyFromPrev)
+		for i := range candidates {
+			if candidates[i].ID == stickyFromPrev {
+				if i > 0 {
+					cand := candidates[i]
+					copy(candidates[1:i+1], candidates[0:i])
+					candidates[0] = cand
+				}
+				candidates[0].RequestCount -= 1_000_000_000
+				break
+			}
+		}
 	}
+	service := newChatService(options)
 	started := time.Now()
 	responseID := responses.NewResponseID()
 	respPolicy := historycompact.ResolveOutboundToolPolicy(
 		"openai_responses",
 		r.UserAgent(),
-		options.Config.OutboundMaxTools,
-		options.Config.OutboundMaxToolsOpenAI,
-		options.Config.OutboundMaxToolsResponsesNative,
-		options.Config.OutboundToolGap,
-		options.Config.OutboundToolGapNative,
+		options.runtimeConfig().OutboundMaxTools,
+		options.runtimeConfig().OutboundMaxToolsOpenAI,
+		options.runtimeConfig().OutboundMaxToolsResponsesNative,
+		options.runtimeConfig().OutboundToolGap,
+		options.runtimeConfig().OutboundToolGapNative,
 	)
 	if stream {
-		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, "least_used")
+		// Codex TTFT: open SSE envelope immediately so the client is not blocked on
+		// account pick + upstream first-byte. Empty/failover still happens before any
+		// model payload is emitted by LiveStreamer.Start being called once only.
+		flusher, canFlush := w.(http.Flusher)
+		if !canFlush {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "streaming is not supported by this response writer"})
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-transform")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Set("X-Grok2API-Protocol", "openai_responses")
+		if pck != "" {
+			w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
+		}
+		w.WriteHeader(http.StatusOK)
+		early := responses.NewLiveStreamerWithMaxTools(responseID, model, allowedResponsesToolNames(body), respPolicy.MaxTools)
+		early.SetShellArgKeys(shellArgKeysFrom(r.Context()))
+		for _, frame := range early.Start() {
+			_, _ = w.Write([]byte(frame))
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+		opened, err := service.OpenStreamWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
 		if err != nil {
-			status := http.StatusBadGateway
-			if errors.Is(err, proxy.ErrAllAccountsFailed) {
-				status = http.StatusServiceUnavailable
+			// Emit failed terminal on already-open stream.
+			for _, frame := range early.Fail(err.Error(), "server_error") {
+				_, _ = w.Write([]byte(frame))
 			}
-			recordResponsesUsage(r, options, apiKey, "", model, true, false, status, started, nil, err, 0, raw)
-			if errors.Is(err, proxy.ErrAllAccountsFailed) {
-				writeResponsesUpstreamSSEError(w, responseID, model)
-			} else {
-				writeOpenAIError(w, status, err.Error(), "server_error")
+			if canFlush {
+				flusher.Flush()
 			}
+			// Per-account free-usage / 额度用完 already kicked via FailureReporter.
+			recordResponsesUsage(r, options, apiKey, opened.AccountID, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
 			return
 		}
 		defer opened.Body.Close()
 		defer releaseServerPick(options, opened.AccountID)
+		// Bind this response_id so next Codex turn with previous_response_id sticks.
+		bindResponseAffinity(r.Context(), options, responseID, opened.AccountID, opened.Model, pck)
 		req := r
-		if options.Config.SSEKeepalive > 0 {
-			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.Config.SSEKeepalive))
+		if options.runtimeConfig().SSEKeepalive > 0 {
+			req = r.WithContext(withAnthropicKeepalive(r.Context(), options.runtimeConfig().SSEKeepalive))
 		}
 		if respPolicy.ToolGap > 0 {
 			req = req.WithContext(withOutboundToolGap(req.Context(), respPolicy.ToolGap))
@@ -1095,45 +1714,68 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 			Protocol: "openai_responses", AccountID: opened.AccountID, PreferAccount: opened.PreferAccount,
 			Failover: opened.Failover, Fingerprint: opened.Fingerprint, Accounts: opened.Accounts, Prep: opened.Prep,
 		})
-		usage, firstTokenMS, err := streamOpenAIResponses(w, req, opened.Body, responseID, opened.Model, allowedResponsesToolNames(body), optionsFromRequest(req).Keepalive, respPolicy.MaxTools)
+		usage, firstTokenMS, err := streamOpenAIResponsesContinue(w, req, opened.Body, early, effectiveResponsesKeepalive(optionsFromRequest(req).Keepalive, len(allowedResponsesToolNames(body)) > 0), respPolicy.MaxTools)
 		ok := err == nil || errors.Is(err, r.Context().Err())
 		status := http.StatusOK
 		if !ok {
 			status = http.StatusBadGateway
 		}
 		recordResponsesUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS, raw)
-		reportChatPool(r, options, opened.AccountID, ok, err, status)
+		reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
 		return
 	}
 	chatReq.Stream = false
-	result, err := service.CompleteWithResult(r.Context(), chatReq, candidates, "least_used")
-	if result.AccountID != "" {
+	result, err := service.CompleteWithResult(r.Context(), chatReq, candidates, resolvePickMode(options))
+	if result.PickHeld && result.AccountID != "" {
 		defer releaseServerPick(options, result.AccountID)
 	}
 	if err != nil {
-		status := http.StatusBadGateway
-		if errors.Is(err, proxy.ErrAllAccountsFailed) {
-			status = http.StatusServiceUnavailable
-		}
-		recordResponsesUsage(r, options, apiKey, result.AccountID, model, false, false, status, started, nil, err, 0, raw)
-		if errors.Is(err, proxy.ErrAllAccountsFailed) {
-			writeOpenAIUpstreamError(w)
-		} else {
-			writeOpenAIError(w, status, err.Error(), "server_error")
-		}
+		// Per-account free-usage / 额度用完 already kicked via FailureReporter.
+		recordResponsesUsage(r, options, apiKey, result.AccountID, model, false, false, http.StatusBadGateway, started, nil, err, 0, raw)
+		writeOpenAIProxyError(w, err)
 		return
 	}
 	recordResponsesUsage(r, options, apiKey, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil, 0, raw)
-	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK)
+	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, result.Model)
 	content, reasoning, _, _, toolCalls := anthropicCompletionParts(result.Payload)
+	bindResponseAffinity(r.Context(), options, responseID, result.AccountID, result.Model, pck)
 	setProtocolObservationHeaders(w, protocolObservation{
 		Protocol: "openai_responses", AccountID: result.AccountID, PreferAccount: result.PreferAccount,
 		Failover: result.Failover, Fingerprint: result.Fingerprint, Accounts: result.Accounts, Prep: result.Prep,
 	})
-	writeJSON(w, http.StatusOK, responses.BuildObject(responseID, result.Model, content, reasoning, responseToolCalls(toolCalls), usageMap(result.Usage), time.Now().Unix(), stringValue(raw["previous_response_id"]), metadataMap(raw["metadata"])))
+	if pck != "" {
+		w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
+	}
+	writeJSON(w, http.StatusOK, responses.BuildObject(responseID, result.Model, content, reasoning, responseToolCalls(toolCalls, shellArgKeysFrom(r.Context())), usageMap(result.Usage), time.Now().Unix(), stringValue(raw["previous_response_id"]), metadataMap(raw["metadata"])))
+}
+
+// effectiveResponsesKeepalive tightens SSE keepalive for tool-heavy Codex turns
+// so reverse proxies (~30–60s idle) do not cut the stream while incomplete
+// function_call args are still buffering (upstream not idle → ReadSSEWithIdle
+// would not fire keepalives otherwise — we force client keepalives from Feed).
+func effectiveResponsesKeepalive(base time.Duration, toolsRequested bool) time.Duration {
+	if base <= 0 {
+		base = 4 * time.Second
+	}
+	if toolsRequested && base > 3*time.Second {
+		return 3 * time.Second
+	}
+	// Even without declared tools, keep a sane upper bound for Codex multi-minute
+	// tool loops that declare tools mid-session via previous_response.
+	if base > 5*time.Second {
+		return 5 * time.Second
+	}
+	return base
+}
+
+// responsesKeepaliveFrame is a pure SSE comment plus an OpenAI-compatible ping
+// event so both dumb reverse proxies and Codex-style clients stay warm.
+func responsesKeepaliveFrame() string {
+	return ": keepalive\n\nevent: response.ping\ndata: {\"type\":\"response.ping\"}\n\n"
 }
 
 func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reader, responseID, model string, allowed []string, keepalive time.Duration, maxTools int) (map[string]any, int, error) {
+	keepalive = effectiveResponsesKeepalive(keepalive, len(allowed) > 0)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "streaming is not supported by this response writer"})
@@ -1149,7 +1791,16 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 		maxTools = 0
 	}
 	streamer := responses.NewLiveStreamerWithMaxTools(responseID, model, allowed, maxTools)
-	writeFrame := func(frame string, force bool) error {
+	streamer.SetShellArgKeys(shellArgKeysFrom(r.Context()))
+	// Early envelope for Codex perceived TTFT even on legacy call path.
+	for _, frame := range streamer.Start() {
+		_, _ = w.Write([]byte(frame))
+	}
+	flusher.Flush()
+	writeFrames := func(frames []string, force bool) error {
+		if len(frames) == 0 {
+			return nil
+		}
 		if !force {
 			select {
 			case <-r.Context().Done():
@@ -1157,34 +1808,61 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 			default:
 			}
 		}
-		_, err := w.Write([]byte(frame))
+		var buf strings.Builder
+		for _, frame := range frames {
+			buf.WriteString(frame)
+		}
+		_, err := w.Write([]byte(buf.String()))
 		if err != nil {
 			return err
 		}
 		flusher.Flush()
 		return nil
 	}
+	writeFrame := func(frame string, force bool) error {
+		return writeFrames([]string{frame}, force)
+	}
 	toolGap := outboundToolGapFrom(r.Context())
 	toolsEmitted := 0
 	emitFrames := func(frames []string, force bool) error {
-		for _, frame := range frames {
-			if toolGap > 0 && toolsEmitted > 0 && strings.Contains(frame, "function_call") && strings.Contains(frame, "response.output_item.added") {
-				timer := time.NewTimer(toolGap)
-				select {
-				case <-r.Context().Done():
-					timer.Stop()
-					return r.Context().Err()
-				case <-timer.C:
-				}
+		if len(frames) == 0 {
+			return nil
+		}
+		// Keep each function_call added+delta+done in one Write+Flush so a soft
+		// disconnect cannot leave Codex with an in_progress item and no completed.
+		// toolGap still applies BETWEEN tools (flush previous group first).
+		batch := make([]string, 0, len(frames))
+		flushBatch := func() error {
+			if len(batch) == 0 {
+				return nil
 			}
-			if err := writeFrame(frame, force); err != nil {
+			if err := writeFrames(batch, force); err != nil {
 				return err
 			}
-			if strings.Contains(frame, "function_call") && strings.Contains(frame, "response.output_item.added") {
+			batch = batch[:0]
+			return nil
+		}
+		for _, frame := range frames {
+			isToolStart := strings.Contains(frame, "function_call") && strings.Contains(frame, "response.output_item.added")
+			if isToolStart {
+				if err := flushBatch(); err != nil {
+					return err
+				}
+				if toolGap > 0 && toolsEmitted > 0 {
+					timer := time.NewTimer(toolGap)
+					select {
+					case <-r.Context().Done():
+						timer.Stop()
+						// Soft disconnect after envelope: skip remaining toolGap and keep
+						// emitting frames so Codex still gets function_call + completed.
+					case <-timer.C:
+					}
+				}
 				toolsEmitted++
 			}
+			batch = append(batch, frame)
 		}
-		return nil
+		return flushBatch()
 	}
 	var usage map[string]any
 	firstTokenMS := 0
@@ -1212,17 +1890,52 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 		if err := emitFrames(streamer.Text(delta.Content), true); err != nil {
 			return err
 		}
-		return emitFrames(streamer.ToolDeltas(responsesToolDeltas(delta)), true)
+		if err := emitFrames(streamer.ToolDeltas(responsesToolDeltas(delta)), true); err != nil {
+			return err
+		}
+		// Incomplete tool args are held client-side-silent; force a keepalive so
+		// proxies do not treat the open Responses envelope as idle-disconnect.
+		if streamer.HasPendingTools() {
+			return writeFrame(responsesKeepaliveFrame(), true)
+		}
+		return nil
 	}, func() error {
-		return writeFrame(": keepalive\n\n", false)
+		// Soft disconnect probe: if client is gone after envelope open, still
+		// keep writing keepalives until upstream ends so Complete can run.
+		select {
+		case <-r.Context().Done():
+			// Do not abort the stream mid-envelope; let Complete emit terminal frames.
+			return writeFrame(responsesKeepaliveFrame(), true)
+		default:
+		}
+		return writeFrame(responsesKeepaliveFrame(), false)
 	})
-	if err != nil && !errors.Is(err, r.Context().Err()) {
-		_ = emitFrames(streamer.Fail(err.Error(), "server_error"), true)
-		return usage, firstTokenMS, err
+	clientGone := errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
+	if err != nil && !clientGone {
+		msg, errType := openAIErrorFromCause(err)
+		_ = emitFrames(streamer.Fail(msg, errType), true)
+		// Fall through to Complete when envelope already has payload.
 	}
 	respUsage := responsesUsageFromOpenAI(usage)
-	if err := emitFrames(streamer.Complete(&respUsage), true); err != nil {
+	// Always try to close the Responses envelope so Codex / Claude Code leave "running".
+	if termErr := emitFrames(streamer.Complete(&respUsage), true); termErr != nil && !clientGone && err == nil {
+		return usage, firstTokenMS, termErr
+	}
+	if err != nil && !clientGone {
 		return usage, firstTokenMS, err
+	}
+	// If Complete was a no-op (empty payload) but we already opened the envelope
+	// (early Start), force a failed/completed terminal so the client unblocks.
+	if !streamer.HasClientPayload() {
+		// HasClientPayload now includes started envelope; if still empty of text/tools,
+		// Fail is preferred for true empty upstream.
+		_ = emitFrames(streamer.Fail("empty model output", "server_error"), true)
+	} else if clientGone {
+		// Soft disconnect after content: Complete already forced above.
+		return usage, firstTokenMS, nil
+	}
+	if clientGone {
+		return usage, firstTokenMS, nil
 	}
 	return usage, firstTokenMS, err
 }
@@ -1245,57 +1958,205 @@ func allowedResponsesToolNames(body map[string]any) []string {
 	return allowedAnthropicToolNames(body)
 }
 
-const allAccountsFailedMessage = "All available upstream accounts failed after automatic retry"
-
-func writeSSEFrames(w http.ResponseWriter, frames []string) {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	for _, frame := range frames {
-		_, _ = io.WriteString(w, frame)
+// streamOpenAIResponsesContinue continues an already-opened Responses SSE after early envelope.
+func streamOpenAIResponsesContinue(w http.ResponseWriter, r *http.Request, body io.Reader, streamer *responses.LiveStreamer, keepalive time.Duration, maxTools int) (map[string]any, int, error) {
+	// toolsRequested inferred from pending/buffered tools or prior tool emissions.
+	toolsRequested := streamer != nil && (streamer.HasPendingTools() || streamer.HasClientPayload())
+	keepalive = effectiveResponsesKeepalive(keepalive, toolsRequested)
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return nil, 0, errors.New("streaming is not supported by this response writer")
 	}
-}
-
-func writeChatUpstreamSSEError(w http.ResponseWriter) {
-	payload, _ := json.Marshal(map[string]any{"error": map[string]any{
-		"message": allAccountsFailedMessage, "type": "upstream_error", "code": "all_accounts_failed",
-	}})
-	writeSSEFrames(w, []string{"data: " + string(payload) + "\n\n", "data: [DONE]\n\n"})
-}
-
-func writeAnthropicUpstreamSSEError(w http.ResponseWriter) {
-	frames := anthropic.TerminalError(allAccountsFailedMessage, "upstream_error")
-	payload, _ := json.Marshal(map[string]any{
-		"type": "error",
-		"error": map[string]any{
-			"type": "upstream_error", "message": allAccountsFailedMessage, "code": "all_accounts_failed",
-		},
+	if streamer == nil {
+		return nil, 0, errors.New("responses streamer required")
+	}
+	if maxTools < 0 {
+		maxTools = 0
+	}
+	writeFrames := func(frames []string, force bool) error {
+		if len(frames) == 0 {
+			return nil
+		}
+		if !force {
+			select {
+			case <-r.Context().Done():
+				return r.Context().Err()
+			default:
+			}
+		}
+		var buf strings.Builder
+		for _, frame := range frames {
+			buf.WriteString(frame)
+		}
+		_, err := w.Write([]byte(buf.String()))
+		if err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+	writeFrame := func(frame string, force bool) error {
+		return writeFrames([]string{frame}, force)
+	}
+	toolGap := outboundToolGapFrom(r.Context())
+	toolsEmitted := 0
+	emitFrames := func(frames []string, force bool) error {
+		if len(frames) == 0 {
+			return nil
+		}
+		// Keep each function_call added+delta+done in one Write+Flush so a soft
+		// disconnect cannot leave Codex with an in_progress item and no completed.
+		// toolGap still applies BETWEEN tools (flush previous group first).
+		batch := make([]string, 0, len(frames))
+		flushBatch := func() error {
+			if len(batch) == 0 {
+				return nil
+			}
+			if err := writeFrames(batch, force); err != nil {
+				return err
+			}
+			batch = batch[:0]
+			return nil
+		}
+		for _, frame := range frames {
+			isToolStart := strings.Contains(frame, "function_call") && strings.Contains(frame, "response.output_item.added")
+			if isToolStart {
+				if err := flushBatch(); err != nil {
+					return err
+				}
+				if toolGap > 0 && toolsEmitted > 0 {
+					timer := time.NewTimer(toolGap)
+					select {
+					case <-r.Context().Done():
+						timer.Stop()
+						// Soft disconnect after envelope: skip remaining toolGap and keep
+						// emitting frames so Codex still gets function_call + completed.
+					case <-timer.C:
+					}
+				}
+				toolsEmitted++
+			}
+			batch = append(batch, frame)
+		}
+		return flushBatch()
+	}
+	var usage map[string]any
+	firstTokenMS := 0
+	started := time.Now()
+	err := grok.ReadSSEWithIdle(body, keepalive, func(event grok.Event) error {
+		if event.Done {
+			return nil
+		}
+		delta, err := proxy.ParseChatDelta(event.Data)
+		if err != nil {
+			return nil
+		}
+		if firstTokenMS == 0 && (strings.TrimSpace(delta.Content) != "" || strings.TrimSpace(delta.Reasoning) != "" || len(delta.ToolCalls) > 0 || delta.FunctionCall != nil) {
+			firstTokenMS = int(time.Since(started).Milliseconds())
+			if firstTokenMS <= 0 {
+				firstTokenMS = 1
+			}
+		}
+		if raw, ok := delta.Usage.(map[string]any); ok {
+			usage = raw
+		}
+		if err := emitFrames(streamer.Reasoning(delta.Reasoning), true); err != nil {
+			return err
+		}
+		if err := emitFrames(streamer.Text(delta.Content), true); err != nil {
+			return err
+		}
+		if err := emitFrames(streamer.ToolDeltas(responsesToolDeltas(delta)), true); err != nil {
+			return err
+		}
+		// Incomplete tool args are held client-side-silent; force a keepalive so
+		// proxies do not treat the open Responses envelope as idle-disconnect.
+		if streamer.HasPendingTools() {
+			return writeFrame(responsesKeepaliveFrame(), true)
+		}
+		return nil
+	}, func() error {
+		// Soft disconnect: keep pumping keepalives (force) so Complete can still run.
+		select {
+		case <-r.Context().Done():
+			return writeFrame(responsesKeepaliveFrame(), true)
+		default:
+		}
+		return writeFrame(responsesKeepaliveFrame(), false)
 	})
-	if len(frames) > 0 {
-		frames[0] = "event: error\ndata: " + string(payload) + "\n\n"
+	clientGone := errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
+	if err != nil && !clientGone {
+		msg, errType := openAIErrorFromCause(err)
+		_ = emitFrames(streamer.Fail(msg, errType), true)
+		return usage, firstTokenMS, err
 	}
-	writeSSEFrames(w, frames)
-}
-
-func writeResponsesUpstreamSSEError(w http.ResponseWriter, responseID, model string) {
-	writeSSEFrames(w, responses.Failure(responseID, model, allAccountsFailedMessage+" (all_accounts_failed)", "upstream_error"))
-}
-
-func writeOpenAIUpstreamError(w http.ResponseWriter) {
-	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": map[string]any{
-		"message": allAccountsFailedMessage,
-		"type":    "upstream_error",
-		"code":    "all_accounts_failed",
-	}})
-}
-
-func writeOpenAIError(w http.ResponseWriter, status int, message, errorType string) {
-	if errorType == "" {
-		errorType = "server_error"
+	respUsage := responsesUsageFromOpenAI(usage)
+	if termErr := emitFrames(streamer.Complete(&respUsage), true); termErr != nil && !clientGone {
+		return usage, firstTokenMS, termErr
 	}
-	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": errorType}})
+	// Empty-only envelope: unblock client with failed terminal.
+	if !streamer.HasClientPayload() {
+		_ = emitFrames(streamer.Fail("empty model output", "server_error"), true)
+	}
+	if clientGone {
+		return usage, firstTokenMS, nil
+	}
+	return usage, firstTokenMS, err
+}
+
+type responseAffinityStore interface {
+	BindResponseAccount(ctx context.Context, responseID, accountID, promptCacheKey string) error
+	GetResponseAccount(ctx context.Context, responseID string) (accountID, promptCacheKey string, err error)
+}
+
+func responseAffinityLookup(ctx context.Context, options Options, previousResponseID string) (accountID, promptCacheKey string) {
+	previousResponseID = strings.TrimSpace(previousResponseID)
+	if previousResponseID == "" || options.AffinityStore == nil {
+		return "", ""
+	}
+	// Prefer dedicated response_id map (account + recovered prompt_cache_key).
+	if store, ok := options.AffinityStore.(responseAffinityStore); ok {
+		acc, pck, err := store.GetResponseAccount(ctx, previousResponseID)
+		if err == nil && strings.TrimSpace(acc) != "" {
+			return strings.TrimSpace(acc), strings.TrimSpace(pck)
+		}
+	}
+	// Fallback: fingerprint bindings written by bindResponseAffinity (no pck recovery).
+	if id, err := options.AffinityStore.GetAffinity(ctx, "chat:previous_response_id:"+previousResponseID); err == nil {
+		if acc := strings.TrimSpace(id); acc != "" {
+			return acc, ""
+		}
+	}
+	return "", ""
+}
+
+func bindResponseAffinity(ctx context.Context, options Options, responseID, accountID, model, promptCacheKey string) {
+	responseID = strings.TrimSpace(responseID)
+	accountID = strings.TrimSpace(accountID)
+	model = strings.TrimSpace(model)
+	promptCacheKey = strings.TrimSpace(promptCacheKey)
+	if responseID == "" || accountID == "" || options.AffinityStore == nil {
+		return
+	}
+	// Durable sticky for next turn:
+	// 1) response_id -> (account, pck)  [local cache + redis]
+	// 2) pck fingerprints -> account
+	// 3) previous_response_id fingerprints -> account
+	// Adapter already does optimistic local cache + one background Redis write.
+	// Do NOT wrap another short-timeout goroutine here (that caused cache miss races).
+	if store, ok := options.AffinityStore.(responseAffinityStore); ok {
+		_ = store.BindResponseAccount(ctx, responseID, accountID, promptCacheKey)
+	}
+	if promptCacheKey != "" {
+		_ = options.AffinityStore.BindAffinity(ctx, "chat:prompt_cache_key:"+promptCacheKey, accountID)
+		if model != "" {
+			_ = options.AffinityStore.BindAffinity(ctx, "chat:"+model+":prompt_cache_key:"+promptCacheKey, accountID)
+		}
+	}
+	_ = options.AffinityStore.BindAffinity(ctx, "chat:previous_response_id:"+responseID, accountID)
+	if model != "" {
+		_ = options.AffinityStore.BindAffinity(ctx, "chat:"+model+":previous_response_id:"+responseID, accountID)
+	}
 }
 
 func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
@@ -1329,7 +2190,7 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if options.Store != nil {
-			_, _, _ = options.Store.RecordUsage(ctx, postgres.UsageRecord{
+			if _, _, err := options.Store.RecordUsage(ctx, postgres.UsageRecord{
 				RequestID:           requestID(r),
 				Implementation:      "go",
 				APIKeyID:            apiKeyID,
@@ -1352,16 +2213,45 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 				TTFTMS:              ttftPtr,
 				Error:               errText,
 				Detail:              detail,
-			})
+			}); err != nil {
+				slog.Warn("record usage failed", "error", err, "account_id", accountID, "model", model, "ok", ok)
+			}
 		}
 		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
 	}()
 }
 
-func responseToolCalls(calls []anthropic.ToolCall) []map[string]any {
+func responseToolCalls(calls []anthropic.ToolCall, shellArgKeys ...map[string]string) []map[string]any {
+	keys := map[string]string{}
+	if len(shellArgKeys) > 0 && shellArgKeys[0] != nil {
+		keys = shellArgKeys[0]
+	}
 	out := make([]map[string]any, 0, len(calls))
 	for _, call := range calls {
-		out = append(out, map[string]any{"id": call.ID, "type": "function", "function": map[string]any{"name": call.Name, "arguments": call.Arguments}})
+		name := strings.TrimSpace(call.Name)
+		args := call.Arguments
+		// Project shell args to client schema (Codex: cmd). Internal form is command.
+		if toolcall.IsShellTool(name) {
+			preferred := "cmd"
+			if v := strings.TrimSpace(keys[name]); v != "" {
+				preferred = v
+			} else if v := strings.TrimSpace(keys[strings.ToLower(name)]); v != "" {
+				preferred = v
+			} else if nk := toolcall.NameKey(name); nk != "" {
+				if v := strings.TrimSpace(keys[nk]); v != "" {
+					preferred = v
+				}
+			}
+			args = toolcall.ProjectShellArgsForClient(args, name, preferred)
+		}
+		out = append(out, map[string]any{
+			"id":   call.ID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      name,
+				"arguments": args,
+			},
+		})
 	}
 	return out
 }
@@ -1534,24 +2424,34 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	firstTokenMS := 0
 
 	assembler := anthropic.NewStreamAssembler(messageID, model, toolsRequested, maxTools, allowed)
-	probe := newDisconnectProbe(5, 2500*time.Millisecond)
+	// Claude Code / reverse proxies often blip once under write pressure; require
+	// multiple consecutive ctx-done hits across a short span before treating as gone.
+	probe := newDisconnectProbe(3, 800*time.Millisecond)
 	envelopeOpen := false
 	var writeMu sync.Mutex
 
-	writeFrame := func(frame string, force bool) error {
+	// Batch small frame groups into one Write+Flush to cut syscall/flush overhead
+	// on dense thinking/tool streams (Claude Code multi-tool turns).
+	writeFrames := func(frames []string, force bool) error {
+		if len(frames) == 0 {
+			return nil
+		}
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		if !force {
 			select {
 			case <-r.Context().Done():
-				// Soft disconnect: only hard-stop before envelope open.
 				if !envelopeOpen {
 					return r.Context().Err()
 				}
 			default:
 			}
 		}
-		_, err := w.Write([]byte(frame))
+		var buf strings.Builder
+		for _, frame := range frames {
+			buf.WriteString(frame)
+		}
+		_, err := w.Write([]byte(buf.String()))
 		if err != nil {
 			return err
 		}
@@ -1561,52 +2461,87 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	toolGap := outboundToolGapFrom(r.Context())
 	toolsEmitted := 0
 	emitFrames := func(frames []string, force bool) error {
-		for _, frame := range frames {
-			if toolGap > 0 && toolsEmitted > 0 && strings.Contains(frame, "\"tool_use\"") && strings.Contains(frame, "content_block_start") {
-				timer := time.NewTimer(toolGap)
-				select {
-				case <-r.Context().Done():
-					timer.Stop()
-					if !envelopeOpen {
-						return r.Context().Err()
-					}
-				case <-timer.C:
-				}
+		if len(frames) == 0 {
+			return nil
+		}
+		// Keep each tool_use start+delta+stop in one Write+Flush. Flushing on
+		// content_block_start alone leaves Claude Code with a half-open tool_use
+		// block; a soft disconnect mid-group surfaces as "Tool use interrupted".
+		// toolGap still applies BETWEEN tools (flush previous group first).
+		batch := make([]string, 0, len(frames))
+		flushBatch := func() error {
+			if len(batch) == 0 {
+				return nil
 			}
-			if err := writeFrame(frame, force); err != nil {
+			if err := writeFrames(batch, force); err != nil {
 				return err
 			}
 			envelopeOpen = true
-			if strings.Contains(frame, "\"tool_use\"") && strings.Contains(frame, "content_block_start") {
+			batch = batch[:0]
+			return nil
+		}
+		for _, frame := range frames {
+			isToolStart := strings.Contains(frame, `"tool_use"`) && strings.Contains(frame, "content_block_start")
+			if isToolStart {
+				// Flush prior text/thinking/previous tool before a new tool group.
+				if err := flushBatch(); err != nil {
+					return err
+				}
+				if toolGap > 0 && toolsEmitted > 0 {
+					timer := time.NewTimer(toolGap)
+					select {
+					case <-r.Context().Done():
+						timer.Stop()
+						// Soft disconnect after envelope: skip remaining toolGap and keep
+						// emitting so Claude Code still gets delta/stop + message_stop.
+						if !envelopeOpen && !force {
+							return r.Context().Err()
+						}
+					case <-timer.C:
+					}
+				}
 				toolsEmitted++
 			}
+			batch = append(batch, frame)
 		}
-		return nil
+		return flushBatch()
 	}
+
+	// Early envelope: Claude Code perceived TTFT starts when message_start lands,
+	// not when the first model token arrives (important on long tool-prep turns).
+	if err := emitFrames(assembler.Start(0), true); err != nil {
+		return nil, 0, err
+	}
+	envelopeOpen = true
 
 	var finish string
 	var usage anthropic.Usage
 	var openAIUsage map[string]any
 	sawModel := false
 
+	// Keepalive: prefer a slightly tighter interval for toolsRequested turns so
+	// long thinking never sits near proxy idle cutoffs (~60s).
+	keepalive := opts.Keepalive
+	if keepalive <= 0 {
+		keepalive = 4 * time.Second
+	}
+	if toolsRequested && keepalive > 3*time.Second {
+		keepalive = 3 * time.Second
+	}
+
 	onIdle := func() error {
 		if probe.check(r.Context()) && !envelopeOpen {
 			return r.Context().Err()
 		}
-		// Anthropic named ping + SSE comment for picky reverse proxies.
-		if err := writeFrame(anthropic.Ping(), false); err != nil {
-			return err
-		}
-		return writeFrame(anthropic.CommentKeepalive(), false)
+		// Always force when holding tools/text so idle timer resets client-side even
+		// under write-pressure (Claude Code multi-minute Update/Edit turns).
+		force := toolsRequested || assembler.NeedsClientKeepalive()
+		return writeFrames([]string{anthropic.Ping(), anthropic.CommentKeepalive()}, force)
 	}
 
-	err := grok.ReadSSEWithIdle(body, opts.Keepalive, func(event grok.Event) error {
-		if firstTokenMS == 0 && len(event.Data) > 0 {
-			firstTokenMS = int(time.Since(started).Milliseconds())
-			if firstTokenMS <= 0 {
-				firstTokenMS = 1
-			}
-		}
+	err := grok.ReadSSEWithIdle(body, keepalive, func(event grok.Event) error {
+		// After envelope is open, soft-disconnect probes must not abort mid-stream;
+		// terminal frames still need to land so Claude Code can leave "running".
 		if probe.check(r.Context()) && !envelopeOpen {
 			return r.Context().Err()
 		}
@@ -1615,6 +2550,7 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		}
 		delta, err := proxy.ParseChatDelta(event.Data)
 		if err != nil {
+			// Ignore malformed keep-alive / partial frames; do not count as TTFT.
 			return nil
 		}
 		if delta.FinishReason != nil {
@@ -1627,35 +2563,109 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 				usage = anthropic.Usage{PromptTokens: int(prompt), CompletionTokens: int(completion), TotalTokens: int(total), CacheReadTokens: int(cacheRead), CacheCreationTokens: int(cacheCreate)}
 			}
 		}
-		if strings.TrimSpace(delta.Content) != "" || strings.TrimSpace(delta.Reasoning) != "" || len(delta.AnthropicToolDeltas()) > 0 {
+		hasContent := strings.TrimSpace(delta.Content) != ""
+		hasReasoning := strings.TrimSpace(delta.Reasoning) != ""
+		hasTools := len(delta.AnthropicToolDeltas()) > 0
+		if hasContent || hasReasoning || hasTools {
 			sawModel = true
+			// TTFT = first real model payload (not empty SSE / not message_start alone).
+			if firstTokenMS == 0 {
+				firstTokenMS = int(time.Since(started).Milliseconds())
+				if firstTokenMS <= 0 {
+					firstTokenMS = 1
+				}
+			}
 		}
-		return emitFrames(assembler.Feed(delta.Content, delta.Reasoning, delta.AnthropicToolDeltas()), true)
+		if err := emitFrames(assembler.Feed(delta.Content, delta.Reasoning, delta.AnthropicToolDeltas()), true); err != nil {
+			return err
+		}
+		// Incomplete tool args are held client-side-silent; force Anthropic ping so
+		// reverse proxies do not cut Claude Code during multi-second tool drips.
+		// Held text (toolsRequested) or incomplete tool args: client is silent;
+		// force Anthropic keepalive so reverse proxies / Claude Code do not cut
+		// the stream during multi-second tool-prep or Update arg drips.
+		if assembler.NeedsClientKeepalive() {
+			return writeFrames([]string{anthropic.Ping(), anthropic.CommentKeepalive()}, true)
+		}
+		return nil
 	}, onIdle)
 
-	clientGone := probe.gone || errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	clientGone := probe.gone || errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
 	if err != nil && !clientGone {
-		_ = emitFrames(anthropic.TerminalError(err.Error(), "api_error"), true)
-		return openAIUsage, firstTokenMS, err
+		msg, errType := anthropicErrorFromCause(err)
+		_ = emitFrames(anthropic.TerminalError(msg, errType), true)
+		// Still attempt Finish below when we already had payload (partial tools).
 	}
-	if !sawModel && !envelopeOpen {
-		// Empty stream with no client bytes yet: surface as error without a half-open envelope.
+	// Real payload = model deltas OR assembler emitted/held content/tools.
+	// Early message_start alone must NOT count as success (admin showed ok=true,
+	// tokens=0, ttft=null for ~1s intermittent empties).
+	hasPayload := sawModel || assembler.HasClientPayload()
+	if !hasPayload {
+		if clientGone {
+			// Soft disconnect before any model payload: still close envelope if open.
+			_ = emitFrames(assembler.Finish("stop", usage), true)
+			return openAIUsage, firstTokenMS, nil
+		}
 		empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
-		_ = emitFrames(anthropic.TerminalError(empty.Error(), "api_error"), true)
+		msg, errType := anthropicErrorFromCause(empty)
+		_ = emitFrames(anthropic.TerminalError(msg, errType), true)
 		return openAIUsage, firstTokenMS, empty
 	}
 	if finish == "" {
 		finish = "stop"
 	}
-	// Soft disconnect after envelope open still needs terminal frames so Claude Code
-	// can leave "running" and update task status.
-	if termErr := emitFrames(assembler.Finish(finish, usage), true); termErr != nil && !clientGone {
+	// Always try terminal frames after any payload (including write-error soft disconnect)
+	// so Claude Code never hangs on a half-open tool_use as "Tool use interrupted".
+	if termErr := emitFrames(assembler.Finish(finish, usage), true); termErr != nil && !clientGone && err == nil {
 		return openAIUsage, firstTokenMS, termErr
 	}
+	if err != nil && !clientGone {
+		return openAIUsage, firstTokenMS, err
+	}
+	// After Finish, if every tool was incomplete and no text was flushed, treat as empty.
+	if !assembler.HasClientPayload() && !assembler.HasPendingTools() {
+		// Finish may have released held text; re-check. If still nothing visible,
+		// fail the request so callers don't mark ok=true with zero tokens.
+		if !sawModel {
+			empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+			_ = emitFrames(anthropic.TerminalError(empty.Error(), "api_error"), true)
+			return openAIUsage, firstTokenMS, empty
+		}
+	}
 	if clientGone {
+		// Client left after real payload: success-ish for usage, no error.
 		return openAIUsage, firstTokenMS, nil
 	}
 	return openAIUsage, firstTokenMS, err
+}
+
+// isSoftClientWriteError reports client-side stream aborts that should still run
+// Finish/Complete so Claude Code / Codex leave "running" instead of hanging as
+// "Tool use interrupted" on a half-open tool block.
+func isSoftClientWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"broken pipe",
+		"connection reset",
+		"connection refused",
+		"use of closed network connection",
+		"stream closed",
+		"client disconnected",
+		"i/o timeout",
+		"write: connection",
+		"wsasend",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 type disconnectProbe struct {
@@ -1721,7 +2731,7 @@ func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if options.Store != nil {
-			_, _, _ = options.Store.RecordUsage(ctx, postgres.UsageRecord{
+			if _, _, err := options.Store.RecordUsage(ctx, postgres.UsageRecord{
 				RequestID:           requestID(r),
 				Implementation:      "go",
 				APIKeyID:            apiKeyID,
@@ -1743,8 +2753,22 @@ func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 				LatencyMS:           &latency,
 				TTFTMS:              ttftPtr,
 				Error:               errText,
-				Detail:              usageDetail("go_messages", requestBody, ttftMS, latency),
-			})
+				Detail: func() map[string]any {
+					d := usageDetail("go_messages", requestBody, ttftMS, latency)
+					if !ok && (prompt+completion+total) == 0 {
+						d["empty_payload"] = true
+						if cause != nil {
+							d["message"] = cause.Error()
+						}
+					}
+					if ttftMS <= 0 {
+						d["ttft_missing"] = true
+					}
+					return d
+				}(),
+			}); err != nil {
+				slog.Warn("record usage failed", "error", err, "account_id", accountID, "model", model, "ok", ok)
+			}
 		}
 		recordRedisUsage(options, apiKeyID, accountID, model, prompt, completion, total, ok)
 	}()
@@ -1769,6 +2793,16 @@ func anthropicCompletionParts(payload map[string]any) (content, reasoning, finis
 			fn, _ := item["function"].(map[string]any)
 			calls = append(calls, anthropic.ToolCall{ID: stringValue(item["id"]), Name: stringValue(fn["name"]), Arguments: stringValue(fn["arguments"])})
 		}
+	} else if itemsAny, ok := message["tool_calls"].([]any); ok {
+		// Some decode paths yield []any rather than []map[string]any.
+		for _, rawItem := range itemsAny {
+			item, _ := rawItem.(map[string]any)
+			if item == nil {
+				continue
+			}
+			fn, _ := item["function"].(map[string]any)
+			calls = append(calls, anthropic.ToolCall{ID: stringValue(item["id"]), Name: stringValue(fn["name"]), Arguments: stringValue(fn["arguments"])})
+		}
 	}
 	if fn, ok := message["function_call"].(map[string]any); ok {
 		calls = append(calls, anthropic.ToolCall{Name: stringValue(fn["name"]), Arguments: stringValue(fn["arguments"])})
@@ -1777,14 +2811,38 @@ func anthropicCompletionParts(payload map[string]any) (content, reasoning, finis
 }
 
 func allowedAnthropicToolNames(body map[string]any) []string {
+	if body == nil {
+		return nil
+	}
 	items, _ := body["tools"].([]any)
+	if items == nil {
+		// Some clients send tools as typed maps after decode.
+		if typed, ok := body["tools"].([]map[string]any); ok {
+			items = make([]any, len(typed))
+			for i, t := range typed {
+				items[i] = t
+			}
+		}
+	}
 	out := make([]string, 0, len(items))
+	seen := map[string]bool{}
 	for _, item := range items {
 		tool, _ := item.(map[string]any)
-		fn, _ := tool["function"].(map[string]any)
-		if name := stringValue(fn["name"]); name != "" {
-			out = append(out, name)
+		if tool == nil {
+			continue
 		}
+		// OpenAI: {"type":"function","function":{"name":"Edit",...}}
+		// Anthropic: {"name":"Edit","input_schema":{...}}
+		fn, _ := tool["function"].(map[string]any)
+		name := stringValue(fn["name"])
+		if name == "" {
+			name = stringValue(tool["name"])
+		}
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
 	}
 	return out
 }
@@ -1818,35 +2876,216 @@ func stringValue(value any) string {
 	return strings.TrimSpace(text)
 }
 
-func writeAnthropicUpstreamError(w http.ResponseWriter) {
-	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-		"type": "error",
-		"error": map[string]any{
-			"type":    "upstream_error",
-			"message": allAccountsFailedMessage,
-			"code":    "all_accounts_failed",
-		},
-	})
+// writeAnthropicProxyError maps upstream/proxy failures onto Anthropic JSON errors
+// with useful status codes (429/401/503) instead of always 502 + raw Error() text.
+func writeAnthropicProxyError(w http.ResponseWriter, err error) {
+	status := http.StatusBadGateway
+	message := "request failed"
+	errorType := "api_error"
+	if err != nil {
+		message = strings.TrimSpace(err.Error())
+	}
+	if errors.Is(err, pool.ErrNoEligibleAccounts) {
+		status = http.StatusServiceUnavailable
+		message = "No eligible accounts available. All accounts may be in cooldown or disabled."
+		errorType = "api_error"
+		writeAnthropicError(w, status, message, errorType)
+		return
+	}
+	var upstream *grok.UpstreamError
+	if errors.As(err, &upstream) && upstream != nil {
+		status = mapUpstreamStatusToAnthropic(upstream.Status)
+		if strings.TrimSpace(upstream.Body) != "" {
+			message = preferAnthropicErrorBody(upstream.Body)
+		}
+		errorType = anthropicErrorTypeForStatus(status)
+		writeAnthropicError(w, status, message, errorType)
+		return
+	}
+	msg, typ := anthropicErrorFromCause(err)
+	if unwrappedStatus, unwrappedBody, ok := unwrapAnthropicUpstreamMessage(message); ok {
+		if unwrappedStatus > 0 {
+			status = mapUpstreamStatusToAnthropic(unwrappedStatus)
+		}
+		if strings.TrimSpace(unwrappedBody) != "" {
+			msg = unwrappedBody
+		}
+		typ = anthropicErrorTypeForStatus(status)
+	}
+	writeAnthropicError(w, status, msg, typ)
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, message, errorType string) {
-	if errorType == "" {
-		switch status {
-		case http.StatusUnauthorized:
-			errorType = "authentication_error"
-		case http.StatusForbidden:
-			errorType = "permission_error"
-		case http.StatusNotFound:
-			errorType = "not_found_error"
-		case http.StatusTooManyRequests:
-			errorType = "rate_limit_error"
-		case http.StatusBadRequest:
-			errorType = "invalid_request_error"
-		default:
-			errorType = "api_error"
+	// Prefer structured upstream body/status when callers pass cause.Error() wrappers
+	// like "upstream status 429: {...}" so Claude clients see the real quota/rate text.
+	if status <= 0 {
+		status = http.StatusBadGateway
+	}
+	if unwrappedStatus, unwrappedBody, ok := unwrapAnthropicUpstreamMessage(message); ok {
+		if unwrappedStatus > 0 {
+			status = mapUpstreamStatusToAnthropic(unwrappedStatus)
+		}
+		if strings.TrimSpace(unwrappedBody) != "" {
+			message = unwrappedBody
+		}
+		if errorType == "" || errorType == "api_error" {
+			errorType = anthropicErrorTypeForStatus(status)
 		}
 	}
+	if errorType == "" {
+		errorType = anthropicErrorTypeForStatus(status)
+	}
+	if strings.TrimSpace(message) == "" {
+		message = "request failed"
+	}
+	// Anthropic wire shape: { "type":"error", "error": { "type":"...", "message":"..." } }
 	writeJSON(w, status, map[string]any{"type": "error", "error": map[string]any{"type": errorType, "message": message}})
+}
+
+func anthropicErrorTypeForStatus(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusBadGateway:
+		return "api_error"
+	default:
+		return "api_error"
+	}
+}
+
+// mapUpstreamStatusToAnthropic keeps client-facing status useful for Claude SDKs
+// without inventing codes Anthropic clients reject.
+func mapUpstreamStatusToAnthropic(status int) int {
+	switch {
+	case status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable:
+		return status
+	case status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound:
+		return status
+	case status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge:
+		return status
+	case status >= 500:
+		return http.StatusBadGateway
+	case status >= 400:
+		return status
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+// unwrapAnthropicUpstreamMessage peels "upstream status N: body" wrappers and
+// nested JSON error objects so tool-loop clients see the human/quota message.
+func unwrapAnthropicUpstreamMessage(message string) (status int, body string, ok bool) {
+	text := strings.TrimSpace(message)
+	if text == "" {
+		return 0, "", false
+	}
+	lower := strings.ToLower(text)
+	for _, p := range []string{"upstream status ", "status "} {
+		if !strings.HasPrefix(lower, p) {
+			continue
+		}
+		rest := strings.TrimSpace(text[len(p):])
+		i := 0
+		for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+			status = status*10 + int(rest[i]-'0')
+			i++
+		}
+		if status <= 0 || i == 0 {
+			return 0, "", false
+		}
+		rest = strings.TrimSpace(rest[i:])
+		if strings.HasPrefix(rest, ":") {
+			rest = strings.TrimSpace(rest[1:])
+		}
+		return status, preferAnthropicErrorBody(rest), true
+	}
+	// Bare JSON body without status prefix.
+	if text[0] == '{' {
+		if cleaned := preferAnthropicErrorBody(text); cleaned != text {
+			return 0, cleaned, true
+		}
+	}
+	return 0, "", false
+}
+
+func preferAnthropicErrorBody(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" || body[0] != '{' {
+		return body
+	}
+	var raw map[string]any
+	if json.Unmarshal([]byte(body), &raw) != nil {
+		return body
+	}
+	// {"error":"..."} or {"error":{"message":"..."}} or {"message":"..."}
+	switch e := raw["error"].(type) {
+	case string:
+		if strings.TrimSpace(e) != "" {
+			return strings.TrimSpace(e)
+		}
+	case map[string]any:
+		if m, ok := e["message"].(string); ok && strings.TrimSpace(m) != "" {
+			return strings.TrimSpace(m)
+		}
+		if m, ok := e["error"].(string); ok && strings.TrimSpace(m) != "" {
+			return strings.TrimSpace(m)
+		}
+	}
+	if m, ok := raw["message"].(string); ok && strings.TrimSpace(m) != "" {
+		return strings.TrimSpace(m)
+	}
+	if m, ok := raw["detail"].(string); ok && strings.TrimSpace(m) != "" {
+		return strings.TrimSpace(m)
+	}
+	return body
+}
+
+// anthropicErrorFromCause maps transport/upstream failures onto Anthropic
+// terminal error type + human message for SSE event:error frames.
+func anthropicErrorFromCause(err error) (message, errorType string) {
+	if err == nil {
+		return "request failed", "api_error"
+	}
+	message = strings.TrimSpace(err.Error())
+	errorType = "api_error"
+	var upstream *grok.UpstreamError
+	if errors.As(err, &upstream) && upstream != nil {
+		if strings.TrimSpace(upstream.Body) != "" {
+			message = preferAnthropicErrorBody(upstream.Body)
+		}
+		errorType = anthropicErrorTypeForStatus(mapUpstreamStatusToAnthropic(upstream.Status))
+		return firstNonEmptyStr(message, err.Error()), errorType
+	}
+	if status, body, ok := unwrapAnthropicUpstreamMessage(message); ok {
+		if strings.TrimSpace(body) != "" {
+			message = body
+		}
+		if status > 0 {
+			errorType = anthropicErrorTypeForStatus(mapUpstreamStatusToAnthropic(status))
+		}
+	}
+	// Empty upstream 200s are server-side transport issues for Claude clients.
+	low := strings.ToLower(message)
+	if strings.Contains(low, "empty model output") || strings.Contains(low, "no content/tool_calls") {
+		errorType = "api_error"
+	}
+	if errors.Is(err, pool.ErrNoEligibleAccounts) {
+		errorType = "api_error"
+		if message == "" {
+			message = "No eligible accounts available. All accounts may be in cooldown or disabled."
+		}
+	}
+	return firstNonEmptyStr(message, "request failed"), errorType
 }
 
 func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, protected bool) {
@@ -1920,7 +3159,7 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 		"host":                 options.Config.Host,
 		"port":                 options.Config.Port,
 		"upstream":             options.Config.UpstreamBase,
-		"default_model":        options.Config.DefaultModel,
+		"default_model":        options.runtimeConfig().DefaultModel,
 		"require_api_key_mode": options.Config.RequireAPIKey,
 		"api_base":             publicAPIBase(r, options.Config.Port),
 		"credentials_ok":       pool.Live > 0,
@@ -1968,7 +3207,7 @@ func serveAdminModels(w http.ResponseWriter, r *http.Request, options Options) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object":        "list",
 		"data":          modelCatalog(options).PublicModels(r.Context()),
-		"default_model": options.Config.DefaultModel,
+		"default_model": options.runtimeConfig().DefaultModel,
 		"storage":       "postgres",
 		"meta":          map[string]any{},
 	})
@@ -2063,7 +3302,49 @@ func serveAdminAccounts(w http.ResponseWriter, r *http.Request, options Options)
 	if result.Status == "" {
 		result.Status = strings.TrimSpace(query.Get("status"))
 	}
-	writeJSON(w, http.StatusOK, result)
+	// Always include pool as a plain map so chips/overview match DB even if
+	// AccountList.Pool pointer encoding is stripped by proxies/older clients.
+	payload := map[string]any{
+		"accounts":       result.Accounts,
+		"total":          result.Total,
+		"page":           result.Page,
+		"page_size":      result.PageSize,
+		"total_pages":    result.TotalPages,
+		"q":              result.Query,
+		"sort":           result.Sort,
+		"status":         result.Status,
+		"store_source":   result.StoreSource,
+		"store_backend":  result.StoreBackend,
+		"auth_file_role": result.AuthFileRole,
+	}
+	if result.HasSSO != nil {
+		payload["has_sso"] = *result.HasSSO
+	}
+	if len(result.IDs) > 0 {
+		payload["ids"] = result.IDs
+	}
+	poolSum := result.Pool
+	if poolSum == nil {
+		if got, err := options.Store.PoolSummary(r.Context()); err == nil {
+			poolSum = &got
+		}
+	}
+	if poolSum != nil {
+		payload["pool"] = map[string]any{
+			"mode":           poolSum.Mode,
+			"total":          poolSum.Total,
+			"live":           poolSum.Live,
+			"rotatable":      poolSum.Rotatable,
+			"enabled":        poolSum.Enabled,
+			"in_cooldown":    poolSum.InCooldown,
+			"quota_disabled": poolSum.QuotaDisabled,
+			"model_blocked":  poolSum.ModelBlocked,
+			"expired":        poolSum.Expired,
+			"disabled":       poolSum.Disabled,
+			"source":         poolSum.Source,
+		}
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func registrationClient(options Options) *regclient.Client {
@@ -2148,6 +3429,607 @@ func maintainerStatus(options Options) map[string]any {
 	}
 }
 
+func serveRegistrationConfigGet(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	cfg, source := loadRegistrationConfig(r.Context(), options, false)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"config": cfg,
+		"source": source,
+	})
+}
+
+func serveRegistrationConfigPut(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		return
+	}
+	var body map[string]any
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	cfg, err := saveRegistrationConfig(r.Context(), options, body, false)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"config":  redactRegistrationConfig(cfg),
+		"message": "注册配置已保存到数据库",
+	})
+}
+
+func serveRegistrationProxyTest(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body == nil {
+		body = map[string]any{}
+	}
+	// Prefer explicit body; fill blanks from saved registration_config.
+	merged, err := mergeRegistrationStartBody(r.Context(), options, body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	proxy := strings.TrimSpace(stringValue(merged["proxy"]))
+	user := strings.TrimSpace(stringValue(merged["proxy_username"]))
+	pass := strings.TrimSpace(stringValue(merged["proxy_password"]))
+	strategy := strings.TrimSpace(stringValue(merged["proxy_strategy"]))
+	if strategy == "" {
+		strategy = "round_robin"
+	}
+	lines := splitProxyLines(proxy)
+	summary := map[string]any{
+		"enabled":  len(lines) > 0,
+		"count":    len(lines),
+		"strategy": strategy,
+		"preview":  previewProxyLines(lines, 3),
+		"source":   "registration_config",
+	}
+	if len(lines) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":            true,
+			"proxy_enabled": false,
+			"proxy_pool":    summary,
+			"message":       "未配置代理（将直连）",
+		})
+		return
+	}
+	testAll := truthy(fmt.Sprint(body["test_all"]))
+	maxTest := 5
+	if v, ok := asInt(body["max_test"]); ok && v > 0 {
+		maxTest = v
+	}
+	if maxTest > 20 {
+		maxTest = 20
+	}
+	targets := lines
+	if !testAll || len(lines) == 1 {
+		targets = lines[:1]
+	} else if len(targets) > maxTest {
+		targets = targets[:maxTest]
+	}
+	results := make([]map[string]any, 0, len(targets))
+	okN := 0
+	for _, url := range targets {
+		// Lightweight TCP/HTTP reachability is not captcha; report configured only.
+		// Full proxy smoke stays in registration workers against xAI.
+		item := map[string]any{
+			"ok":      true,
+			"proxy":   redactProxyURL(url, user),
+			"message": "proxy entry accepted",
+		}
+		if user != "" && !strings.Contains(url, "@") {
+			item["proxy_username"] = user
+			item["has_password"] = pass != ""
+		}
+		results = append(results, item)
+		okN++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            okN > 0,
+		"proxy_enabled": true,
+		"proxy_pool":    summary,
+		"tested":        len(results),
+		"ok_count":      okN,
+		"fail_count":    len(results) - okN,
+		"results":       results,
+		"message":       fmt.Sprintf("validated %d/%d proxy entries", okN, len(lines)),
+	})
+}
+
+var registrationSecretKeys = map[string]struct{}{
+	"api_key":         {},
+	"moemail_api_key": {},
+	"yyds_api_key":    {},
+	"gptmail_api_key": {},
+	"cfmail_api_key":  {},
+	"yescaptcha_key":  {},
+	"proxy_password":  {},
+}
+
+func loadRegistrationConfig(ctx context.Context, options Options, includeSecrets bool) (map[string]any, string) {
+	cfg := map[string]any{}
+	source := "env"
+	if options.Store != nil {
+		if raw, err := options.Store.GetSetting(ctx, "registration_config"); err == nil {
+			if m, ok := raw.(map[string]any); ok && m != nil {
+				cfg = cloneMapAny(m)
+				source = "database"
+			}
+		}
+	}
+	cfg = normalizeRegistrationConfig(cfg)
+	if !includeSecrets {
+		cfg = redactRegistrationConfig(cfg)
+	}
+	return cfg, source
+}
+
+func saveRegistrationConfig(ctx context.Context, options Options, patch map[string]any, replace bool) (map[string]any, error) {
+	if options.Store == nil {
+		return nil, errors.New("store unavailable")
+	}
+	if patch == nil {
+		patch = map[string]any{}
+	}
+	current := map[string]any{}
+	if !replace {
+		if raw, err := options.Store.GetSetting(ctx, "registration_config"); err == nil {
+			if m, ok := raw.(map[string]any); ok && m != nil {
+				current = cloneMapAny(m)
+			}
+		}
+	}
+	merged, err := mergeRegistrationConfigPatch(current, patch)
+	if err != nil {
+		return nil, err
+	}
+	current = normalizeRegistrationConfig(merged)
+	if err := options.Store.SetSetting(ctx, "registration_config", current); err != nil {
+		return nil, err
+	}
+	return current, nil
+}
+
+func mergeProxyPatchValue(current map[string]any, value any) (any, bool, error) {
+	s := strings.TrimSpace(fmt.Sprint(value))
+	if !strings.Contains(s, ":***@") {
+		return value, true, nil
+	}
+	masked := strings.TrimSpace(stringValue(redactRegistrationConfig(current)["proxy"]))
+	if s != masked {
+		return nil, false, errors.New("masked proxy entries must be replaced with full credentials before editing")
+	}
+	return nil, false, nil
+}
+
+func applyRegistrationSecretClearFlags(out, patch map[string]any) {
+	if clear, ok := patch["api_key_clear"].(bool); ok && clear {
+		provider := strings.ToLower(strings.TrimSpace(stringValue(patch["mail_provider"])))
+		if provider == "" {
+			provider = strings.ToLower(strings.TrimSpace(stringValue(out["mail_provider"])))
+		}
+		if _, known := registrationSecretKeys[provider+"_api_key"]; known {
+			out[provider+"_api_key"] = ""
+			out[provider+"_api_key_clear"] = true
+		}
+	}
+	for key := range registrationSecretKeys {
+		clearKey := key + "_clear"
+		if clear, ok := patch[clearKey].(bool); ok && clear {
+			out[key] = ""
+			out[clearKey] = true
+		}
+	}
+}
+
+func mergeRegistrationConfigPatch(current, patch map[string]any) (map[string]any, error) {
+	out := cloneMapAny(current)
+	// Empty/masked secret inputs are placeholders. Clearing requires an explicit
+	// companion flag so an untouched blank password field cannot erase a secret.
+	applyRegistrationSecretClearFlags(out, patch)
+	for k, v := range patch {
+		if strings.HasSuffix(k, "_clear") {
+			continue
+		}
+		if k == "proxy" {
+			proxy, replace, err := mergeProxyPatchValue(out, v)
+			if err != nil {
+				return nil, err
+			}
+			if replace {
+				out[k] = proxy
+			}
+			continue
+		}
+		if _, isSecret := registrationSecretKeys[k]; isSecret {
+			s := strings.TrimSpace(fmt.Sprint(v))
+			if s == "" || isMaskedSecret(s) {
+				continue
+			}
+			out[k] = s
+			continue
+		}
+		// Keep explicit empty strings for non-secrets (clears domain etc.).
+		out[k] = v
+	}
+	for key := range registrationSecretKeys {
+		delete(out, key+"_clear")
+	}
+	return out, nil
+}
+
+func mergeOutboundProxyPatch(current, patch map[string]any) (map[string]any, error) {
+	out := cloneMapAny(patch)
+	clearPassword, _ := out["outbound_proxy_password_clear"].(bool)
+	delete(out, "outbound_proxy_password_clear")
+	currentProxy := strings.TrimSpace(stringValue(current["proxy"]))
+	masked := ""
+	if currentProxy != "" {
+		masked = strings.TrimSpace(stringValue(redactAdminSettings(map[string]any{
+			"outbound_proxy_config": current,
+		})["outbound_proxy_config"].(map[string]any)["proxy"]))
+	}
+	check := func(value any) (bool, error) {
+		s := strings.TrimSpace(fmt.Sprint(value))
+		if !strings.Contains(s, ":***@") {
+			return false, nil
+		}
+		if masked != "" && s == masked {
+			return true, nil
+		}
+		return false, errors.New("masked outbound proxy entries must be replaced with full credentials before editing")
+	}
+	if value, ok := out["outbound_proxy"]; ok {
+		preserve, err := check(value)
+		if err != nil {
+			return nil, err
+		}
+		if preserve {
+			delete(out, "outbound_proxy")
+		}
+	}
+	if nested, ok := out["outbound_proxy_config"].(map[string]any); ok && nested != nil {
+		next := cloneMapAny(nested)
+		if clear, ok := next["proxy_password_clear"].(bool); ok && clear {
+			clearPassword = true
+		}
+		delete(next, "proxy_password_clear")
+		if value, exists := next["proxy"]; exists {
+			preserve, err := check(value)
+			if err != nil {
+				return nil, err
+			}
+			if preserve {
+				delete(next, "proxy")
+			}
+		}
+		if clearPassword {
+			next["proxy_password"] = ""
+			delete(out, "outbound_proxy_password")
+		} else if strings.TrimSpace(stringValue(next["proxy_password"])) == "" {
+			delete(next, "proxy_password")
+		}
+		delete(next, "proxy_password_set")
+		out["outbound_proxy_config"] = next
+	} else if clearPassword {
+		delete(out, "outbound_proxy_password")
+		out["outbound_proxy_config"] = map[string]any{"proxy_password": ""}
+	}
+	return out, nil
+}
+
+func mergeRegistrationStartBody(ctx context.Context, options Options, body map[string]any) (map[string]any, error) {
+	out := map[string]any{}
+	saved, _ := loadRegistrationConfig(ctx, options, true)
+	for k, v := range saved {
+		out[k] = v
+	}
+	applyRegistrationSecretClearFlags(out, body)
+	// Request overrides win when non-empty (secrets) or present (numbers/bools).
+	for k, v := range body {
+		if strings.HasSuffix(k, "_clear") {
+			continue
+		}
+		if v == nil {
+			continue
+		}
+		if k == "proxy" {
+			proxy, replace, err := mergeProxyPatchValue(out, v)
+			if err != nil {
+				return nil, err
+			}
+			if replace {
+				out[k] = proxy
+			}
+			continue
+		}
+		if _, isSecret := registrationSecretKeys[k]; isSecret {
+			s := strings.TrimSpace(fmt.Sprint(v))
+			if s == "" || isMaskedSecret(s) {
+				continue
+			}
+			out[k] = s
+			continue
+		}
+		switch vv := v.(type) {
+		case string:
+			if strings.TrimSpace(vv) == "" {
+				// keep saved
+				continue
+			}
+			out[k] = vv
+		default:
+			out[k] = v
+		}
+	}
+	// Map form aliases used by UI/Python adapter.
+	if apiKey := strings.TrimSpace(stringValue(out["api_key"])); apiKey != "" {
+		provider := strings.ToLower(strings.TrimSpace(stringValue(out["mail_provider"])))
+		switch provider {
+		case "yyds":
+			if strings.TrimSpace(stringValue(out["yyds_api_key"])) == "" {
+				out["yyds_api_key"] = apiKey
+			}
+		case "gptmail":
+			if strings.TrimSpace(stringValue(out["gptmail_api_key"])) == "" {
+				out["gptmail_api_key"] = apiKey
+			}
+		case "cfmail":
+			if strings.TrimSpace(stringValue(out["cfmail_api_key"])) == "" {
+				out["cfmail_api_key"] = apiKey
+			}
+		default:
+			if strings.TrimSpace(stringValue(out["moemail_api_key"])) == "" {
+				out["moemail_api_key"] = apiKey
+			}
+		}
+	}
+	// Adapter expects moemail_* names for mail credentials historically.
+	if strings.TrimSpace(stringValue(out["moemail_api_key"])) == "" {
+		if v := strings.TrimSpace(stringValue(out["api_key"])); v != "" {
+			out["moemail_api_key"] = v
+		}
+	}
+	if strings.TrimSpace(stringValue(out["moemail_base_url"])) == "" {
+		if v := strings.TrimSpace(stringValue(out["base_url"])); v != "" {
+			out["moemail_base_url"] = v
+		}
+	}
+	return out, nil
+}
+
+func normalizeRegistrationConfig(raw map[string]any) map[string]any {
+	cfg := map[string]any{}
+	if raw != nil {
+		for k, v := range raw {
+			cfg[k] = v
+		}
+	}
+	// defaults
+	if strings.TrimSpace(stringValue(cfg["mail_provider"])) == "" {
+		cfg["mail_provider"] = "moemail"
+	}
+	provider := strings.ToLower(strings.TrimSpace(stringValue(cfg["captcha_provider"])))
+	if provider != "yescaptcha" {
+		provider = "local"
+	}
+	cfg["captcha_provider"] = provider
+	if provider == "local" {
+		cfg["local_solver_url"] = "http://127.0.0.1:5072"
+	}
+	strat := strings.ToLower(strings.TrimSpace(stringValue(cfg["proxy_strategy"])))
+	switch strat {
+	case "random", "rand":
+		cfg["proxy_strategy"] = "random"
+	case "sticky", "first", "fixed":
+		cfg["proxy_strategy"] = "sticky"
+	default:
+		cfg["proxy_strategy"] = "round_robin"
+	}
+	// numeric defaults
+	if _, ok := asInt(cfg["count"]); !ok {
+		cfg["count"] = 1
+	}
+	if _, ok := asInt(cfg["concurrency"]); !ok {
+		cfg["concurrency"] = 3
+	}
+	if _, ok := asInt(cfg["stagger_ms"]); !ok {
+		cfg["stagger_ms"] = 300
+	}
+	if _, ok := asInt(cfg["probe_delay_sec"]); !ok {
+		cfg["probe_delay_sec"] = 30
+	}
+	return cfg
+}
+
+func redactAdminSettings(raw map[string]any) map[string]any {
+	settings := cloneMapAny(raw)
+	if cfg, ok := settings["registration_config"].(map[string]any); ok {
+		settings["registration_config"] = redactRegistrationConfig(cfg)
+	}
+	if cfg, ok := settings["outbound_proxy_config"].(map[string]any); ok {
+		outbound := cloneMapAny(cfg)
+		password := strings.TrimSpace(stringValue(outbound["proxy_password"]))
+		outbound["proxy_password"] = ""
+		outbound["proxy_password_set"] = password != ""
+		if proxyText := strings.TrimSpace(stringValue(outbound["proxy"])); proxyText != "" {
+			lines := splitProxyLines(proxyText)
+			for i := range lines {
+				lines[i] = redactProxyURL(lines[i], stringValue(outbound["proxy_username"]))
+			}
+			outbound["proxy"] = strings.Join(lines, "\n")
+		}
+		settings["outbound_proxy_config"] = outbound
+	}
+	if cfg, ok := settings["sub2api_config"].(map[string]any); ok {
+		public := cloneMapAny(cfg)
+		public["has_password"] = strings.TrimSpace(stringValue(public["password"])) != ""
+		delete(public, "password")
+		delete(public, "token")
+		settings["sub2api_config"] = public
+	}
+	if cfg, ok := settings["cliproxyapi_config"].(map[string]any); ok {
+		public := cloneMapAny(cfg)
+		public["has_management_key"] = strings.TrimSpace(stringValue(public["management_key"])) != ""
+		delete(public, "management_key")
+		settings["cliproxyapi_config"] = public
+	}
+	return settings
+}
+
+func redactRegistrationConfig(raw map[string]any) map[string]any {
+	cfg := cloneMapAny(raw)
+	for key := range registrationSecretKeys {
+		cfg[key+"_set"] = strings.TrimSpace(stringValue(cfg[key])) != ""
+		cfg[key] = ""
+	}
+	if proxyText := strings.TrimSpace(stringValue(cfg["proxy"])); proxyText != "" {
+		lines := splitProxyLines(proxyText)
+		for i := range lines {
+			lines[i] = redactProxyURL(lines[i], stringValue(cfg["proxy_username"]))
+		}
+		cfg["proxy"] = strings.Join(lines, "\n")
+	}
+	return cfg
+}
+
+func maskSecret(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if len(v) <= 4 {
+		return "****"
+	}
+	return v[:2] + "…" + v[len(v)-2:]
+}
+
+func isMaskedSecret(v string) bool {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return false
+	}
+	if s == "****" {
+		return true
+	}
+	if strings.Contains(s, "…") || strings.Contains(s, "...") {
+		return true
+	}
+	for _, ch := range s {
+		if ch != '*' {
+			return false
+		}
+	}
+	return true
+}
+
+func splitProxyLines(text string) []string {
+	raw := strings.FieldsFunc(text, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ';' || r == ','
+	})
+	out := make([]string, 0, len(raw))
+	for _, line := range raw {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func previewProxyLines(lines []string, n int) []string {
+	if n <= 0 || len(lines) == 0 {
+		return []string{}
+	}
+	if len(lines) < n {
+		n = len(lines)
+	}
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, redactProxyURL(lines[i], ""))
+	}
+	return out
+}
+
+func redactProxyURL(raw, _ string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	// hide password in user:pass@host
+	if at := strings.LastIndex(s, "@"); at > 0 {
+		head := s[:at]
+		host := s[at+1:]
+		prefix := ""
+		cred := head
+		if i := strings.Index(head, "://"); i >= 0 {
+			prefix = head[:i+3]
+			cred = head[i+3:]
+		}
+		if colon := strings.Index(cred, ":"); colon > 0 {
+			return prefix + cred[:colon] + ":***@" + host
+		}
+	}
+	// hide password in host:port:user:pass shorthand.
+	scheme := "http"
+	rest := s
+	if i := strings.Index(rest, "://"); i >= 0 {
+		scheme = rest[:i]
+		rest = rest[i+3:]
+	}
+	parts := strings.Split(rest, ":")
+	if len(parts) >= 4 && parts[0] != "" && parts[1] != "" && parts[2] != "" {
+		return scheme + "://" + parts[2] + ":***@" + parts[0] + ":" + parts[1]
+	}
+	return s
+}
+
+func asInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case float64:
+		return int(n), true
+	case json.Number:
+		i, err := n.Int64()
+		return int(i), err == nil
+	case string:
+		s := strings.TrimSpace(n)
+		if s == "" {
+			return 0, false
+		}
+		i, err := strconv.Atoi(s)
+		return i, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func cloneMapAny(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 func writeRegistrationError(w http.ResponseWriter, err error) {
 	var re *regclient.Error
 	if errors.As(err, &re) {
@@ -2159,6 +4041,75 @@ func writeRegistrationError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeJSON(w, http.StatusBadGateway, map[string]any{"detail": err.Error()})
+}
+
+func serveDeviceLoginStart(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration/device service URL is not configured"})
+		return
+	}
+	var body map[string]any
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	if body == nil {
+		body = map[string]any{"mode": "device", "capture": true}
+	}
+	if _, ok := body["mode"]; !ok {
+		body["mode"] = "device"
+	}
+	payload, err := client.StartDeviceLogin(r.Context(), body)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveDeviceLoginSession(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration/device service URL is not configured"})
+		return
+	}
+	sid := strings.TrimSpace(r.PathValue("session_id"))
+	if sid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "session_id required"})
+		return
+	}
+	payload, err := client.DeviceLoginSession(r.Context(), sid)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveDeviceLoginSessions(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration/device service URL is not configured"})
+		return
+	}
+	payload, err := client.DeviceLoginSessions(r.Context())
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func serveSSOImportStart(w http.ResponseWriter, r *http.Request, options Options) {
@@ -2245,8 +4196,7 @@ func serveRegistrationSession(w http.ResponseWriter, r *http.Request, options Op
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
 		return
 	}
-	includeAuth := truthy(r.URL.Query().Get("include_auth_json"))
-	payload, err := client.Session(r.Context(), r.PathValue("session_id"), includeAuth)
+	payload, err := client.Session(r.Context(), r.PathValue("session_id"))
 	if err != nil {
 		writeRegistrationError(w, err)
 		return
@@ -2344,6 +4294,20 @@ func serveRegistrationStart(w http.ResponseWriter, r *http.Request, options Opti
 	if body == nil {
 		body = map[string]any{}
 	}
+	// Merge non-empty request overrides onto durable registration_config so
+	// empty form fields still use last-saved mail/captcha/proxy secrets.
+	merged, err := mergeRegistrationStartBody(r.Context(), options, body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	body = merged
+	// Auto-persist last-used config (secrets only when newly provided).
+	if options.Store != nil {
+		if _, err := saveRegistrationConfig(r.Context(), options, body, false); err != nil {
+			// non-fatal: registration can still start with merged body
+		}
+	}
 	idem := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if idem == "" {
 		idem = strings.TrimSpace(stringValue(body["idempotency_key"]))
@@ -2412,12 +4376,24 @@ func serveAdminUpdateSettings(w http.ResponseWriter, r *http.Request, options Op
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
+	currentOutbound := map[string]any{}
+	if raw, getErr := options.Store.GetSetting(r.Context(), "outbound_proxy_config"); getErr == nil {
+		if cfg, ok := raw.(map[string]any); ok && cfg != nil {
+			currentOutbound = cfg
+		}
+	}
+	patch, err := mergeOutboundProxyPatch(currentOutbound, patch)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
 	settings, err := options.Store.UpdateRuntimeSettings(r.Context(), patch)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "settings": settings})
+	options.applySettingsToRuntime(settings)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "settings": redactAdminSettings(settings)})
 }
 
 func serveAdminSettings(w http.ResponseWriter, r *http.Request, options Options) {
@@ -2433,7 +4409,7 @@ func serveAdminSettings(w http.ResponseWriter, r *http.Request, options Options)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "settings": settings})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "settings": redactAdminSettings(settings)})
 }
 
 func serveAdminLogs(w http.ResponseWriter, r *http.Request, options Options) {
@@ -2595,6 +4571,27 @@ func upstreamClient(options Options) *grok.Client {
 	return &grok.Client{BaseURL: options.Config.UpstreamBase}
 }
 
+// resolvePickMode returns the configured account rotation mode for failover chains.
+// Sticky accounts are still forced first; mode only ranks the rest of the window.
+func resolvePickMode(options Options) string {
+	mode := "least_used"
+	if options.Store != nil {
+		if raw, err := options.Store.GetSetting(context.Background(), "account_mode"); err == nil {
+			if s, ok := raw.(string); ok {
+				if v := strings.ToLower(strings.TrimSpace(s)); v != "" {
+					mode = v
+				}
+			}
+		}
+	}
+	switch mode {
+	case "round_robin", "random", "least_used":
+		return mode
+	default:
+		return "least_used"
+	}
+}
+
 func listCandidatesForRequest(ctx context.Context, options Options, chatReq proxy.ChatRequest, headers http.Header) ([]pool.Candidate, error) {
 	candidates, err := listCandidates(ctx, options)
 	if err != nil {
@@ -2611,7 +4608,51 @@ func listCandidatesForRequest(ctx context.Context, options Options, chatReq prox
 		}
 	}
 	sticky := stickyAccountID(ctx, options, fp)
-	return ensureStickyCandidate(ctx, options, candidates, sticky), nil
+	// Direct pck recovery when fingerprint shape differed or model was empty.
+	if sticky == "" && chatReq.Raw != nil && options.AffinityStore != nil {
+		if pck, _ := chatReq.Raw["prompt_cache_key"].(string); strings.TrimSpace(pck) != "" {
+			pck = strings.TrimSpace(pck)
+			if id, err := options.AffinityStore.GetAffinity(ctx, "chat:prompt_cache_key:"+pck); err == nil {
+				sticky = strings.TrimSpace(id)
+			}
+			if sticky == "" && strings.TrimSpace(chatReq.Model) != "" {
+				if id, err := options.AffinityStore.GetAffinity(ctx, "chat:"+strings.TrimSpace(chatReq.Model)+":prompt_cache_key:"+pck); err == nil {
+					sticky = strings.TrimSpace(id)
+				}
+			}
+		}
+	}
+	// Codex previous_response_id recovery when fingerprint miss.
+	if sticky == "" && chatReq.Raw != nil {
+		if prev, _ := chatReq.Raw["previous_response_id"].(string); strings.TrimSpace(prev) != "" {
+			if acc, recoveredPCK := responseAffinityLookup(ctx, options, prev); acc != "" {
+				sticky = acc
+				// If pck was recovered, also ensure request carries it for upstream cache.
+				if recoveredPCK != "" {
+					if _, has := chatReq.Raw["prompt_cache_key"]; !has || strings.TrimSpace(stringValue(chatReq.Raw["prompt_cache_key"])) == "" {
+						chatReq.Raw["prompt_cache_key"] = recoveredPCK
+					}
+				}
+			}
+		}
+	}
+	candidates = ensureStickyCandidate(ctx, options, candidates, sticky)
+	// Pin sticky to front so prepareChain can skip a second Redis affinity GET.
+	if sticky != "" {
+		for i := range candidates {
+			if candidates[i].ID == sticky {
+				if i > 0 {
+					cand := candidates[i]
+					copy(candidates[1:i+1], candidates[0:i])
+					candidates[0] = cand
+				}
+				// Massive least_used boost so Chain keeps sticky first.
+				candidates[0].RequestCount -= 1_000_000_000
+				break
+			}
+		}
+	}
+	return candidates, nil
 }
 
 func listCandidates(ctx context.Context, options Options) ([]pool.Candidate, error) {
@@ -2643,6 +4684,11 @@ func ensureStickyCandidate(ctx context.Context, options Options, candidates []po
 	if err != nil || extra == nil {
 		return candidates
 	}
+	// Skip cooled-down / disabled / expired sticky pins — injecting them only
+	// burns TTFT and forces a known-bad first hop every multi-turn request.
+	if !extra.Eligible("", time.Now()) {
+		return candidates
+	}
 	// Put sticky first so prepareChain affinity boost is redundant but safe.
 	out := make([]pool.Candidate, 0, len(candidates)+1)
 	out = append(out, *extra)
@@ -2656,10 +4702,35 @@ func stickyAccountID(ctx context.Context, options Options, fingerprint string) s
 		return ""
 	}
 	id, err := options.AffinityStore.GetAffinity(ctx, fingerprint)
-	if err != nil {
-		return ""
+	if err == nil {
+		if s := strings.TrimSpace(id); s != "" {
+			return s
+		}
 	}
-	return strings.TrimSpace(id)
+	// Fallbacks for fingerprint shape drift across turns / model aliasing.
+	// chat:{model}:prompt_cache_key:{pck} -> chat:prompt_cache_key:{pck}
+	if i := strings.Index(fingerprint, ":prompt_cache_key:"); i >= 0 {
+		alt := "chat" + fingerprint[i:]
+		if alt != fingerprint {
+			if id, err := options.AffinityStore.GetAffinity(ctx, alt); err == nil {
+				if s := strings.TrimSpace(id); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	// chat:{model}:previous_response_id:{id} -> chat:previous_response_id:{id}
+	if i := strings.Index(fingerprint, ":previous_response_id:"); i >= 0 {
+		alt := "chat" + fingerprint[i:]
+		if alt != fingerprint {
+			if id, err := options.AffinityStore.GetAffinity(ctx, alt); err == nil {
+				if s := strings.TrimSpace(id); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func modelCatalog(options Options) *models.Catalog {
@@ -3172,7 +5243,7 @@ func serveChangeAdminPassword(w http.ResponseWriter, r *http.Request, options Op
 		return
 	}
 	settings, _ := options.Store.PublicSettings(r.Context())
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "密码已更新", "settings": settings})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "密码已更新", "settings": redactAdminSettings(settings)})
 }
 
 func servePruneModelBlocks(w http.ResponseWriter, r *http.Request, options Options) {
@@ -3385,14 +5456,18 @@ func serveAdminModelsSync(w http.ResponseWriter, r *http.Request, options Option
 		return
 	}
 	a := authList[0]
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(options.Config.UpstreamBase, "/")+"/models", nil)
+	gc := upstreamClient(options)
+	client := gc.HTTP
+	if client == nil {
+		client = grok.NewHTTPClient(nil)
+	}
+	requestCtx := outboundproxy.WithAccountID(r.Context(), a.ID)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, strings.TrimRight(options.Config.UpstreamBase, "/")+"/models", nil)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
-	gc := upstreamClient(options)
-	for k, v := range gc.Headers(a.Token, options.Config.DefaultModel) {
+	for k, v := range gc.Headers(a.Token, options.runtimeConfig().DefaultModel) {
 		req.Header.Set(k, v)
 	}
 	resp, err := client.Do(req)
@@ -3413,7 +5488,7 @@ func serveAdminModelsSync(w http.ResponseWriter, r *http.Request, options Option
 	}
 	items := parseUpstreamModels(payload)
 	// Always keep local extras (coding/build/search aliases) even when upstream list is tiny.
-	items = ensureLocalModelExtras(items, options.Config.DefaultModel)
+	items = ensureLocalModelExtras(items, options.runtimeConfig().DefaultModel)
 	if len(items) == 0 {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "no models in upstream response"})
 		return
@@ -3475,30 +5550,73 @@ func serveAdminAccountQuota(w http.ResponseWriter, r *http.Request, options Opti
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
 		return
 	}
-	// return cached for single account if present
-	all, err := options.Store.ListCachedQuotas(r.Context())
+	aid := strings.TrimSpace(r.PathValue("account_id"))
+	if aid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "account_id required"})
+		return
+	}
+	// Live fetch by default so "额度" button always works even without cache.
+	// ?cached=1 keeps old behavior for bulk UI hydration.
+	cachedOnly := truthy(r.URL.Query().Get("cached")) && !truthy(r.URL.Query().Get("refresh"))
+	if cachedOnly {
+		all, err := options.Store.ListCachedQuotas(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+			return
+		}
+		results, _ := all["results"].([]map[string]any)
+		if results == nil {
+			if arr, ok := all["results"].([]any); ok {
+				for _, item := range arr {
+					if m, ok := item.(map[string]any); ok {
+						results = append(results, m)
+					}
+				}
+			}
+		}
+		for _, item := range results {
+			if stringValue(item["account_id"]) == aid {
+				writeJSON(w, http.StatusOK, item)
+				return
+			}
+		}
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "quota cache not found"})
+		return
+	}
+	if options.Quota == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "quota service unavailable"})
+		return
+	}
+	item, err := options.Quota.FetchOne(r.Context(), aid)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
-	aid := r.PathValue("account_id")
-	results, _ := all["results"].([]map[string]any)
-	if results == nil {
-		if arr, ok := all["results"].([]any); ok {
-			for _, item := range arr {
-				if m, ok := item.(map[string]any); ok {
-					results = append(results, m)
-				}
+	if item == nil {
+		item = map[string]any{"ok": false, "account_id": aid, "error": "empty quota result"}
+	}
+	// Attach pool AFTER SaveQuotaSnapshot so UI reflects DB-coherent status
+	// (quota_disabled / re-enabled normal) without a full page reload.
+	if poolView, perr := options.Store.GetAccountPoolView(r.Context(), aid); perr == nil && poolView != nil {
+		item["pool"] = poolView
+		if v, ok := poolView["pool_status"]; ok {
+			item["pool_status"] = v
+		}
+		if v, ok := poolView["disabled_for_quota"]; ok {
+			item["disabled_for_quota"] = v
+			if b, ok := v.(bool); ok && b {
+				item["auto_disabled"] = true
+				item["pool_disabled"] = true
 			}
 		}
-	}
-	for _, item := range results {
-		if stringValue(item["account_id"]) == aid {
-			writeJSON(w, http.StatusOK, item)
-			return
+		if v, ok := poolView["enabled"]; ok {
+			item["enabled"] = v
+		}
+		if v, ok := poolView["in_cooldown"]; ok {
+			item["in_cooldown"] = v
 		}
 	}
-	writeJSON(w, http.StatusNotFound, map[string]any{"detail": "quota cache not found"})
+	writeJSON(w, http.StatusOK, item)
 }
 
 func serveIntegrationSettingsGet(w http.ResponseWriter, r *http.Request, options Options, key string) {
@@ -3745,112 +5863,17 @@ func usageDetail(route string, requestBody map[string]any, ttftMS, latency int) 
 }
 
 // extractReasoningEffort normalizes client thinking intensity to low/medium/high/xhigh.
+// Codex: auto/default/standard/extra-high · Claude Code: low/medium/high/xhigh + budget_tokens.
 func extractReasoningEffort(payload map[string]any) string {
-	if payload == nil {
-		return ""
-	}
-	for _, key := range []string{"reasoning_effort", "thinking_effort", "effort", "thinking_intensity"} {
-		if v, ok := payload[key]; ok && v != nil {
-			if got := normalizeReasoningEffort(v); got != "" {
-				return got
-			}
-		}
-	}
-	if v, ok := payload["reasoning"]; ok && v != nil {
-		if got := normalizeReasoningEffort(v); got != "" {
-			return got
-		}
-	}
-	if v, ok := payload["thinking"]; ok && v != nil {
-		if got := normalizeReasoningEffort(v); got != "" {
-			return got
-		}
-	}
-	// Responses API sometimes nests under text/reasoning configs.
-	if raw, ok := payload["text"].(map[string]any); ok {
-		if got := extractReasoningEffort(raw); got != "" {
-			return got
-		}
-	}
-	return ""
+	return reasoning.FromRequest(payload)
 }
 
 func normalizeReasoningEffort(value any) string {
-	switch v := value.(type) {
-	case nil:
-		return ""
-	case bool:
-		if v {
-			return "medium"
-		}
-		return ""
-	case float64:
-		return budgetToEffort(int(v))
-	case float32:
-		return budgetToEffort(int(v))
-	case int:
-		return budgetToEffort(v)
-	case int64:
-		return budgetToEffort(int(v))
-	case json.Number:
-		n, _ := v.Int64()
-		return budgetToEffort(int(n))
-	case string:
-		s := strings.ToLower(strings.TrimSpace(v))
-		if s == "" || s == "none" || s == "null" || s == "false" || s == "off" || s == "disabled" {
-			return ""
-		}
-		aliases := map[string]string{
-			"minimal": "low", "min": "low", "l": "low",
-			"m": "medium", "med": "medium", "enabled": "medium", "adaptive": "medium", "true": "medium", "on": "medium",
-			"h":   "high",
-			"max": "xhigh", "maximum": "xhigh", "ultra": "xhigh", "extra_high": "xhigh", "extrahigh": "xhigh",
-		}
-		if a, ok := aliases[s]; ok {
-			return a
-		}
-		if s == "low" || s == "medium" || s == "high" || s == "xhigh" {
-			return s
-		}
-		if len(s) > 32 {
-			s = s[:32]
-		}
-		return s
-	case map[string]any:
-		for _, key := range []string{"effort", "reasoning_effort", "thinking_effort", "intensity", "level"} {
-			if vv, ok := v[key]; ok && vv != nil {
-				if got := normalizeReasoningEffort(vv); got != "" {
-					return got
-				}
-			}
-		}
-		if vv, ok := v["budget_tokens"]; ok && vv != nil {
-			return normalizeReasoningEffort(vv)
-		}
-		tt := strings.ToLower(strings.TrimSpace(fmt.Sprint(v["type"])))
-		if v["enabled"] == true || tt == "enabled" || tt == "adaptive" {
-			return "medium"
-		}
-		return ""
-	default:
-		return normalizeReasoningEffort(fmt.Sprint(v))
-	}
+	return reasoning.Normalize(value)
 }
 
 func budgetToEffort(n int) string {
-	if n <= 0 {
-		return ""
-	}
-	if n <= 4096 {
-		return "low"
-	}
-	if n <= 16000 {
-		return "medium"
-	}
-	if n <= 48000 {
-		return "high"
-	}
-	return "xhigh"
+	return reasoning.BudgetToLevel(n)
 }
 
 func firstNonEmptyStr(values ...string) string {
@@ -4097,30 +6120,89 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	model := stringValue(body["model"])
 	if model == "" {
-		model = options.Config.DefaultModel
+		model = options.runtimeConfig().DefaultModel
 	}
 	model = modelCatalog(options).Resolve(model)
-	auth, err := options.Store.GetAccountAuth(r.Context(), r.PathValue("account_id"))
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"detail": err.Error()})
+	accountID := strings.TrimSpace(r.PathValue("account_id"))
+	if accountID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "account_id required"})
+		return
+	}
+	// Manual "模型测试" is full 测活: last_probe + kick/block/clear must land in DB
+	// (same semantics as probe-batch / background model health).
+	autoDisable := true
+	if v, ok := body["auto_disable"].(bool); ok {
+		autoDisable = v
+	}
+	if options.ModelHealth != nil {
+		results := options.ModelHealth.ProbeIDs(r.Context(), []string{accountID}, model, autoDisable, "manual")
+		if len(results) == 0 {
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
+			return
+		}
+		row := results[0]
+		// ProbeIDs shape: {ok, account_id, email, result:probe} OR {ok:false, account_id, error}
+		result, _ := row["result"].(map[string]any)
+		if result == nil {
+			result = map[string]any{
+				"account_id": firstNonEmptyStr(stringValue(row["account_id"]), accountID),
+				"model":      model,
+				"available":  false,
+				"ok":         false,
+				"error":      firstNonEmptyStr(stringValue(row["error"]), "probe produced no result"),
+				"source":     "manual",
+				"probed_at":  time.Now().Unix(),
+			}
+		}
+		aid := firstNonEmptyStr(stringValue(row["account_id"]), stringValue(result["account_id"]), accountID)
+		email := firstNonEmptyStr(stringValue(row["email"]), stringValue(result["email"]))
+		// ProbeIDs already SaveLastProbe inside probeAccount; re-save is idempotent insurance.
+		if result["budget_cut"] != true {
+			_ = options.Store.SaveLastProbe(r.Context(), aid, result)
+		}
+		poolView, _ := options.Store.GetAccountPoolView(r.Context(), aid)
+		ok := row["ok"] == true || result["available"] == true
+		statusCode := 0
+		switch v := result["status_code"].(type) {
+		case int:
+			statusCode = v
+		case int64:
+			statusCode = int(v)
+		case float64:
+			statusCode = int(v)
+		case json.Number:
+			if n, err := v.Int64(); err == nil {
+				statusCode = int(n)
+			}
+		}
+		errText := stringValue(result["error"])
+		if ok {
+			touchRedisPool(options, aid, true, "", nil, statusCode)
+		} else {
+			touchRedisPool(options, aid, false, errText, nil, statusCode)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": ok, "account_id": aid, "email": email,
+			"result": result, "pool": poolView,
+		})
+		return
+	}
+	// Fallback when ModelHealth is not wired (tests / degraded): still persist last_probe.
+	auth, err := options.Store.GetAccountAuth(r.Context(), accountID)
+	if err != nil || auth == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found or has no token"})
 		return
 	}
 	client := upstreamClient(options)
-	// Lightweight connectivity probe: open a short streamed completion and abort after headers/body start.
 	probeBody := map[string]any{
-		"model":      model,
-		"stream":     true,
-		"max_tokens": 1,
-		"messages":   []any{map[string]any{"role": "user", "content": "ping"}},
+		"model": model, "stream": true, "max_tokens": 1,
+		"messages": []any{map[string]any{"role": "user", "content": "ping"}},
 	}
 	started := time.Now()
 	resp, err := client.Open(r.Context(), grok.Account{ID: auth.ID, Token: auth.Token}, model, probeBody)
 	result := map[string]any{
-		"account_id": auth.ID,
-		"email":      auth.Email,
-		"model":      model,
-		"probed_at":  time.Now().Unix(),
-		"source":     "manual",
+		"account_id": auth.ID, "email": auth.Email, "model": model,
+		"probed_at": time.Now().Unix(), "source": "manual",
 	}
 	if err != nil {
 		status := 0
@@ -4133,29 +6215,135 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 				errText = errText[:400]
 			}
 		}
-		autoDisable, _ := body["auto_disable"].(bool)
-		if autoDisable && (status == 401 || status == 403) {
-			_, _ = options.Store.SetAccountEnabled(r.Context(), auth.ID, false)
+		if autoDisable {
+			decision := pool.ClassifyUpstreamFailure(status, errText, model)
+			if status == 401 || status == 403 {
+				_, _ = options.Store.SetAccountEnabled(r.Context(), auth.ID, false)
+				result["auto_disabled"] = true
+			} else if decision.ShouldCooldown {
+				until := time.Now().Add(10 * time.Minute)
+				if decision.Until != nil {
+					until = *decision.Until
+				}
+				if decision.BlockModel {
+					bm := model
+					if decision.Model != "" {
+						bm = decision.Model
+					}
+					_ = options.Store.BlockPoolModel(r.Context(), auth.ID, bm, &until)
+					result["model_blocked"] = true
+					result["blocked_model"] = bm
+				}
+				sec := until.Sub(time.Now()).Seconds()
+				if sec < 60 {
+					sec = 60
+				}
+				_, _ = options.Store.KickFromPool(r.Context(), auth.ID, errText, &sec)
+				result["kicked_cooldown"] = true
+			}
 		}
 		result["available"] = false
+		result["ok"] = false
 		result["error"] = errText
 		result["status_code"] = status
 		result["latency_ms"] = time.Since(started).Milliseconds()
+		_ = options.Store.SaveLastProbe(r.Context(), auth.ID, result)
 		poolView, _ := options.Store.GetAccountPoolView(r.Context(), auth.ID)
 		touchRedisPool(options, auth.ID, false, errText, nil, status)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "account_id": auth.ID, "email": auth.Email, "result": result, "pool": poolView})
 		return
 	}
-	// Drain a tiny amount then close.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
 	_ = resp.Body.Close()
 	_ = options.Store.ReportPoolSuccess(r.Context(), auth.ID, true)
-	touchRedisPool(options, auth.ID, true, "", nil, resp.StatusCode)
+	if _, err := options.Store.ClearAccountCooldown(r.Context(), auth.ID); err == nil {
+		result["recovered"] = true
+	}
+	if model != "" {
+		if err := options.Store.UnblockPoolModel(r.Context(), auth.ID, model); err == nil {
+			result["unblocked_model"] = model
+		}
+	}
 	result["available"] = true
+	result["ok"] = true
 	result["status_code"] = resp.StatusCode
 	result["latency_ms"] = time.Since(started).Milliseconds()
+	_ = options.Store.SaveLastProbe(r.Context(), auth.ID, result)
+	touchRedisPool(options, auth.ID, true, "", nil, resp.StatusCode)
 	poolView, _ := options.Store.GetAccountPoolView(r.Context(), auth.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account_id": auth.ID, "email": auth.Email, "result": result, "pool": poolView})
+}
+
+func serveAdminSetAccountStatus(w http.ResponseWriter, r *http.Request, options Options) {
+	if !adminWriteAllowed(w, r, options) {
+		return
+	}
+	if _, ok := admin.RequireSession(r, options.AdminSessions); !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "PostgreSQL store unavailable"})
+		return
+	}
+	var body map[string]any
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	_ = decoder.Decode(&body)
+	if body == nil {
+		body = map[string]any{}
+	}
+	status := strings.TrimSpace(stringValue(body["status"]))
+	if status == "" {
+		status = strings.TrimSpace(stringValue(body["pool_status"]))
+	}
+	if status == "" {
+		status = strings.TrimSpace(stringValue(body["tag"]))
+	}
+	if status == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"detail":  "status required",
+			"allowed": []string{"live", "cooldown", "model_blocked", "quota_disabled", "disabled", "expired"},
+		})
+		return
+	}
+	reason := strings.TrimSpace(stringValue(body["reason"]))
+	if reason == "" {
+		reason = strings.TrimSpace(stringValue(body["message"]))
+	}
+	model := strings.TrimSpace(stringValue(body["model"]))
+	if model == "" {
+		model = strings.TrimSpace(stringValue(body["blocked_model"]))
+	}
+	var cooldown *float64
+	for _, key := range []string{"cooldown_sec", "cooldown_seconds", "sec"} {
+		switch v := body[key].(type) {
+		case float64:
+			cooldown = &v
+		case json.Number:
+			if f, err := v.Float64(); err == nil {
+				cooldown = &f
+			}
+		}
+		if cooldown != nil {
+			break
+		}
+	}
+	rec, err := options.Store.SetAccountPoolStatus(r.Context(), r.PathValue("account_id"), status, reason, model, cooldown)
+	if err != nil {
+		if postgres.IsAccountNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "Account not found"})
+			return
+		}
+		msg := err.Error()
+		if strings.HasPrefix(msg, "unsupported status") {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": msg})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": msg})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": rec, "pool": rec, "status": rec["pool_status"]})
 }
 
 func serveAdminKickAccount(w http.ResponseWriter, r *http.Request, options Options) {

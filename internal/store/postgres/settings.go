@@ -11,23 +11,20 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const (
-	defaultUpstreamRetryCount = 3
-	maxUpstreamRetryCount     = 63
-)
-
 func (c *Connector) PublicSettings(ctx context.Context) (map[string]any, error) {
-	rows, err := c.Pool.Query(ctx, "SELECT key, value FROM app_settings")
+	rows, err := c.Pool.Query(ctx, "SELECT key, value, EXTRACT(EPOCH FROM updated_at)::bigint FROM app_settings")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
 	values := map[string]any{}
+	var maxUpdated int64
 	for rows.Next() {
 		var key string
 		var data []byte
-		if err := rows.Scan(&key, &data); err != nil {
+		var updated *int64
+		if err := rows.Scan(&key, &data, &updated); err != nil {
 			return nil, err
 		}
 		var decoded any
@@ -35,12 +32,17 @@ func (c *Connector) PublicSettings(ctx context.Context) (map[string]any, error) 
 			continue
 		}
 		values[key] = decoded
+		if updated != nil && *updated > maxUpdated {
+			maxUpdated = *updated
+		}
+	}
+	if maxUpdated > 0 {
+		values["__updated_at"] = maxUpdated
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	retryCount := effectiveUpstreamRetryCount(values)
 	out := map[string]any{
 		"account_mode":                  stringSetting(values, "account_mode", "round_robin"),
 		"account_modes":                 []string{"round_robin", "random", "least_used"},
@@ -68,22 +70,34 @@ func (c *Connector) PublicSettings(ctx context.Context) (map[string]any, error) 
 		"model_health_auto_disable":     boolSetting(values, "model_health_auto_disable", true),
 		"probe_models":                  valueOr(values, "probe_models", []string{}),
 		"default_model":                 stringSetting(values, "default_model", ""),
-		"upstream_retry_count":          int64(retryCount),
-		"max_failover_attempts":         int64(retryCount + 1),
 		"registration_config":           mapSetting(values, "registration_config"),
 		"outbound_proxy_config":         mapSetting(values, "outbound_proxy_config"),
-		"outbound_proxy_pool":           map[string]any{"enabled": false, "count": 0, "strategy": "round_robin", "source": "none", "preview": []any{}},
+		"outbound_proxy_pool":           outboundProxyPoolSummary(mapSetting(values, "outbound_proxy_config")),
 		"sub2api_config":                mapSetting(values, "sub2api_config"),
 		"cliproxyapi_config":            mapSetting(values, "cliproxyapi_config"),
-		"updated_at":                    nil,
+		"updated_at":                    values["__updated_at"],
 	}
-	if policy := mapSetting(values, "pool_policy"); len(policy) > 0 {
-		out["pool_policy"] = policy
-		for key, value := range policy {
-			out[key] = value
+	// Pool / cooldown / kick policy: always return effective defaults so the
+	// admin UI "轮询 / 冷却 / 踢出策略" section is never blank. DB overrides
+	// (flat keys or nested pool_policy) win when present.
+	policy := defaultPoolPolicy()
+	// Flat per-key settings (written by UpdateRuntimeSettings) take precedence.
+	for key := range policy {
+		if v, ok := values[key]; ok && v != nil {
+			policy[key] = v
 		}
-	} else {
-		out["pool_policy"] = map[string]any{}
+	}
+	// Nested pool_policy blob (if any) overlays last.
+	if nested := mapSetting(values, "pool_policy"); len(nested) > 0 {
+		for key, value := range nested {
+			if value != nil {
+				policy[key] = value
+			}
+		}
+	}
+	out["pool_policy"] = policy
+	for key, value := range policy {
+		out[key] = value
 	}
 	return out, nil
 }
@@ -280,7 +294,7 @@ func (c *Connector) UpdateRuntimeSettings(ctx context.Context, patch map[string]
 		{key: "model_health_interval_sec", kind: "float", minF: 0, maxF: 86400},
 		{key: "model_health_auto_disable", kind: "bool"},
 		{key: "default_model", kind: "string"},
-		{key: "upstream_retry_count", kind: "int", minF: 0, maxF: 63},
+		{key: "max_failover_attempts", kind: "int", minF: 1, maxF: 64},
 		{key: "cooldown_default_sec", kind: "float", minF: 1, maxF: 600},
 		{key: "cooldown_auth_sec", kind: "float", minF: 5, maxF: 1800},
 		{key: "cooldown_rate_limit_sec", kind: "float", minF: 5, maxF: 1800},
@@ -399,66 +413,102 @@ func (c *Connector) UpdateRuntimeSettings(ctx context.Context, patch map[string]
 		}
 		applied++
 	}
+
+	// Outbound proxy pool fields → durable outbound_proxy_config JSON.
+	proxyKeys := []string{
+		"outbound_proxy", "outbound_proxy_enabled", "outbound_proxy_username",
+		"outbound_proxy_password", "outbound_proxy_strategy", "outbound_proxy_config",
+	}
+	hasProxyPatch := false
+	for _, k := range proxyKeys {
+		if _, ok := patch[k]; ok {
+			hasProxyPatch = true
+			break
+		}
+	}
+	if hasProxyPatch {
+		current := mapSetting(map[string]any{"outbound_proxy_config": nil}, "outbound_proxy_config")
+		// load existing
+		if raw, err := c.GetSetting(ctx, "outbound_proxy_config"); err == nil {
+			if m, ok := raw.(map[string]any); ok && m != nil {
+				current = m
+			}
+		}
+		if v, ok := patch["outbound_proxy_config"].(map[string]any); ok && v != nil {
+			for k, val := range v {
+				current[k] = val
+			}
+		}
+		if v, ok := patch["outbound_proxy"]; ok {
+			current["proxy"] = fmt.Sprint(v)
+		}
+		if v, ok := patch["outbound_proxy_enabled"].(bool); ok {
+			current["enabled"] = v
+		}
+		if v, ok := patch["outbound_proxy_username"]; ok {
+			current["proxy_username"] = fmt.Sprint(v)
+		}
+		if v, ok := patch["outbound_proxy_password"]; ok {
+			s := fmt.Sprint(v)
+			if strings.TrimSpace(s) != "" {
+				current["proxy_password"] = s
+			}
+		}
+		if v, ok := patch["outbound_proxy_strategy"]; ok {
+			st := strings.ToLower(strings.TrimSpace(fmt.Sprint(v)))
+			if st != "random" && st != "sticky" && st != "round_robin" {
+				st = "round_robin"
+			}
+			current["proxy_strategy"] = st
+		}
+		if err := c.SetSetting(ctx, "outbound_proxy_config", current); err != nil {
+			return nil, err
+		}
+		applied++
+	}
+
+	// Pool policy fields are stored as a single pool_policy JSON object so
+	// admin UI round-trips without losing values under env-only config.
+	policyKeys := []string{
+		"max_failover_attempts", "cooldown_default_sec", "cooldown_auth_sec",
+		"cooldown_rate_limit_sec", "cooldown_server_error_sec", "cooldown_max_sec",
+		"soft_model_block_ttl_sec", "durable_model_block_ttl_sec",
+		"probe_fail_kick_streak", "probe_fail_disable_streak", "probe_kick_cooldown_sec",
+	}
+	hasPolicy := false
+	for _, k := range policyKeys {
+		if _, ok := patch[k]; ok {
+			hasPolicy = true
+			break
+		}
+	}
+	if hasPolicy {
+		policy := map[string]any{}
+		if raw, err := c.GetSetting(ctx, "pool_policy"); err == nil {
+			if m, ok := raw.(map[string]any); ok && m != nil {
+				policy = m
+			}
+		}
+		for _, k := range policyKeys {
+			if v, ok := patch[k]; ok && v != nil {
+				// already validated/written as scalars above; mirror into policy blob
+				if raw, err := c.GetSetting(ctx, k); err == nil {
+					policy[k] = raw
+				} else {
+					policy[k] = v
+				}
+			}
+		}
+		if err := c.SetSetting(ctx, "pool_policy", policy); err != nil {
+			return nil, err
+		}
+		applied++
+	}
+
 	if applied == 0 {
 		return nil, errors.New("没有可更新的字段")
 	}
 	return c.PublicSettings(ctx)
-}
-
-func effectiveUpstreamRetryCount(values map[string]any) int {
-	if value, ok := numericSetting(values["upstream_retry_count"]); ok {
-		return clampInt(value, 0, maxUpstreamRetryCount)
-	}
-	if value, ok := numericSetting(values["max_failover_attempts"]); ok {
-		return clampInt(value-1, 0, maxUpstreamRetryCount)
-	}
-	return defaultUpstreamRetryCount
-}
-
-func numericSetting(value any) (int, bool) {
-	switch v := value.(type) {
-	case float64:
-		return int(v), true
-	case float32:
-		return int(v), true
-	case int64:
-		return int(v), true
-	case int:
-		return v, true
-	case json.Number:
-		n, err := v.Int64()
-		return int(n), err == nil
-	default:
-		return 0, false
-	}
-}
-
-func clampInt(value, minimum, maximum int) int {
-	if value < minimum {
-		return minimum
-	}
-	if value > maximum {
-		return maximum
-	}
-	return value
-}
-
-func (c *Connector) UpstreamRetryCount(ctx context.Context) (int, error) {
-	if c == nil || c.Pool == nil {
-		return defaultUpstreamRetryCount, errors.New("postgres unavailable")
-	}
-	values := map[string]any{}
-	for _, key := range []string{"upstream_retry_count", "max_failover_attempts"} {
-		value, err := c.GetSetting(ctx, key)
-		if err == nil {
-			values[key] = value
-			continue
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return defaultUpstreamRetryCount, err
-		}
-	}
-	return effectiveUpstreamRetryCount(values), nil
 }
 
 func asFloat(value any) (float64, bool) {
@@ -490,4 +540,57 @@ func (c *Connector) GetSetting(ctx context.Context, key string) (any, error) {
 		return nil, err
 	}
 	return decoded, nil
+}
+
+// defaultPoolPolicy mirrors Python account_pool.cooldown_defaults /
+// settings_store.get_pool_policy so admin UI always has numbers to show.
+func defaultPoolPolicy() map[string]any {
+	return map[string]any{
+		"cooldown_default_sec":        float64(20),
+		"cooldown_auth_sec":           float64(90),
+		"cooldown_rate_limit_sec":     float64(45),
+		"cooldown_server_error_sec":   float64(20),
+		"cooldown_max_sec":            float64(600),
+		"soft_model_block_ttl_sec":    float64(180),
+		"durable_model_block_ttl_sec": float64(3600),
+		"probe_fail_kick_streak":      int64(2),
+		"probe_fail_disable_streak":   int64(4),
+		"probe_kick_cooldown_sec":     float64(600),
+		"max_failover_attempts":       int64(4),
+	}
+}
+
+func outboundProxyPoolSummary(cfg map[string]any) map[string]any {
+	enabled := true
+	if v, ok := cfg["enabled"].(bool); ok {
+		enabled = v
+	}
+	proxyText, _ := cfg["proxy"].(string)
+	count := 0
+	for _, line := range strings.Split(proxyText, "\n") {
+		for _, part := range strings.FieldsFunc(line, func(r rune) bool {
+			return r == ';' || r == ','
+		}) {
+			part = strings.TrimSpace(part)
+			if part == "" || strings.HasPrefix(part, "#") {
+				continue
+			}
+			count++
+		}
+	}
+	strategy, _ := cfg["proxy_strategy"].(string)
+	if strategy == "" {
+		strategy = "round_robin"
+	}
+	source := "none"
+	if count > 0 {
+		source = "settings"
+	}
+	return map[string]any{
+		"enabled":  enabled,
+		"count":    count,
+		"strategy": strategy,
+		"source":   source,
+		"preview":  []any{},
+	}
 }

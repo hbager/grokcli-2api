@@ -11,7 +11,17 @@ cd "$(dirname "$0")"
 
 APP_SERVICE="${GROKCLI_APP_SERVICE:-grokcli-2api}"
 # Default health port matches docker-compose.yml (override via env / compose override)
-HEALTH_PORT="${GROKCLI_HEALTH_PORT:-40081}"
+# Prefer compose override / .env port when present; fall back to 40081 (current deploy default).
+if [[ -z "${GROKCLI_HEALTH_PORT:-}" ]]; then
+  if [[ -f .env ]] && grep -qE '^GROK2API_PORT=' .env; then
+    HEALTH_PORT="$(grep -E '^GROK2API_PORT=' .env | head -1 | cut -d= -f2- | tr -d "\"'")"
+  else
+    HEALTH_PORT=40081
+  fi
+else
+  HEALTH_PORT="${GROKCLI_HEALTH_PORT}"
+fi
+HEALTH_PORT="${HEALTH_PORT:-40081}"
 HEALTH_URL="${GROKCLI_HEALTH_URL:-http://127.0.0.1:${HEALTH_PORT}/health}"
 
 echo "== git =="
@@ -23,15 +33,15 @@ fi
 echo "== local fingerprint =="
 python3 -c 'from pathlib import Path; import re
 adapter_path = Path("grok2api/upstream/grok_build_adapter.py")
-app_path = Path("grok2api/app.py")
-adapter = adapter_path.read_text(encoding="utf-8")
-app = app_path.read_text(encoding="utf-8")
+buildinfo_path = Path("internal/buildinfo/buildinfo.go")
+adapter = adapter_path.read_text(encoding="utf-8") if adapter_path.exists() else ""
+buildinfo = buildinfo_path.read_text(encoding="utf-8") if buildinfo_path.exists() else ""
 m1 = re.search(r"ADAPTER_BUILD\s*=\s*\"([^\"]+)\"", adapter)
-m2 = re.search(r"APP_VERSION\s*=\s*\"([^\"]+)\"", app)
+m2 = re.search(r"Version\s*=\s*\"([^\"]+)\"", buildinfo)
 print("ADAPTER_BUILD=", m1.group(1) if m1 else None)
-print("APP_VERSION=", m2.group(1) if m2 else None)
+print("GO_VERSION=", m2.group(1) if m2 else None)
 print("adapter_present=", adapter_path.exists())
-print("app_package_present=", app_path.exists())
+print("go_binary_source=", Path("cmd/grok2api/main.go").exists())
 print("engine_dir_present=", Path("grok-build-auth/xconsole_client").exists())
 '
 
@@ -51,6 +61,18 @@ fi
 NO_CACHE="${NO_CACHE:-0}"
 echo "== admin assets =="
 python3 scripts/build_admin_assets.py || true
+
+# Host bind-mounts ./bin over /app/bin (see docker-compose*.yml). Image rebuild alone
+# does NOT update the running Go binary — always compile into ./bin first.
+echo "== go binary (host ./bin bind-mount) =="
+mkdir -p bin
+if command -v go >/dev/null 2>&1; then
+  go build -o bin/grok2api ./cmd/grok2api
+  go build -o bin/grok2api-migrate ./cmd/grok2api-migrate
+  ls -la bin/grok2api bin/grok2api-migrate || true
+else
+  echo "WARN: go toolchain missing; keeping existing bin/grok2api" >&2
+fi
 
 echo "== build (old container still serving) =="
 if [[ "$NO_CACHE" == "1" ]]; then

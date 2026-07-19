@@ -25,12 +25,28 @@ func (c *Client) MarkInflight(ctx context.Context, accountID string, ttlSeconds 
 		ttlSeconds = InflightTTLSeconds
 	}
 	key := c.key("inflight", accountID)
-	value, err := c.Incr(ctx, key)
+	// Single RTT: INCR + EXPIRE on one pooled connection.
+	results, err := c.pipeline(ctx, [][]string{
+		{"INCR", key},
+		{"EXPIRE", key, strconv.Itoa(ttlSeconds)},
+	})
 	if err != nil {
+		// INCR may already have executed before a read failure. Retrying a
+		// non-idempotent mark can permanently overcount inflight requests.
 		return 0, err
 	}
-	_ = c.Expire(ctx, key, ttlSeconds)
-	return value, nil
+	if len(results) == 0 {
+		return 0, nil
+	}
+	switch v := results[0].(type) {
+	case int64:
+		return v, nil
+	case string:
+		n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		return n, nil
+	default:
+		return 0, nil
+	}
 }
 
 func (c *Client) ReleaseInflight(ctx context.Context, accountID string) error {

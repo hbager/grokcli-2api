@@ -26,13 +26,33 @@ type APIKeyRecord struct {
 	LastUsedAt   *time.Time
 }
 
-type APIKeyVerifier struct {
-	cfg   config.Config
-	store *postgres.Connector
+type apiKeyStore interface {
+	HasEnabledAPIKeys(context.Context) (bool, error)
+	FindAPIKeyByHash(context.Context, string) (*postgres.APIKeyRecord, error)
+	TouchAPIKeyUsage(context.Context, string) error
 }
 
+type APIKeyVerifier struct {
+	cfg             config.Config
+	store           apiKeyStore
+	usageTouchSlots chan struct{}
+}
+
+const maxConcurrentAPIKeyUsageTouches = 32
+
 func NewAPIKeyVerifier(cfg config.Config, store *postgres.Connector) *APIKeyVerifier {
-	return &APIKeyVerifier{cfg: cfg, store: store}
+	if store == nil {
+		return newAPIKeyVerifier(cfg, nil)
+	}
+	return newAPIKeyVerifier(cfg, store)
+}
+
+func newAPIKeyVerifier(cfg config.Config, store apiKeyStore) *APIKeyVerifier {
+	return &APIKeyVerifier{
+		cfg:             cfg,
+		store:           store,
+		usageTouchSlots: make(chan struct{}, maxConcurrentAPIKeyUsageTouches),
+	}
 }
 
 func (v *APIKeyVerifier) Require(ctx context.Context, r *http.Request) (*APIKeyRecord, error) {
@@ -88,7 +108,8 @@ func (v *APIKeyVerifier) Verify(ctx context.Context, token string) (*APIKeyRecor
 	if v.store == nil {
 		return nil, nil
 	}
-	row, err := v.store.FindAPIKeyByHash(ctx, hashKey(token))
+	h := hashKey(token)
+	row, err := v.store.FindAPIKeyByHash(ctx, h)
 	if err != nil || row == nil || !row.Enabled {
 		return nil, err
 	}
@@ -101,8 +122,25 @@ func (v *APIKeyVerifier) Verify(ctx context.Context, token string) (*APIKeyRecor
 		RequestCount: row.RequestCount,
 		LastUsedAt:   row.LastUsedAt,
 	}
-	_ = v.store.TouchAPIKeyUsage(ctx, rec.ID)
+	v.touchAPIKeyUsage(rec.ID)
 	return rec, nil
+}
+
+func (v *APIKeyVerifier) touchAPIKeyUsage(id string) {
+	if v == nil || v.store == nil || id == "" || id == "env" {
+		return
+	}
+	select {
+	case v.usageTouchSlots <- struct{}{}:
+	default:
+		return
+	}
+	go func() {
+		defer func() { <-v.usageTouchSlots }()
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
+		_ = v.store.TouchAPIKeyUsage(ctx, id)
+	}()
 }
 
 func tokenFromRequest(r *http.Request) string {

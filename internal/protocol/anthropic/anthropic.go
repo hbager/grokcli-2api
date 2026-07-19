@@ -3,6 +3,7 @@ package anthropic
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
 )
@@ -48,7 +49,27 @@ func Completion(messageID, model, content, reasoning, finish string, calls []Too
 	emittedTools := 0
 	for _, call := range calls {
 		name := toolcall.CanonicalName(call.Name, allowed)
-		arguments := toolcall.EffectiveJSON(call.Arguments, name)
+		// Non-stream end-of-turn: force-finish like stream Finish(). Without
+		// CoerceCompleteJSON, path+old omit of new_string (true delete-match)
+		// is dropped and Claude Code sees end_turn instead of tool_use.
+		arguments := toolcall.CoerceCompleteJSON(call.Arguments, name)
+		if name == "" || !toolcall.CompleteJSON(arguments, name) {
+			// Retry under Edit after Update→Edit rename race / alias recovery.
+			for _, tryName := range []string{
+				toolcall.CanonicalName("Edit", allowed),
+				"Edit",
+			} {
+				tryName = strings.TrimSpace(tryName)
+				if tryName == "" || tryName == name {
+					continue
+				}
+				if coerced := toolcall.CoerceCompleteJSON(call.Arguments, tryName); toolcall.CompleteJSON(coerced, tryName) {
+					name = tryName
+					arguments = coerced
+					break
+				}
+			}
+		}
 		if name == "" || !toolcall.CompleteJSON(arguments, name) {
 			continue
 		}
@@ -107,6 +128,11 @@ func TerminalError(message, errorType string) []string {
 	if errorType == "" {
 		errorType = "api_error"
 	}
+	if message == "" {
+		message = "request failed"
+	}
+	// Always close the Anthropic SSE envelope so Claude Code leaves "running"
+	// and tool loops can surface the failure instead of hanging on an open stream.
 	return []string{
 		event("error", map[string]any{
 			"type": "error", "error": map[string]any{"type": errorType, "message": message},

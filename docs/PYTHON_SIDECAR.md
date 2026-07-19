@@ -34,6 +34,7 @@ Go owns the public API and most admin control plane.
 | `POST /admin/api/accounts/register-email` | `POST /internal/registration/v1/jobs` |
 | `GET  /admin/api/accounts/register-email/*` | `/internal/registration/v1/sessions|batches|...` |
 | `POST /admin/api/accounts/import-sso` | `POST /internal/sso/v1/import` |
+| `GET/PUT /admin/api/accounts/register-email/config` | Go owns DB settings (`registration_config`) |
 | `GET  /admin/api/accounts/import-sso/jobs/{id}` | `GET /internal/sso/v1/jobs/{id}` |
 
 Captcha is **not** exposed on the public admin port. Registration workers call the local solver at `GROK2API_LOCAL_SOLVER_URL` (default `http://127.0.0.1:5072`).
@@ -70,7 +71,7 @@ GROK2API_YESCAPTCHA_KEY=...
 | Registration orchestration | `grok2api/upstream/grok_build_adapter.py` |
 | Protocol client | `grok-build-auth/xconsole_client/*` |
 | Mailbox providers | `grok2api/upstream/moemail.py` |
-| SSO cookie → token | `scripts/sso_to_auth_json.py` |
+| SSO cookie → token | `scripts/sso_to_auth_json.py` + `grok2api/admin/sso_import.py` |
 | Sidecar HTTP | `scripts/registration_service.py` |
 | Captcha browser pool | `turnstile-solver/api_solver.py` |
 | Go client | `internal/registration/client` |

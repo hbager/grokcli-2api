@@ -56,11 +56,11 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.RequireSharedStores || !cfg.RequireMigrations {
 		t.Fatal("shared stores and migrations must default to required")
 	}
-	if cfg.Runtime != "go" || cfg.StoreBackend != "hybrid" || cfg.GoOwnershipMode != "disabled" || cfg.RequireAPIKey != "auto" {
-		t.Fatalf("unexpected staged defaults: runtime=%s store=%s ownership=%s auth=%s", cfg.Runtime, cfg.StoreBackend, cfg.GoOwnershipMode, cfg.RequireAPIKey)
+	if cfg.Runtime != "go" || cfg.StoreBackend != "hybrid" || cfg.GoOwnershipMode != "all" || cfg.RequireAPIKey != "auto" {
+		t.Fatalf("unexpected defaults: runtime=%s store=%s ownership=%s auth=%s", cfg.Runtime, cfg.StoreBackend, cfg.GoOwnershipMode, cfg.RequireAPIKey)
 	}
-	if cfg.GoWrites || cfg.GoChat || cfg.GoAdminWrite {
-		t.Fatal("Go route/write flags must default to off")
+	if !cfg.GoWrites || !cfg.GoChat || !cfg.GoAdminWrite || !cfg.GoPublicRead || !cfg.GoMessages || !cfg.GoResponses || !cfg.GoAdminRead || !cfg.GoMaintainer {
+		t.Fatal("Go route/write flags must default to on after Python main removal")
 	}
 	if cfg.OutboundMaxTools != 1 {
 		t.Fatalf("outbound max tools default = %d", cfg.OutboundMaxTools)
@@ -76,6 +76,15 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.OutboundToolGapNative != 0 {
 		t.Fatalf("native tool gap default = %s", cfg.OutboundToolGapNative)
+	}
+	if !cfg.StickyFirstOnly {
+		t.Fatal("StickyFirstOnly must default to on for Codex TTFT")
+	}
+	if cfg.FirstByteProbeWorkers != 3 {
+		t.Fatalf("FirstByteProbeWorkers default=%d want 3", cfg.FirstByteProbeWorkers)
+	}
+	if !cfg.CodexForceReasoningLow {
+		t.Fatal("CodexForceReasoningLow must default to on")
 	}
 }
 
@@ -128,5 +137,12 @@ func TestLoadRejectsInvalidEnum(t *testing.T) {
 	t.Setenv("GROK2API_GO_OWNERSHIP_MODE", "maybe")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected invalid ownership mode error")
+	}
+}
+
+func TestLoadRejectsPythonRuntime(t *testing.T) {
+	t.Setenv("GROK2API_RUNTIME", "python")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected GROK2API_RUNTIME=python to be rejected after public Python main removal")
 	}
 }

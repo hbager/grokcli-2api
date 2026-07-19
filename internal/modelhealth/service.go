@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hm2899/grokcli-2api/internal/pool"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/store/redis"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
@@ -21,12 +23,12 @@ import (
 
 // Default probe knobs mirror Python grok2api.pool.model_health.
 const (
-	defaultWorkers            = 4
-	defaultBatch              = 30
+	defaultWorkers            = 8
+	defaultBatch              = 50
 	defaultMaxModelsPerAcct   = 2
 	defaultCycleBudget        = 150 * time.Second
 	defaultManualCycleBudget  = 150 * time.Second
-	defaultProbeTimeout       = 20 * time.Second
+	defaultProbeTimeout       = 15 * time.Second
 	defaultManualAccountLimit = 5000
 	// Multi-wave manual_all: keep each wave short (lock-friendly) but continue
 	// until the live pool is covered or maxWaves is hit.
@@ -100,18 +102,19 @@ func New(store *postgres.Connector, redisClient *redis.Client, upstream string, 
 		stop:                make(chan struct{}),
 		runSoon:             make(chan struct{}, 1),
 		last:                map[string]any{"ok": true, "started": false},
-		httpClient:          newProbeHTTPClient(),
+		httpClient:          newProbeHTTPClient(nil),
 		job:                 map[string]any{"running": false},
 		localSweepCovered:   map[string]struct{}{},
 	}
 }
 
-func newProbeHTTPClient() *http.Client {
+func newProbeHTTPClient(proxy func(*http.Request) (*url.URL, error)) *http.Client {
 	// Shared client for dense probe batches: reuse TLS/TCP across accounts.
 	// Sized for MODEL_PROBE_WORKERS up to 32 without thrashing the dialer.
 	return &http.Client{
 		Timeout: defaultProbeTimeout,
 		Transport: &http.Transport{
+			Proxy:                 proxy,
 			MaxIdleConns:          128,
 			MaxIdleConnsPerHost:   64,
 			MaxConnsPerHost:       96,
@@ -130,19 +133,28 @@ func newProbeHTTPClient() *http.Client {
 
 func (s *Service) probeHTTP() *http.Client {
 	if s == nil {
-		return newProbeHTTPClient()
-	}
-	// httpClient is set in New and only replaced under rare config reloads;
-	// read without lock on the hot probe path to avoid worker contention.
-	if c := s.httpClient; c != nil {
-		return c
+		return newProbeHTTPClient(nil)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.httpClient == nil {
-		s.httpClient = newProbeHTTPClient()
+		s.httpClient = newProbeHTTPClient(nil)
 	}
 	return s.httpClient
+}
+
+func (s *Service) SetProxy(proxy func(*http.Request) (*url.URL, error)) {
+	if s == nil {
+		return
+	}
+	next := newProbeHTTPClient(proxy)
+	s.mu.Lock()
+	previous := s.httpClient
+	s.httpClient = next
+	s.mu.Unlock()
+	if previous != nil {
+		previous.CloseIdleConnections()
+	}
 }
 
 func (s *Service) Start() {
@@ -322,8 +334,10 @@ func (s *Service) StartProbeAll() map[string]any {
 	s.jobCancel = cancel
 	s.jobRunning = true
 	started := time.Now()
+	jobID := "manual_all:" + time.Now().UTC().Format("20060102T150405")
 	s.job = map[string]any{
 		"ok": true, "running": true, "source": "manual_all",
+		"job_id": jobID, "task_id": "probe:" + jobID,
 		"started_at": started.Unix(), "wave": 0, "waves": 0,
 		"probed": 0, "available": 0, "failed": 0,
 		"implementation": "go",
@@ -529,6 +543,13 @@ func (s *Service) runManualAll(ctx context.Context, source string) map[string]an
 		"available", totalAvailable, "failed", totalFailed,
 		"covered", covered, "remaining", remaining, "elapsed_ms", result["elapsed_ms"],
 	)
+	// Merge multi-wave progress into one task_logs row via stable job_id.
+	s.jobMu.Lock()
+	if jid, ok := s.job["job_id"].(string); ok && jid != "" {
+		result["job_id"] = jid
+		result["task_id"] = "probe:" + jid
+	}
+	s.jobMu.Unlock()
 	s.writeTaskLog(ctx, source, result)
 	return result
 }
@@ -618,8 +639,8 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool) m
 	}
 	if manualWave {
 		boosted := workers * 2
-		if boosted > 8 {
-			boosted = 8
+		if boosted > 16 {
+			boosted = 16
 		}
 		if boosted < workers {
 			boosted = workers
@@ -912,14 +933,53 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 					base["auto_disabled"] = true
 				}
 			case isFreeUsageExhausted(errText) || status == 429:
-				until := time.Now().Add(2 * time.Hour)
-				if e := s.Store.BlockPoolModel(ctx, auth.ID, model, &until); e == nil {
-					base["model_blocked"] = true
-				} else {
-					sec := 600.0
-					if _, e2 := s.Store.KickFromPool(ctx, auth.ID, errText, &sec); e2 == nil {
-						base["kicked_cooldown"] = true
+				// Classify: free-usage -> account cool only; bare 429 -> short cool.
+				// Free-usage must NOT write blocked_models (cool only; keep other models usable).
+				decision := pool.ClassifyUpstreamFailure(status, errText, model)
+				until := time.Now().Add(10 * time.Minute)
+				if decision.Until != nil {
+					until = *decision.Until
+				} else if decision.Class == pool.ClassFreeUsage {
+					until = time.Now().Add(2 * time.Hour)
+				}
+				// Cap cool window so probe storms cannot pin an account for days.
+				maxUntil := time.Now().Add(6 * time.Hour)
+				if until.After(maxUntil) {
+					until = maxUntil
+				}
+				// Only soft-block model when classifier explicitly asks AND this is NOT free-usage.
+				if decision.BlockModel && decision.Class != pool.ClassFreeUsage {
+					blockModel := model
+					if decision.Model != "" {
+						blockModel = decision.Model
 					}
+					if blockModel != "" {
+						if e := s.Store.BlockPoolModel(ctx, auth.ID, blockModel, &until); e == nil {
+							base["model_blocked"] = true
+							base["blocked_model"] = blockModel
+						}
+					}
+				}
+				sec := until.Sub(time.Now()).Seconds()
+				if sec < 60 {
+					sec = 60
+				}
+				if sec > 6*3600 {
+					sec = 6 * 3600
+				}
+				// Prefer classifier code in reason so KickFromPool clears free-usage model blocks.
+				kickReason := errText
+				if decision.Code != "" && !strings.Contains(strings.ToLower(errText), strings.ToLower(decision.Code)) {
+					kickReason = decision.Code + ": " + errText
+				}
+				if _, e2 := s.Store.KickFromPool(ctx, auth.ID, kickReason, &sec); e2 == nil {
+					base["kicked_cooldown"] = true
+					base["cooldown_code"] = decision.Code
+					base["failure_class"] = string(decision.Class)
+				}
+				// Free-usage: ensure no leftover model soft-block from older probes.
+				if decision.Class == pool.ClassFreeUsage {
+					_ = s.Store.UnblockPoolModel(ctx, auth.ID, "")
 				}
 			case status >= 500:
 				sec := 300.0
@@ -1294,7 +1354,15 @@ func (s *Service) writeTaskLog(ctx context.Context, source string, result map[st
 		return
 	}
 	probed := intOf(result["probed"])
-	if probed == 0 && intOf(result["count"]) == 0 && source == "background" {
+	count := intOf(result["count"])
+	if count == 0 {
+		count = probed
+	}
+	available := intOf(result["available_count"])
+	if available == 0 {
+		available = intOf(result["available"])
+	}
+	if probed == 0 && count == 0 && source == "background" {
 		return
 	}
 	okVal := result["ok"] != false
@@ -1302,24 +1370,70 @@ func (s *Service) writeTaskLog(ctx context.Context, source string, result map[st
 	if result["ok"] == false {
 		status = "error"
 		okVal = false
-	} else if result["budget_hit"] == true || intOf(result["deferred"]) > 0 {
-		status = "partial"
+	} else if result["budget_hit"] == true || intOf(result["deferred"]) > 0 || intOf(result["unavailable_count"]) > 0 {
+		// partial when some accounts failed/deferred but overall job completed
+		if result["ok"] != false {
+			status = "partial"
+		}
 	}
-	summary := "模型探测[" + source + "]：可用 " + itoa(intOf(result["available_count"])) + "/" + itoa(intOf(result["count"]))
+	// Prefer account-level progress for multi-wave (probed accounts), fall back to probe count.
+	progressTotal := probed
+	if progressTotal == 0 {
+		progressTotal = count
+	}
+	progressDone := available
+	if progressDone > progressTotal && progressTotal > 0 {
+		// available is per-probe; clamp display to total accounts when multi-model.
+		// Keep raw numbers in detail.
+	}
+	summary := "模型探测[" + source + "]：可用 " + itoa(available) + "/" + itoa(progressTotal)
+	if count > 0 && count != progressTotal {
+		summary += "（探测 " + itoa(count) + " 次）"
+	}
 	if intOf(result["kick_cooldown"])+intOf(result["kick_disabled"]) > 0 {
 		summary += " · 冷却踢出 " + itoa(intOf(result["kick_cooldown"])) + " · 禁用 " + itoa(intOf(result["kick_disabled"]))
 	}
 	if intOf(result["model_blocked_count"]) > 0 {
 		summary += " · 模型封禁 " + itoa(intOf(result["model_blocked_count"]))
 	}
+	if intOf(result["waves"]) > 0 {
+		summary += " · 波次 " + itoa(intOf(result["waves"]))
+	}
+	if intOf(result["recovered"]) > 0 {
+		summary += " · 恢复 " + itoa(intOf(result["recovered"]))
+	}
 	detail := map[string]any{}
-	for _, k := range []string{"probed", "count", "available_count", "unavailable_count", "kick_cooldown", "kick_disabled", "model_blocked_count", "workers", "waves", "budget_hit", "models", "source", "elapsed_ms", "sweep"} {
+	for _, k := range []string{
+		"probed", "count", "available", "available_count", "unavailable_count", "failed",
+		"kick_cooldown", "kick_disabled", "model_blocked_count", "recovered",
+		"workers", "waves", "budget_hit", "models", "source", "elapsed_ms", "sweep",
+		"failed_sample", "ok",
+	} {
 		if v, ok := result[k]; ok {
 			detail[k] = v
 		}
 	}
+	// Stable task_id so multi-wave / progress updates merge into one row when job id is known.
+	taskID := "probe:" + source
+	if jid, ok := result["job_id"].(string); ok && strings.TrimSpace(jid) != "" {
+		taskID = "probe:" + strings.TrimSpace(jid)
+	} else if jid, ok := result["task_id"].(string); ok && strings.TrimSpace(jid) != "" {
+		taskID = strings.TrimSpace(jid)
+	}
+	// For background cycles, keep one rolling row per day+source so UI isn't flooded,
+	// but still update the same row within the day.
+	if source == "background" {
+		taskID = "probe:background:" + time.Now().Format("2006-01-02")
+	}
+	finished := true
+	if result["running"] == true || status == "running" || status == "queued" {
+		finished = false
+		if status == "done" {
+			status = "running"
+		}
+	}
 	okPtr := okVal
-	_, _ = s.Store.WriteTask(ctx, "probe", status, summary, "probe:"+source, &okPtr, detail, intOf(result["available_count"]), intOf(result["count"]), true)
+	_, _ = s.Store.WriteTask(ctx, "probe", status, summary, taskID, &okPtr, detail, progressDone, progressTotal, finished)
 }
 
 func itoa(n int) string {
@@ -1327,11 +1441,7 @@ func itoa(n int) string {
 }
 
 func isFreeUsageExhausted(errText string) bool {
-	t := strings.ToLower(errText)
-	return strings.Contains(t, "free-usage-exhausted") ||
-		strings.Contains(t, "free usage") ||
-		strings.Contains(t, "额度耗尽") ||
-		(strings.Contains(t, "quota") && strings.Contains(t, "exhaust"))
+	return pool.IsFreeUsageExhausted(errText)
 }
 
 func firstModel(models []string) string {

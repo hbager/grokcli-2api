@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -24,6 +26,18 @@ var required = map[string][]string{
 	"notebookedit":  {"notebook_path", "new_source"},
 	"bash":          {"command"},
 	"shell":         {"command"},
+	"localshell":    {"command"},
+	"local_shell":   {"command"},
+	"exec":          {"command"},
+	"execcommand":   {"command"},
+	"exec_command":  {"command"},
+	"run":           {"command"},
+	"runcommand":    {"command"},
+	"run_command":   {"command"},
+	"shellcommand":  {"command"},
+	"shell_command": {"command"},
+	"applypatch":    {"input"},
+	"apply_patch":   {"input"},
 	"grep":          {"pattern"},
 	"glob":          {"pattern"},
 	"webfetch":      {"url"},
@@ -41,12 +55,46 @@ var aliases = map[string]string{
 	"path": "file_path", "filepath": "file_path", "file": "file_path", "filename": "file_path",
 	"target_file": "file_path", "targetfile": "file_path", "targetpath": "file_path", "target_path": "file_path", "file_name": "file_path",
 	"oldstring": "old_string", "oldstr": "old_string", "oldtext": "old_string", "old": "old_string", "old_text": "old_string", "original": "old_string", "original_text": "old_string",
+	"from": "old_string", "from_string": "old_string", "find": "old_string", "find_string": "old_string", "match": "old_string", "match_string": "old_string",
 	"newstring": "new_string", "newstr": "new_string", "newtext": "new_string", "new": "new_string", "new_text": "new_string", "replacement": "new_string", "replace_with": "new_string",
+	"to": "new_string", "to_string": "new_string", "with": "new_string", "with_string": "new_string", "replacement_text": "new_string",
 	"contents": "content", "filecontent": "content", "file_content": "content", "filecontents": "content",
 	"notebookpath": "notebook_path", "notebook": "notebook_path",
-	"cmd": "command", "shell_command": "command",
+	"cmd": "command", "shell_command": "command", "argv": "command", "args": "command", "cmdline": "command", "command_line": "command", "script": "command",
+	"bash": "command", "line": "command",
+	"patch": "input", "diff": "input", "patch_text": "input", "patch_input": "input",
 	"q": "query", "search": "query", "search_query": "query",
 	"uri": "url", "href": "url", "regex": "pattern", "glob_pattern": "pattern",
+}
+
+// Edit/Update-only aliases. Keep global "search"→query for Grep; map search/replace
+// only when the tool is an edit rewrite (Grok often emits search/replace for Update).
+var editOnlyAliases = map[string]string{
+	"search": "old_string", "search_string": "old_string", "searchtext": "old_string", "search_text": "old_string",
+	"searchfor": "old_string", "search_for": "old_string", "findtext": "old_string", "find_text": "old_string",
+	"replace": "new_string", "replacestring": "new_string", "replace_string": "new_string", "replacetext": "new_string", "replace_text": "new_string",
+	"replacewith": "new_string", "replace_with": "new_string", "replacementtext": "new_string",
+	"content": "new_string", "contents": "new_string",
+	"text": "new_string", "body": "new_string", "value": "new_string",
+	"old": "old_string", "original": "old_string", "src": "old_string", "source": "old_string",
+	"oldcode": "old_string", "old_code": "old_string", "oldsnippet": "old_string",
+	"newcode": "new_string", "new_code": "new_string", "newsnippet": "new_string",
+	"before": "old_string", "after": "new_string",
+	"target": "file_path", "targetfile": "file_path", "target_file": "file_path",
+}
+
+// weakEditAliasSources never overwrite an already-set value that came from a real
+// schema key (or a stronger alias). Grok often appends content/text chatter after a
+// valid new_string; taking it as later-wins produced wrong Edit text / invalid params.
+var weakEditAliasSources = map[string]bool{
+	"content": true, "contents": true, "text": true, "body": true, "value": true,
+	"explanation": true, "reason": true, "comment": true, "message": true, "note": true,
+}
+
+func isWeakEditAliasSource(rawKey string) bool {
+	folded := nonName.ReplaceAllString(strings.ToLower(strings.TrimSpace(rawKey)), "")
+	alnum := strings.ReplaceAll(folded, "_", "")
+	return weakEditAliasSources[folded] || weakEditAliasSources[alnum]
 }
 
 var editAliases = map[string]bool{
@@ -126,6 +174,45 @@ func canonicalArgKey(key string) string {
 	return raw
 }
 
+func canonicalArgKeyForTool(key, toolName string) string {
+	raw := strings.TrimSpace(key)
+	folded := nonName.ReplaceAllString(strings.ToLower(raw), "")
+	alnum := strings.ReplaceAll(folded, "_", "")
+	// Edit-family tools: allow search/replace/content → old/new_string.
+	if isEditTool(toolName) {
+		if alias, ok := editOnlyAliases[folded]; ok {
+			return alias
+		}
+		if alias, ok := editOnlyAliases[alnum]; ok {
+			return alias
+		}
+	}
+	return canonicalArgKey(key)
+}
+
+func isEditTool(name string) bool {
+	key := nameKey(name)
+	if key == "edit" || editAliases[key] {
+		return true
+	}
+	if key == "update" || key == "strreplace" || key == "replace" {
+		return true
+	}
+	if protectedNames[key] {
+		return false
+	}
+	if strings.Contains(key, "strreplace") || strings.Contains(key, "stringreplace") {
+		return true
+	}
+	if strings.HasSuffix(key, "edit") || strings.HasSuffix(key, "update") {
+		if key == "evaluate" || strings.Contains(key, "evaluat") {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
 type chosenValue struct {
 	value     any
 	canonical bool
@@ -133,12 +220,22 @@ type chosenValue struct {
 
 // NormalizeObject renames common alternate tool-arg keys to Claude Code schema
 // names. Later conflicting non-empty values win (authoritative rewrite).
+// Prefer NormalizeObjectForTool when the tool name is known (Edit/Update aliases).
 func NormalizeObject(input map[string]any) map[string]any {
+	return NormalizeObjectForTool(input, "")
+}
+
+// NormalizeObjectForTool is like NormalizeObject but applies tool-specific aliases
+// (e.g. Update/Edit: search/replace → old_string/new_string). Missing new_string
+// is left absent; call CoerceCompleteJSON / fillEditNewStringDefault at force-finish.
+func NormalizeObjectForTool(input map[string]any, toolName string) map[string]any {
 	chosen := make(map[string]chosenValue, len(input))
 	// Preserve insertion order of first-seen canonical keys for stable encode.
 	order := make([]string, 0, len(input))
 	for raw, value := range input {
-		canonical := canonicalArgKey(raw)
+		// Unwrap accidental JSON-string values: {"file_path":""/x""} / nested JSON.
+		value = unwrapJSONStringValue(value)
+		canonical := canonicalArgKeyForTool(raw, toolName)
 		current, exists := chosen[canonical]
 		if !exists {
 			order = append(order, canonical)
@@ -159,8 +256,23 @@ func NormalizeObject(input map[string]any) map[string]any {
 			}
 			continue
 		}
-		// Different non-empty values: later wins.
-		chosen[canonical] = chosenValue{value: value, canonical: raw == canonical}
+		// Conflict policy (must match NormalizeJSON ordered decode):
+		// - weak chatter (content/text/body/explanation) never overwrites non-empty values
+		// - prefer real schema keys over non-path aliases (new_string beats replace/content)
+		// - path aliases still later-win (path flip-form: file_path then path → path)
+		incomingCanonical := raw == canonical
+		if isWeakEditAliasSource(raw) && !empty(current.value) {
+			continue
+		}
+		if current.canonical && !incomingCanonical && !isPathArgKey(raw) {
+			continue
+		}
+		if !current.canonical && incomingCanonical {
+			chosen[canonical] = chosenValue{value: value, canonical: true}
+			continue
+		}
+		// Different non-empty values: later wins (path flip-form, rewrite deltas).
+		chosen[canonical] = chosenValue{value: value, canonical: incomingCanonical}
 	}
 	out := make(map[string]any, len(chosen))
 	for _, key := range order {
@@ -174,7 +286,551 @@ func NormalizeObject(input map[string]any) map[string]any {
 			out[key] = value.value
 		}
 	}
+	return applyEditDefaults(out, toolName)
+}
+
+// editClientKeys are the only fields Claude Code Edit accepts. Extra Grok
+// chatter (explanation/mode/content/query) triggers "Invalid tool parameters".
+var editClientKeys = map[string]bool{
+	"file_path":   true,
+	"old_string":  true,
+	"new_string":  true,
+	"replace_all": true,
+}
+
+// densifyEditObject keeps only Claude Code Edit schema fields.
+func densifyEditObject(obj map[string]any) map[string]any {
+	if obj == nil {
+		return nil
+	}
+	out := make(map[string]any, 4)
+	for _, key := range []string{"file_path", "old_string", "new_string"} {
+		if v, ok := obj[key]; ok {
+			out[key] = v
+		}
+	}
+	if v, ok := obj["replace_all"]; ok && v != nil {
+		switch b := v.(type) {
+		case bool:
+			out["replace_all"] = b
+		case string:
+			switch strings.TrimSpace(strings.ToLower(b)) {
+			case "true", "1", "yes":
+				out["replace_all"] = true
+			case "false", "0", "no":
+				out["replace_all"] = false
+			}
+		case float64:
+			out["replace_all"] = b != 0
+		case json.Number:
+			if n, err := b.Int64(); err == nil {
+				out["replace_all"] = n != 0
+			}
+		}
+	}
 	return out
+}
+
+// unwrapPathValue flattens nested path objects Grok sometimes emits:
+// {"file_path":{"path":"/x"}} → "/x".
+func unwrapPathValue(v any) any {
+	switch t := v.(type) {
+	case string:
+		return t
+	case map[string]any:
+		for _, k := range []string{"file_path", "path", "target_file", "targetfile", "filepath", "file"} {
+			if s, ok := t[k].(string); ok && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s)
+			}
+		}
+		// Nested once more (rare).
+		for _, k := range []string{"file_path", "path", "target_file"} {
+			if nested, ok := t[k].(map[string]any); ok {
+				if s := unwrapPathValue(nested); s != nil {
+					if ss, ok := s.(string); ok && strings.TrimSpace(ss) != "" {
+						return strings.TrimSpace(ss)
+					}
+				}
+			}
+		}
+	}
+	return v
+}
+
+// fillEditNewStringDefault sets missing new_string to "" when path+old are present.
+// Used at force-finish (CoerceCompleteJSON) so stream Merge does not invent empty
+// new_string mid-turn when replace has not arrived yet.
+func fillEditNewStringDefault(obj map[string]any, toolName string) map[string]any {
+	if obj == nil || !isEditTool(toolName) {
+		return obj
+	}
+	fp, _ := obj["file_path"].(string)
+	old, hasOld := obj["old_string"]
+	if strings.TrimSpace(fp) == "" || !hasOld || old == nil {
+		return obj
+	}
+	if _, hasNew := obj["new_string"]; !hasNew {
+		obj["new_string"] = ""
+	}
+	return obj
+}
+
+// applyEditDefaults coerces path/old/new types for Edit/Update. Does NOT invent
+// missing new_string during mid-stream merges (see fillEditNewStringDefault).
+func applyEditDefaults(obj map[string]any, toolName string) map[string]any {
+	if obj == nil {
+		return obj
+	}
+	if isEditTool(toolName) {
+		// Recover keys poisoned when args were normalized before the tool name
+		// was known: global alias maps search→query (Grep), so a nameless Merge
+		// of Update search/replace becomes query/replace and never maps to
+		// old_string. Promote leftovers once we know this is an edit tool.
+		recoverEditPoisonedKeys(obj)
+
+		if v, ok := obj["file_path"]; ok && v != nil {
+			v = unwrapPathValue(v)
+			obj["file_path"] = v
+			if _, isStr := v.(string); !isStr {
+				s := strings.TrimSpace(stringify(v))
+				if s != "" && s != "null" && s != "{}" && s != "[]" {
+					obj["file_path"] = s
+				}
+			}
+		}
+		for _, k := range []string{"old_string", "new_string"} {
+			v, ok := obj[k]
+			if !ok || v == nil {
+				continue
+			}
+			if _, isStr := v.(string); isStr {
+				continue
+			}
+			switch v.(type) {
+			case map[string]any, []any:
+				// leave complex (rare nested edits) — densify will still type-check
+			default:
+				obj[k] = stringify(v)
+			}
+		}
+		// Strip Grok chatter / leftover aliases so Claude Code never sees
+		// explanation/mode/content/query and rejects with "Invalid tool parameters".
+		dense := densifyEditObject(obj)
+		// Mutate in place so callers sharing the map see densified keys.
+		for k := range obj {
+			if !editClientKeys[k] {
+				delete(obj, k)
+			}
+		}
+		for k, v := range dense {
+			obj[k] = v
+		}
+		// Intentionally do NOT invent missing new_string here.
+		// Mid-stream Merge/Normalize must wait for an explicit new_string/replace
+		// (or force-finish via CoerceCompleteJSON → fillEditNewStringDefault).
+		// Premature "" defaults caused Claude Code to accept a delete-match Edit
+		// before Grok finished streaming the real replacement, then drop the
+		// late args (tool already stopped) — intermittent Update failures.
+	}
+	return applyShellDefaults(obj, toolName)
+}
+
+// recoverEditPoisonedKeys remaps leftover Grep/generic aliases onto Edit schema
+// when the tool is known to be Edit/Update. Safe only for isEditTool names.
+func recoverEditPoisonedKeys(obj map[string]any) {
+	if obj == nil {
+		return
+	}
+	// old_string: search was often rewritten to query under empty tool name.
+	if v, ok := obj["old_string"]; !ok || empty(v) {
+		for _, alt := range []string{
+			"query", "search", "search_string", "search_text", "searchfor", "search_for",
+			"find", "find_string", "find_text", "match", "match_string",
+		} {
+			if av, exists := obj[alt]; exists && !empty(av) {
+				obj["old_string"] = av
+				delete(obj, alt)
+				break
+			}
+		}
+	}
+	// Drop residual search aliases so clients never see query+old_string together.
+	for _, alt := range []string{
+		"query", "search", "search_string", "search_text", "searchfor", "search_for",
+		"find", "find_string", "find_text", "match", "match_string",
+	} {
+		if _, has := obj["old_string"]; has {
+			delete(obj, alt)
+		}
+	}
+	// new_string: promote aliases only when missing. Prefer replace* over content
+	// (content is a common Grok chatter key that must not clobber real new_string).
+	if _, hasNew := obj["new_string"]; !hasNew {
+		for _, alt := range []string{
+			"replace", "replacement", "replace_with", "replacewith", "replace_string",
+			"contents", "text", "body", "value", "to", "to_string", "with",
+			"content", // last: weaker fallback
+		} {
+			if av, exists := obj[alt]; exists && av != nil {
+				obj["new_string"] = av
+				delete(obj, alt)
+				break
+			}
+		}
+	}
+	// Always drop leftover aliases — even when new_string already present —
+	// so densify is not the only line of defense against Invalid tool parameters.
+	for _, alt := range []string{
+		"replace", "replacement", "replace_with", "replacewith", "replace_string",
+		"content", "contents", "text", "body", "value", "to", "to_string", "with",
+		"explanation", "mode", "reason", "comment", "notes", "description",
+	} {
+		delete(obj, alt)
+	}
+}
+
+func isShellTool(name string) bool {
+	key := nameKey(name)
+	// Namespaced forms: "default_api.exec_command", "functions.Shell", "mcp__shell".
+	if i := strings.LastIndex(key, "."); i >= 0 && i+1 < len(key) {
+		key = key[i+1:]
+	}
+	// Strip common prefixes that survive nameKey (mcp, tool, fn).
+	for _, prefix := range []string{"mcp", "tool", "fn", "function"} {
+		if strings.HasPrefix(key, prefix) && len(key) > len(prefix) {
+			// only strip when remainder still looks shell-like
+			rest := key[len(prefix):]
+			if isShellToolKey(rest) {
+				return true
+			}
+		}
+	}
+	return isShellToolKey(key)
+}
+
+func isShellToolKey(key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	switch key {
+	case "bash", "shell", "localshell", "exec", "run", "sh", "zsh", "powershell",
+		"execcommand", "runcommand", "shellcommand", "localshellcommand":
+		return true
+	default:
+		// Codex / agent shells often use compound names: exec_command, run_command,
+		// shell_command, local_shell, *_shell, shell_*, exec_*.
+		if strings.HasSuffix(key, "shell") || strings.HasSuffix(key, "command") {
+			if strings.Contains(key, "shell") || strings.Contains(key, "exec") ||
+				strings.Contains(key, "bash") || strings.Contains(key, "run") ||
+				strings.HasPrefix(key, "cmd") {
+				return true
+			}
+		}
+		if strings.HasPrefix(key, "shell") || strings.HasPrefix(key, "exec") ||
+			strings.HasPrefix(key, "bash") || strings.HasPrefix(key, "run") {
+			return true
+		}
+		return false
+	}
+}
+
+// IsShellTool reports whether name is a shell-family tool (bash/shell/exec/...).
+func IsShellTool(name string) bool { return isShellTool(name) }
+
+// NameKey returns the normalized alnum-only tool name key used for alias maps.
+func NameKey(name string) string { return nameKey(name) }
+
+func isApplyPatchTool(name string) bool {
+	key := nameKey(name)
+	if key == "" {
+		return false
+	}
+	switch key {
+	case "applypatch", "apply_patch", "applydiff", "apply_diff", "applygitpatch", "apply_git_patch":
+		return true
+	}
+	// Namespaced / compound: *.apply_patch, apply_patch_v2, codex_apply_patch, ...
+	if strings.Contains(key, "applypatch") || strings.Contains(key, "apply_patch") {
+		return true
+	}
+	if strings.Contains(key, "applydiff") || strings.Contains(key, "apply_diff") {
+		return true
+	}
+	if strings.HasSuffix(key, "patch") && (strings.Contains(key, "apply") || strings.Contains(key, "git")) {
+		return true
+	}
+	return false
+}
+
+// applyShellDefaults flattens nested command argv and drops empty junk that
+// Grok sometimes emits for Codex shell tools: {"command":[[""]]}.
+// Also promotes common wrong parameter names (cmd/argv/args/...) onto "command"
+// so Codex stops retrying "参数名写错了".
+func applyShellDefaults(obj map[string]any, toolName string) map[string]any {
+	if obj == nil {
+		return obj
+	}
+	if isShellTool(toolName) {
+		// Prefer existing command; otherwise promote known aliases that may have
+		// survived earlier renames (or been double-keyed by the model).
+		if _, ok := obj["command"]; !ok {
+			for _, alt := range []string{"cmd", "argv", "args", "shell_command", "cmdline", "command_line", "script", "bash", "line"} {
+				if v, exists := obj[alt]; exists && !empty(v) {
+					obj["command"] = v
+					delete(obj, alt)
+					break
+				}
+			}
+		}
+		// Drop leftover alias keys so clients never see both cmd and command.
+		for _, alt := range []string{"cmd", "argv", "args", "shell_command", "cmdline", "command_line", "script", "bash", "line"} {
+			if _, ok := obj[alt]; ok {
+				// If command empty and alt has value, already handled above; always strip alias.
+				if empty(obj["command"]) && !empty(obj[alt]) {
+					obj["command"] = obj[alt]
+				}
+				delete(obj, alt)
+			}
+		}
+		if cmd, ok := obj["command"]; ok {
+			obj["command"] = normalizeShellCommand(cmd)
+			// After normalize, nil means incomplete — delete so CompleteJSON fails cleanly.
+			if obj["command"] == nil {
+				delete(obj, "command")
+			}
+		}
+	}
+	if isApplyPatchTool(toolName) {
+		aliases := []string{"patch", "diff", "patch_text", "patch_input", "content", "patch_content", "text", "body", "data", "code", "code_edit", "edit"}
+		if _, ok := obj["input"]; !ok {
+			for _, alt := range aliases {
+				if v, exists := obj[alt]; exists && !empty(v) {
+					obj["input"] = v
+					delete(obj, alt)
+					break
+				}
+			}
+		}
+		// Drop leftover aliases so clients never see both input and patch/diff.
+		for _, alt := range aliases {
+			if _, ok := obj[alt]; !ok {
+				continue
+			}
+			if empty(obj["input"]) && !empty(obj[alt]) {
+				obj["input"] = obj[alt]
+			}
+			delete(obj, alt)
+		}
+		if v, ok := obj["input"]; ok {
+			if s, ok := v.(string); ok {
+				obj["input"] = s
+			} else if v != nil {
+				if encoded, err := compactJSON(v); err == nil {
+					obj["input"] = encoded
+				} else {
+					obj["input"] = stringify(v)
+				}
+			}
+		}
+	}
+	return obj
+}
+
+// normalizeShellCommand always returns a non-empty string (or nil if incomplete).
+//
+// Codex exec_command / shell local schema requires:
+//
+//	cmd: string   (NOT an argv array)
+//
+// Grok often emits {"command":["ls","-la"]} or nested [["echo","hi"]]. Flatten
+// and join into a single shell string so clients stop rejecting with
+// "command 要字符串，不要 argv 数组".
+func normalizeShellCommand(value any) any {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return nil
+		}
+		// Unwrap accidental JSON-encoded argv: "[\"ls\",\"-la\"]"
+		if (strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]")) ||
+			(strings.HasPrefix(s, `"[`) && strings.Contains(s, `]`)) {
+			var arr []any
+			if json.Unmarshal([]byte(s), &arr) == nil {
+				if flat := flattenCommandParts(arr); len(flat) > 0 {
+					return joinShellArgv(flat)
+				}
+			}
+			var unquoted string
+			if json.Unmarshal([]byte(s), &unquoted) == nil {
+				unquoted = strings.TrimSpace(unquoted)
+				if unquoted != "" && unquoted[0] == '[' {
+					if json.Unmarshal([]byte(unquoted), &arr) == nil {
+						if flat := flattenCommandParts(arr); len(flat) > 0 {
+							return joinShellArgv(flat)
+						}
+					}
+				}
+			}
+		}
+		return s
+	case []any:
+		flat := flattenCommandParts(v)
+		if len(flat) == 0 {
+			return nil
+		}
+		return joinShellArgv(flat)
+	case []string:
+		tmp := make([]any, len(v))
+		for i, s := range v {
+			tmp[i] = s
+		}
+		return normalizeShellCommand(tmp)
+	default:
+		// Numbers / bools / objects: stringify; objects that are JSON arrays go through flatten.
+		if encoded, err := compactJSON(v); err == nil {
+			if strings.HasPrefix(encoded, "[") {
+				var arr []any
+				if json.Unmarshal([]byte(encoded), &arr) == nil {
+					flat := flattenCommandParts(arr)
+					if len(flat) == 0 {
+						return nil
+					}
+					return joinShellArgv(flat)
+				}
+			}
+		}
+		s := strings.TrimSpace(stringify(v))
+		if s == "" || s == "null" || s == "[]" || s == "{}" {
+			return nil
+		}
+		return s
+	}
+}
+
+// joinShellArgv joins argv parts into one shell command string.
+// Tokens that need quoting (spaces / quotes / meta) are single-quoted POSIX-style.
+func joinShellArgv(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, shellQuoteToken(p))
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, " ")
+}
+
+func shellQuoteToken(s string) string {
+	// Safe bare token: alnum + common path/flag chars.
+	safe := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.' || c == '/' || c == '=' || c == ':' || c == '@' || c == '+' || c == '%' {
+			continue
+		}
+		safe = false
+		break
+	}
+	if safe {
+		return s
+	}
+	// POSIX single-quote: 'foo'\''bar'
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func flattenCommandParts(parts []any) []string {
+	out := make([]string, 0, len(parts))
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case nil:
+			return
+		case string:
+			s := strings.TrimSpace(t)
+			if s != "" {
+				out = append(out, s)
+			}
+		case []any:
+			for _, item := range t {
+				walk(item)
+			}
+		case []string:
+			for _, item := range t {
+				walk(item)
+			}
+		default:
+			s := strings.TrimSpace(stringify(t))
+			if s != "" && s != "null" {
+				out = append(out, s)
+			}
+		}
+	}
+	for _, p := range parts {
+		walk(p)
+	}
+	return out
+}
+
+// shellCommandNonEmpty reports whether a normalized command value is usable.
+func shellCommandNonEmpty(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(v) != ""
+	case []any:
+		return len(flattenCommandParts(v)) > 0
+	case []string:
+		for _, s := range v {
+			if strings.TrimSpace(s) != "" {
+				return true
+			}
+		}
+		return false
+	default:
+		return strings.TrimSpace(stringify(v)) != ""
+	}
+}
+
+// unwrapJSONStringValue peels one layer of accidental JSON-encoded strings
+// (Grok sometimes double-encodes path/old/new as ""..."" or full JSON objects).
+func unwrapJSONStringValue(value any) any {
+	s, ok := value.(string)
+	if !ok {
+		return value
+	}
+	text := strings.TrimSpace(s)
+	if text == "" {
+		return value
+	}
+	// Double-quoted JSON string: ""/path"" or ""old text""
+	if len(text) >= 2 && text[0] == '"' {
+		var decoded string
+		if err := json.Unmarshal([]byte(text), &decoded); err == nil {
+			// Only unwrap when it changes something (avoid turning bare words into empty).
+			if decoded != text {
+				return decoded
+			}
+		}
+	}
+	// Nested JSON object/array encoded as string — leave for callers that expect strings;
+	// only unwrap when key is not a path/text field is handled above.
+	return value
 }
 
 // NormalizeJSON alias-normalizes a single JSON object string. Multi-object
@@ -197,31 +853,111 @@ func NormalizeJSON(raw string, toolName string) string {
 	chosen := make(map[string]chosenValue, len(pairs))
 	order := make([]string, 0, len(pairs))
 	for _, pair := range pairs {
-		canonical := canonicalArgKey(pair.key)
+		val := unwrapJSONStringValue(pair.value)
+		canonical := canonicalArgKeyForTool(pair.key, toolName)
 		current, exists := chosen[canonical]
 		if !exists {
 			order = append(order, canonical)
-			chosen[canonical] = chosenValue{value: pair.value, canonical: pair.key == canonical}
+			chosen[canonical] = chosenValue{value: val, canonical: pair.key == canonical}
 			continue
 		}
-		oldEmpty, newEmpty := empty(current.value), empty(pair.value)
+		oldEmpty, newEmpty := empty(current.value), empty(val)
 		if oldEmpty && !newEmpty {
-			chosen[canonical] = chosenValue{value: pair.value, canonical: pair.key == canonical}
+			chosen[canonical] = chosenValue{value: val, canonical: pair.key == canonical}
 			continue
 		}
 		if newEmpty {
 			continue
 		}
-		if equal(current.value, pair.value) {
+		if equal(current.value, val) {
 			if pair.key == canonical && !current.canonical {
-				chosen[canonical] = chosenValue{value: pair.value, canonical: true}
+				chosen[canonical] = chosenValue{value: val, canonical: true}
 			}
 			continue
 		}
-		// Later conflicting aliases represent a later authoritative rewrite.
-		chosen[canonical] = chosenValue{value: pair.value, canonical: pair.key == canonical}
+		// Conflict policy (ordered decode, matches NormalizeObjectForTool):
+		// - weak chatter never overwrites non-empty values
+		// - prefer real schema keys over non-path aliases (new_string beats replace/content)
+		// - path aliases still later-win (file_path then path → path value)
+		incomingCanonical := pair.key == canonical
+		if isWeakEditAliasSource(pair.key) && !empty(current.value) {
+			continue
+		}
+		if current.canonical && !incomingCanonical && !isPathArgKey(pair.key) {
+			continue
+		}
+		if !current.canonical && incomingCanonical {
+			chosen[canonical] = chosenValue{value: val, canonical: true}
+			continue
+		}
+		// Later conflicting same-class aliases represent a later authoritative rewrite.
+		chosen[canonical] = chosenValue{value: val, canonical: incomingCanonical}
 	}
-	return encodeObjectOrdered(order, chosen)
+	// Materialize map so edit defaults (missing new_string) can apply.
+	tmp := make(map[string]any, len(chosen))
+	for _, key := range order {
+		if value, ok := chosen[key]; ok {
+			tmp[key] = value.value
+		}
+	}
+	for key, value := range chosen {
+		if _, ok := tmp[key]; !ok {
+			tmp[key] = value.value
+		}
+	}
+	tmp = applyEditDefaults(tmp, toolName)
+	// Re-encode with order. applyShellDefaults (via applyEditDefaults) may:
+	// - promote bash/line/cmd → command
+	// - drop shell alias keys
+	// - flatten nested command argv / delete empty command
+	// so we must sync order+chosen from tmp rather than only patching edit keys.
+	shellAliasKeys := map[string]bool{
+		"cmd": true, "argv": true, "args": true, "shell_command": true,
+		"cmdline": true, "command_line": true, "script": true, "bash": true, "line": true,
+	}
+	newOrder := make([]string, 0, len(order)+4)
+	seen := map[string]bool{}
+	for _, key := range order {
+		if shellAliasKeys[key] {
+			if _, keep := tmp[key]; !keep {
+				delete(chosen, key)
+				continue
+			}
+		}
+		if v, ok := tmp[key]; ok {
+			newOrder = append(newOrder, key)
+			seen[key] = true
+			chosen[key] = chosenValue{value: v, canonical: true}
+		} else {
+			delete(chosen, key)
+		}
+	}
+	if isShellTool(toolName) {
+		if v, ok := tmp["command"]; ok && !seen["command"] {
+			newOrder = append([]string{"command"}, newOrder...)
+			seen["command"] = true
+			chosen["command"] = chosenValue{value: v, canonical: true}
+		}
+	}
+	for _, key := range []string{"file_path", "old_string", "new_string", "command", "input"} {
+		if seen[key] {
+			continue
+		}
+		if v, ok := tmp[key]; ok {
+			newOrder = append(newOrder, key)
+			seen[key] = true
+			chosen[key] = chosenValue{value: v, canonical: true}
+		}
+	}
+	for key, v := range tmp {
+		if seen[key] {
+			continue
+		}
+		newOrder = append(newOrder, key)
+		seen[key] = true
+		chosen[key] = chosenValue{value: v, canonical: true}
+	}
+	return encodeObjectOrdered(newOrder, chosen)
 }
 
 type objectPair struct {
@@ -264,6 +1000,20 @@ func decodeObjectPairs(text string) ([]objectPair, error) {
 	return pairs, nil
 }
 
+// marshalNoHTML encodes a single JSON value without HTML escaping so shell
+// args keep raw & < > (json.Marshal rewrites them as \u0026 / \u003c / \u003e).
+func marshalNoHTML(value any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(value); err != nil {
+		return nil, err
+	}
+	// Encode appends a trailing newline.
+	out := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+	return out, nil
+}
+
 func encodeObjectOrdered(order []string, chosen map[string]chosenValue) string {
 	var output bytes.Buffer
 	output.WriteByte('{')
@@ -271,8 +1021,11 @@ func encodeObjectOrdered(order []string, chosen map[string]chosenValue) string {
 		if index > 0 {
 			output.WriteByte(',')
 		}
-		encodedKey, _ := json.Marshal(key)
-		encodedValue, err := json.Marshal(chosen[key].value)
+		encodedKey, err := marshalNoHTML(key)
+		if err != nil {
+			return ""
+		}
+		encodedValue, err := marshalNoHTML(chosen[key].value)
 		if err != nil {
 			return ""
 		}
@@ -387,6 +1140,13 @@ func decodeJSONValues(src string) ([]any, []int) {
 		}
 		values = append(values, value)
 		ends = append(ends, int(decoder.InputOffset()))
+		// Cap recovery scans: a pathological buffer of thousands of repeated
+		// JSON blobs (runaway upstream rewrite loop) would otherwise be decoded
+		// in full on every mid-stream Merge / EffectiveJSON / CompleteJSON call,
+		// turning one glitchy tool call into a multi-second CPU stall.
+		if len(values) >= 32 {
+			break
+		}
 	}
 	return values, ends
 }
@@ -484,7 +1244,7 @@ func mergeArgDicts(values []any, toolName string) map[string]any {
 	}
 
 	objComplete := func(d map[string]any) bool {
-		text, err := compactJSON(NormalizeObject(d))
+		text, err := compactJSON(NormalizeObjectForTool(d, toolName))
 		if err != nil {
 			return false
 		}
@@ -550,7 +1310,7 @@ func mergeArgDicts(values []any, toolName string) map[string]any {
 				}
 			}
 		}
-		return NormalizeObject(base)
+		return NormalizeObjectForTool(base, toolName)
 	}
 
 	// No later complete base: sequential merge with path-strip on later path.
@@ -602,7 +1362,7 @@ func mergeArgDicts(values []any, toolName string) map[string]any {
 			}
 		}
 	}
-	return NormalizeObject(merged)
+	return NormalizeObjectForTool(merged, toolName)
 }
 
 func isPathArgKey(key string) bool {
@@ -650,6 +1410,17 @@ func Merge(current, incoming, toolName string) string {
 	if piece == "" && pieceRaw == "" {
 		return cur
 	}
+	// Whitespace-only pieces still matter mid-string: NormalizeJSON/SanitizeJSON
+	// trim them to "", but dropping " " inside `"echo hello"` corrupts the
+	// command. Only a truly empty incoming chunk is a no-op; when there is a
+	// non-empty buffer, append the whitespace fragment to the raw form so the
+	// next delta still lands on the correct byte boundary.
+	if strings.TrimSpace(incoming) == "" {
+		if curRaw != "" {
+			return curRaw + incoming
+		}
+		return cur + incoming
+	}
 	if cur == "" && curRaw == "" {
 		if piece != "" {
 			return piece
@@ -666,8 +1437,11 @@ func Merge(current, incoming, toolName string) string {
 		return cur
 	}
 
-	curComplete := CompleteJSON(cur, toolName)
-	pieceComplete := CompleteJSON(piece, toolName)
+	// Strict completeness for merge decisions: mid-stream fragments must not
+	// be "repaired" into looking complete or the merge keeps a truncated
+	// buffer and drops the live remainder of the tool call.
+	curComplete := CompleteJSONStrict(cur, toolName)
+	pieceComplete := CompleteJSONStrict(piece, toolName)
 	curAny := isCompleteJSONText(cur)
 	pieceAny := isCompleteJSONText(piece)
 
@@ -696,10 +1470,19 @@ func Merge(current, incoming, toolName string) string {
 	bText := firstNonEmpty(pieceRaw, piece)
 	var a, b any
 	if err := json.Unmarshal([]byte(aText), &a); err != nil {
-		return NormalizeJSON(aText+bText, toolName)
+		// Incomplete fragments: append raw, do not re-normalize yet (lossy).
+		appended := aText + bText
+		if n := NormalizeJSON(appended, toolName); n != "" && looksCompleteJSONValue(n) {
+			return n
+		}
+		return appended
 	}
 	if err := json.Unmarshal([]byte(bText), &b); err != nil {
-		return NormalizeJSON(aText+bText, toolName)
+		appended := aText + bText
+		if n := NormalizeJSON(appended, toolName); n != "" && looksCompleteJSONValue(n) {
+			return n
+		}
+		return appended
 	}
 	if equal(a, b) {
 		if cur != "" {
@@ -711,15 +1494,15 @@ func Merge(current, incoming, toolName string) string {
 	aMap, aOK := a.(map[string]any)
 	bMap, bOK := b.(map[string]any)
 	if aOK && bOK {
-		aNorm := NormalizeObject(aMap)
-		bNorm := NormalizeObject(bMap)
+		aNorm := NormalizeObjectForTool(aMap, toolName)
+		bNorm := NormalizeObjectForTool(bMap, toolName)
 		aCompleteObj := false
 		bCompleteObj := false
 		if text, err := compactJSON(aNorm); err == nil {
-			aCompleteObj = CompleteJSON(text, toolName)
+			aCompleteObj = CompleteJSONStrict(text, toolName)
 		}
 		if text, err := compactJSON(bNorm); err == nil {
-			bCompleteObj = CompleteJSON(text, toolName)
+			bCompleteObj = CompleteJSONStrict(text, toolName)
 		}
 
 		var merged map[string]any
@@ -840,12 +1623,43 @@ func Merge(current, incoming, toolName string) string {
 		return NormalizeJSON(pieceRaw, toolName)
 	}
 
-	// Both incomplete / non-JSON-ish: only append when it looks like a true delta.
-	return NormalizeJSON(firstNonEmpty(curRaw, cur)+firstNonEmpty(pieceRaw, piece), toolName)
+	// Both incomplete / non-JSON-ish: append raw fragments so streaming
+	// deltas accumulate byte-for-byte. NormalizeJSON of a partial payload is
+	// lossy (it cannot decode an unterminated object and returns ""), so
+	// appending normalized text would DROP earlier fragments — the next
+	// delta then restarts from a shorter buffer and the tool call never
+	// completes (intermittent Claude Code tool failures on char-level
+	// upstream chunking). Callers pass the result back into Merge as
+	// `current`, where SanitizeJSON+NormalizeJSON re-derive the normalized
+	// form once the buffer finally parses.
+	return firstNonEmpty(curRaw, cur) + firstNonEmpty(pieceRaw, piece)
 }
 
 func EffectiveJSON(raw string, toolName string) string {
+	// 1) Normal path.
 	text := strings.TrimSpace(NormalizeJSON(raw, toolName))
+	if text != "" && looksCompleteJSONValue(text) {
+		// Do NOT invent missing new_string here — that belongs only to
+		// CoerceCompleteJSON (stream Finish / non-stream force-finish).
+		// Mid-stream EffectiveJSON must leave path+old incomplete so the
+		// real replace can still arrive before Claude Code accepts the tool.
+		return text
+	}
+	// 2) Recover first complete JSON object when stream left trailing junk
+	// (common intermittent Grok glitch: valid object + garbage suffix).
+	if recovered := firstCompleteJSONFragment(raw); recovered != "" {
+		if norm := strings.TrimSpace(NormalizeJSON(recovered, toolName)); norm != "" {
+			return norm
+		}
+		return strings.TrimSpace(recovered)
+	}
+	// 3) Soft-repair truncated objects at stream end (missing closing braces/quotes).
+	if repaired := repairTruncatedJSONObject(raw); repaired != "" {
+		if norm := strings.TrimSpace(NormalizeJSON(repaired, toolName)); norm != "" {
+			return norm
+		}
+		return repaired
+	}
 	if text != "" {
 		return text
 	}
@@ -855,24 +1669,101 @@ func EffectiveJSON(raw string, toolName string) string {
 	return "{}"
 }
 
-func CompleteJSON(raw string, toolName string) bool {
+// CoerceCompleteJSON is a force-finish helper: EffectiveJSON + last-chance
+// required-field fills so intermittent partial tool args still emit rather
+// than vanishing mid-turn (Claude/Codex "tool call disappeared").
+func CoerceCompleteJSON(raw string, toolName string) string {
+	// Force-finish path: recover JSON first, then invent missing new_string only here.
+	text := strings.TrimSpace(NormalizeJSON(raw, toolName))
+	if text == "" || !looksCompleteJSONValue(text) {
+		if recovered := firstCompleteJSONFragment(raw); recovered != "" {
+			if norm := strings.TrimSpace(NormalizeJSON(recovered, toolName)); norm != "" {
+				text = norm
+			} else {
+				text = strings.TrimSpace(recovered)
+			}
+		} else if repaired := repairTruncatedJSONObject(raw); repaired != "" {
+			if norm := strings.TrimSpace(NormalizeJSON(repaired, toolName)); norm != "" {
+				text = norm
+			} else {
+				text = repaired
+			}
+		} else if text == "" {
+			text = EffectiveJSON(raw, toolName)
+		}
+	}
+	// Force-finish: fill default new_string for delete-match Update/Edit.
+	if obj := parseObjectLoose(text); obj != nil && isEditTool(toolName) {
+		obj = fillEditNewStringDefault(NormalizeObjectForTool(obj, toolName), toolName)
+		if encoded, err := compactJSON(obj); err == nil {
+			text = encoded
+		}
+	}
+	if CompleteJSON(text, toolName) {
+		return text
+	}
+	// Last chance: parse whatever object we can and apply edit/shell defaults again.
+	if repaired := repairTruncatedJSONObject(text); repaired != "" {
+		if norm := strings.TrimSpace(NormalizeJSON(repaired, toolName)); CompleteJSON(norm, toolName) {
+			return norm
+		}
+		if CompleteJSON(repaired, toolName) {
+			return repaired
+		}
+	}
+	// Shell: if we have any non-empty command-like field after normalize, force shape.
+	if isShellTool(toolName) {
+		if obj := parseObjectLoose(text); obj != nil {
+			obj = applyShellDefaults(obj, toolName)
+			if shellCommandNonEmpty(obj["command"]) || shellCommandNonEmpty(obj["cmd"]) {
+				if _, ok := obj["command"]; !ok {
+					if v, ok2 := obj["cmd"]; ok2 {
+						obj["command"] = v
+						delete(obj, "cmd")
+					}
+				}
+				if encoded, err := compactJSON(obj); err == nil && CompleteJSON(encoded, toolName) {
+					return encoded
+				}
+			}
+		}
+	}
+	// apply_patch: promote patch/diff aliases and force-finish when input present.
+	if isApplyPatchTool(toolName) {
+		if obj := parseObjectLoose(text); obj != nil {
+			obj = applyShellDefaults(obj, toolName)
+			if v, ok := obj["input"]; ok && !empty(v) {
+				if encoded, err := compactJSON(obj); err == nil && CompleteJSON(encoded, toolName) {
+					return encoded
+				}
+			}
+		}
+	}
+	return text
+}
+
+// CompleteJSONStrict reports completeness on the literal text only — no
+// truncation repair / trailing-junk recovery. Used by Merge and live stream
+// assemblers so an unterminated fragment like {"file_path":"/a.g is NOT
+// mistaken for a complete payload (EffectiveJSON would "repair" it into a
+// valid object and the still-arriving remainder would be discarded — the
+// classic intermittent Claude Code / Codex tool-arg loss).
+func CompleteJSONStrict(raw, toolName string) bool {
 	text := strings.TrimSpace(NormalizeJSON(raw, toolName))
 	if text == "" || (text[0] != '{' && text[0] != '[') {
 		return false
 	}
 	var value any
-	decoder := json.NewDecoder(strings.NewReader(text))
-	decoder.UseNumber()
-	if err := decoder.Decode(&value); err != nil {
-		return false
-	}
-	if decoder.More() {
+	if err := json.Unmarshal([]byte(text), &value); err != nil {
 		return false
 	}
 	switch typed := value.(type) {
 	case []any:
 		return len(typed) > 0 || len(requiredKeys(toolName)) == 0
 	case map[string]any:
+		if norm := NormalizeObjectForTool(typed, toolName); norm != nil {
+			typed = norm
+		}
 		keys := requiredKeys(toolName)
 		if len(typed) == 0 {
 			return len(keys) == 0
@@ -880,7 +1771,18 @@ func CompleteJSON(raw string, toolName string) bool {
 		for _, key := range keys {
 			item, ok := typed[key]
 			if !ok || item == nil {
+				if key == "command" && isShellTool(toolName) {
+					if shellCommandNonEmpty(typed["cmd"]) {
+						continue
+					}
+				}
 				return false
+			}
+			if key == "command" && isShellTool(toolName) {
+				if !shellCommandNonEmpty(item) && !shellCommandNonEmpty(typed["cmd"]) {
+					return false
+				}
+				continue
 			}
 			switch v := item.(type) {
 			case string:
@@ -901,6 +1803,296 @@ func CompleteJSON(raw string, toolName string) bool {
 	default:
 		return false
 	}
+}
+
+func CompleteJSON(raw string, toolName string) bool {
+	// Prefer EffectiveJSON recovery so trailing junk / mild truncation does not
+	// intermittently fail completeness after a successful stream merge.
+	text := strings.TrimSpace(EffectiveJSON(raw, toolName))
+	if text == "" || (text[0] != '{' && text[0] != '[') {
+		return false
+	}
+	var value any
+	// Unmarshal first value only — do NOT reject on trailing whitespace that
+	// Decoder.More() would flag (intermittent failures after model padding).
+	if err := json.Unmarshal([]byte(text), &value); err != nil {
+		// One more recovery attempt for slightly broken JSON.
+		if frag := firstCompleteJSONFragment(text); frag != "" {
+			if err2 := json.Unmarshal([]byte(frag), &value); err2 != nil {
+				return false
+			}
+			text = frag
+		} else {
+			return false
+		}
+	}
+	switch typed := value.(type) {
+	case []any:
+		return len(typed) > 0 || len(requiredKeys(toolName)) == 0
+	case map[string]any:
+		// Re-normalize so alias keys (cmd/path/search) count toward required fields.
+		if norm := NormalizeObjectForTool(typed, toolName); norm != nil {
+			typed = norm
+		}
+		// Missing new_string is incomplete for Edit/Update until CoerceCompleteJSON
+		// fills "" at force-finish. This prevents mid-stream delete-match emits.
+		keys := requiredKeys(toolName)
+		if len(typed) == 0 {
+			return len(keys) == 0
+		}
+		for _, key := range keys {
+			item, ok := typed[key]
+			if !ok || item == nil {
+				// Shell: accept cmd when command missing (pre-projection).
+				if key == "command" && isShellTool(toolName) {
+					if shellCommandNonEmpty(typed["cmd"]) {
+						continue
+					}
+				}
+				return false
+			}
+			// Codex shell: command may be string or argv array; reject nested empties.
+			if key == "command" && isShellTool(toolName) {
+				if !shellCommandNonEmpty(item) && !shellCommandNonEmpty(typed["cmd"]) {
+					return false
+				}
+				continue
+			}
+			if key == "input" && isApplyPatchTool(toolName) {
+				switch v := item.(type) {
+				case string:
+					if strings.TrimSpace(v) == "" {
+						return false
+					}
+				default:
+					if empty(item) {
+						return false
+					}
+				}
+				continue
+			}
+			switch v := item.(type) {
+			case string:
+				if strings.TrimSpace(v) == "" && !emptyStringOK[key] {
+					return false
+				}
+			case []any:
+				if len(v) == 0 {
+					return false
+				}
+				// Arrays of only empty strings are incomplete for required fields.
+				if key == "command" && !shellCommandNonEmpty(v) {
+					return false
+				}
+			case map[string]any:
+				if len(v) == 0 {
+					return false
+				}
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// firstCompleteJSONFragment returns the first complete JSON value in src when
+// the stream left trailing garbage after a valid object/array.
+func firstCompleteJSONFragment(src string) string {
+	src = strings.TrimSpace(src)
+	if src == "" {
+		return ""
+	}
+	// Unwrap a single JSON string layer that itself holds an object.
+	if len(src) >= 2 && src[0] == '"' {
+		var unquoted string
+		if json.Unmarshal([]byte(src), &unquoted) == nil {
+			unquoted = strings.TrimSpace(unquoted)
+			if unquoted != "" && (unquoted[0] == '{' || unquoted[0] == '[') {
+				src = unquoted
+			}
+		}
+	}
+	if json.Valid([]byte(src)) {
+		return src
+	}
+	values, ends := decodeJSONValues(src)
+	if len(values) == 0 || len(ends) == 0 {
+		return ""
+	}
+	// Prefer last complete object (authoritative rewrite), else first.
+	for i := len(values) - 1; i >= 0; i-- {
+		if d, ok := values[i].(map[string]any); ok && len(d) > 0 {
+			if encoded, err := compactJSON(d); err == nil && json.Valid([]byte(encoded)) {
+				return encoded
+			}
+		}
+	}
+	start := 0
+	if len(ends) > 0 {
+		// Text for first value.
+		frag := strings.TrimSpace(src[:ends[0]])
+		if json.Valid([]byte(frag)) {
+			return frag
+		}
+	}
+	_ = start
+	if encoded, err := compactJSON(values[0]); err == nil {
+		return encoded
+	}
+	return ""
+}
+
+// repairTruncatedJSONObject attempts to close a truncated {...} payload that
+// Grok sometimes ends mid-stream without a final brace. Conservative: only
+// when braces are unbalanced and a single root object is present.
+func repairTruncatedJSONObject(src string) string {
+	src = strings.TrimSpace(src)
+	if src == "" || src[0] != '{' {
+		return ""
+	}
+	if json.Valid([]byte(src)) {
+		return src
+	}
+	// Strip trailing commas before close attempts.
+	trimmed := strings.TrimRight(src, " \t\r\n")
+	for strings.HasSuffix(trimmed, ",") {
+		trimmed = strings.TrimSpace(trimmed[:len(trimmed)-1])
+	}
+	// Close open strings if odd number of unescaped quotes after last key-ish pattern.
+	if repaired := closeOpenJSONString(trimmed); repaired != "" {
+		trimmed = repaired
+	}
+	open, closeN := 0, 0
+	inStr := false
+	esc := false
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if inStr {
+			if esc {
+				esc = false
+				continue
+			}
+			if ch == '\\' {
+				esc = true
+				continue
+			}
+			if ch == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inStr = true
+		case '{':
+			open++
+		case '}':
+			closeN++
+		}
+	}
+	if inStr || open <= closeN || open-closeN > 4 {
+		// Too broken or already balanced-but-invalid.
+		if !inStr {
+			return ""
+		}
+		// Close dangling string then braces.
+		trimmed += `"`
+		open, closeN = 0, 0
+		inStr, esc = false, false
+		for i := 0; i < len(trimmed); i++ {
+			ch := trimmed[i]
+			if inStr {
+				if esc {
+					esc = false
+					continue
+				}
+				if ch == '\\' {
+					esc = true
+					continue
+				}
+				if ch == '"' {
+					inStr = false
+				}
+				continue
+			}
+			switch ch {
+			case '"':
+				inStr = true
+			case '{':
+				open++
+			case '}':
+				closeN++
+			}
+		}
+	}
+	for closeN < open {
+		trimmed += "}"
+		closeN++
+	}
+	if !json.Valid([]byte(trimmed)) {
+		return ""
+	}
+	return trimmed
+}
+
+func closeOpenJSONString(src string) string {
+	inStr := false
+	esc := false
+	for i := 0; i < len(src); i++ {
+		ch := src[i]
+		if !inStr {
+			if ch == '"' {
+				inStr = true
+			}
+			continue
+		}
+		if esc {
+			esc = false
+			continue
+		}
+		if ch == '\\' {
+			esc = true
+			continue
+		}
+		if ch == '"' {
+			inStr = false
+		}
+	}
+	if !inStr {
+		return ""
+	}
+	return src + `"`
+}
+
+func looksCompleteJSONValue(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
+	}
+	return json.Valid([]byte(text))
+}
+
+func parseObjectLoose(raw string) map[string]any {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(raw), &obj) == nil {
+		return obj
+	}
+	if frag := firstCompleteJSONFragment(raw); frag != "" {
+		if json.Unmarshal([]byte(frag), &obj) == nil {
+			return obj
+		}
+	}
+	if repaired := repairTruncatedJSONObject(raw); repaired != "" {
+		if json.Unmarshal([]byte(repaired), &obj) == nil {
+			return obj
+		}
+	}
+	return nil
 }
 
 func isCompleteJSONText(s string) bool {
@@ -946,16 +2138,87 @@ func cloneMap(input map[string]any) map[string]any {
 	return out
 }
 
+// compactJSON encodes values with stable map key order so edit/shell tool
+// arguments keep a deterministic client-facing shape (file_path before
+// old_string/new_string). encoding/json map iteration order is not stable
+// for string equality checks used by clients and tests.
 func compactJSON(value any) (string, error) {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return "", err
+	return marshalStable(value)
+}
+
+func marshalStable(value any) (string, error) {
+	switch v := value.(type) {
+	case map[string]any:
+		return encodeMapStable(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			s, err := marshalStable(item)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, s)
+		}
+		return "[" + strings.Join(parts, ",") + "]", nil
+	default:
+		encoded, err := marshalNoHTML(value)
+		if err != nil {
+			return "", err
+		}
+		return string(encoded), nil
 	}
-	return string(encoded), nil
+}
+
+func encodeMapStable(m map[string]any) (string, error) {
+	if m == nil {
+		return "null", nil
+	}
+	// Preferred key order for Claude/Codex tool schemas.
+	prefer := []string{
+		"file_path", "old_string", "new_string", "content",
+		"command", "cmd", "input", "pattern", "query", "url",
+		"path", "notebook_path", "taskId", "status",
+	}
+	keys := make([]string, 0, len(m))
+	seen := make(map[string]bool, len(m))
+	for _, k := range prefer {
+		if _, ok := m[k]; ok {
+			keys = append(keys, k)
+			seen[k] = true
+		}
+	}
+	rest := make([]string, 0, len(m))
+	for k := range m {
+		if !seen[k] {
+			rest = append(rest, k)
+		}
+	}
+	sort.Strings(rest)
+	keys = append(keys, rest...)
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		ek, err := marshalNoHTML(k)
+		if err != nil {
+			return "", err
+		}
+		ev, err := marshalStable(m[k])
+		if err != nil {
+			return "", err
+		}
+		b.Write(ek)
+		b.WriteByte(':')
+		b.WriteString(ev)
+	}
+	b.WriteByte('}')
+	return b.String(), nil
 }
 
 func stringify(value any) string {
-	encoded, err := json.Marshal(value)
+	encoded, err := marshalNoHTML(value)
 	if err != nil {
 		return ""
 	}
@@ -973,4 +2236,212 @@ func firstNonEmpty(values ...string) string {
 
 func isSpace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// PreferredShellArgKey inspects a tool parameters schema and returns the
+// parameter name the *client* expects for the shell command payload.
+// Codex historically uses "cmd"; OpenAI/Claude-style tools use "command".
+func PreferredShellArgKey(parameters any) string {
+	params, _ := parameters.(map[string]any)
+	if params == nil {
+		return "command"
+	}
+	props, _ := params["properties"].(map[string]any)
+	req, _ := params["required"].([]any)
+	has := func(name string) bool {
+		if props != nil {
+			if _, ok := props[name]; ok {
+				return true
+			}
+		}
+		for _, item := range req {
+			if strings.EqualFold(strings.TrimSpace(fmt.Sprint(item)), name) {
+				return true
+			}
+		}
+		return false
+	}
+	// Prefer explicit required/property order used by the client.
+	// Codex: required ["cmd"] or properties.cmd without command.
+	if has("cmd") && !has("command") {
+		return "cmd"
+	}
+	if has("command") && !has("cmd") {
+		return "command"
+	}
+	// Both present: prefer required list first item that matches.
+	for _, item := range req {
+		key := strings.ToLower(strings.TrimSpace(fmt.Sprint(item)))
+		if key == "cmd" || key == "command" {
+			return key
+		}
+	}
+	if has("cmd") {
+		return "cmd"
+	}
+	return "command"
+}
+
+// PreferredShellArgKeyFromTool extracts preferred key from a Responses/OpenAI tool object.
+func PreferredShellArgKeyFromTool(tool map[string]any) string {
+	if tool == nil {
+		return "command"
+	}
+	if fn, ok := tool["function"].(map[string]any); ok {
+		return PreferredShellArgKey(firstNonNil(fn["parameters"], fn["input_schema"], tool["parameters"], tool["input_schema"]))
+	}
+	return PreferredShellArgKey(firstNonNil(tool["parameters"], tool["input_schema"]))
+}
+
+// ShellArgKeyMap builds tool-name → preferred shell arg key from a tools array.
+func ShellArgKeyMap(tools any) map[string]string {
+	out := map[string]string{}
+	items, ok := tools.([]any)
+	if !ok {
+		return out
+	}
+	for _, item := range items {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := ""
+		if fn, ok := tool["function"].(map[string]any); ok {
+			name = strings.TrimSpace(fmt.Sprint(fn["name"]))
+		}
+		if name == "" {
+			name = strings.TrimSpace(fmt.Sprint(tool["name"]))
+		}
+		if name == "" || !isShellTool(name) {
+			continue
+		}
+		out[name] = PreferredShellArgKeyFromTool(tool)
+		// also store lower-case + nameKey for lookup tolerance (exec_command / ExecCommand).
+		out[strings.ToLower(name)] = out[name]
+		if nk := nameKey(name); nk != "" {
+			out[nk] = out[name]
+		}
+	}
+	return out
+}
+
+// ProjectShellArgsForClient rewrites internal {"command":...} args into the
+// parameter name expected by the client schema (often Codex "cmd").
+// Non-shell tools / non-objects are returned unchanged.
+//
+// Default preferred key is "cmd" (Codex schema). Pass preferredKey="command"
+// explicitly for pure OpenAI/Claude shell tools that only declare "command".
+// Always emits a STRING for the preferred key — never argv arrays — so Codex
+// does not reject the tool call and retry with "参数名应是 cmd，不是 command".
+func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
+	preferredKey = strings.TrimSpace(preferredKey)
+	// When caller already decided preferredKey=cmd (Codex path), always project
+	// even if tool name is exotic / namespaced and isShellTool missed it.
+	force := preferredKey == "cmd" || preferredKey == "command"
+	if !isShellTool(toolName) && !force {
+		return argsJSON
+	}
+	if preferredKey == "" {
+		// Codex validates shell tools against local schema field "cmd".
+		preferredKey = "cmd"
+	}
+	text := strings.TrimSpace(argsJSON)
+	if text == "" {
+		return argsJSON
+	}
+	// Unwrap accidental double-encoded JSON strings: "\"{\\\"command\\\":\\\"x\\\"}\""
+	for i := 0; i < 2; i++ {
+		if len(text) >= 2 && text[0] == '"' {
+			var unquoted string
+			if json.Unmarshal([]byte(text), &unquoted) == nil && strings.TrimSpace(unquoted) != "" {
+				text = strings.TrimSpace(unquoted)
+				continue
+			}
+		}
+		break
+	}
+	// Start from normalized internal form (command key). Use a shell-family name
+	// for alias maps when the real tool name is namespaced / unknown.
+	normName := toolName
+	if !isShellTool(normName) && force {
+		normName = "shell"
+	}
+	normalized := NormalizeJSON(text, normName)
+	if strings.TrimSpace(normalized) == "" {
+		normalized = text
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(normalized), &obj); err != nil {
+		if err2 := json.Unmarshal([]byte(text), &obj); err2 != nil {
+			return argsJSON
+		}
+	}
+	// Collect command value from command or any known alias.
+	var val any
+	for _, k := range []string{"command", "cmd", "argv", "args", "shell_command", "cmdline", "command_line", "script", "bash", "line"} {
+		if v, ok := obj[k]; ok && !empty(v) {
+			val = v
+			break
+		}
+	}
+	if val == nil {
+		for _, k := range []string{"command", "cmd"} {
+			if v, ok := obj[k]; ok {
+				val = v
+				break
+			}
+		}
+	}
+	if val == nil {
+		return normalized
+	}
+	// Codex / OpenAI shell clients require a STRING for cmd/command — never argv
+	// arrays. Grok frequently emits ["ls","-la"] or nested lists; flatten+join
+	// at the final client projection boundary.
+	strVal := normalizeShellCommand(val)
+	if strVal == nil {
+		// Last resort for exotic non-string/non-array leftovers.
+		if s, ok := val.(string); ok {
+			strVal = strings.TrimSpace(s)
+		} else if encoded, err := compactJSON(val); err == nil && strings.HasPrefix(encoded, "[") {
+			var arr []any
+			if json.Unmarshal([]byte(encoded), &arr) == nil {
+				if flat := flattenCommandParts(arr); len(flat) > 0 {
+					strVal = joinShellArgv(flat)
+				}
+			}
+		} else if val != nil {
+			if s := strings.TrimSpace(stringify(val)); s != "" && s != "null" && s != "[]" && s != "{}" {
+				strVal = s
+			}
+		}
+	}
+	if strVal == nil {
+		return normalized
+	}
+	// Rebuild: preferred key first, keep non-alias extras (workdir, timeout, ...).
+	out := map[string]any{preferredKey: strVal}
+	for k, v := range obj {
+		lk := strings.ToLower(strings.TrimSpace(k))
+		switch lk {
+		case "command", "cmd", "argv", "args", "shell_command", "cmdline", "command_line", "script", "bash", "line":
+			continue
+		default:
+			out[k] = v
+		}
+	}
+	encoded, err := compactJSON(out)
+	if err != nil {
+		return normalized
+	}
+	return encoded
+}
+
+func firstNonNil(values ...any) any {
+	for _, v := range values {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
 }

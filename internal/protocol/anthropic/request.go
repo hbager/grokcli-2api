@@ -5,9 +5,19 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/hm2899/grokcli-2api/internal/protocol/reasoning"
 )
+
+// Claude Code embeds the conversation id inside metadata.user_id, e.g.
+//
+//	user_abc_account__session_01234567-89ab-cdef-0123-456789abcdef
+//
+// CPA/sub2api extract the session_… token as the sticky cache/conversation key.
+var claudeCodeSessionRE = regexp.MustCompile(`(?i)session_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|session_[0-9a-zA-Z_-]{8,}`)
 
 func BuildOpenAIChatBody(raw map[string]any, model string) (map[string]any, error) {
 	messages, _ := raw["messages"].([]any)
@@ -36,7 +46,11 @@ func BuildOpenAIChatBody(raw map[string]any, model string) (map[string]any, erro
 	if pck := ExtractPromptCacheKey(raw); pck != "" {
 		body["prompt_cache_key"] = pck
 	}
-	if effort := ThinkingToReasoningEffort(raw["thinking"]); effort != "" {
+	// Claude Code: thinking / thinking.budget_tokens / thinking.type
+	// Codex/OpenAI: reasoning_effort | reasoning.effort | auto/default/standard/extra-high
+	if effort := reasoning.FromRequest(raw); effort != "" {
+		body["reasoning_effort"] = effort
+	} else if effort := ThinkingToReasoningEffort(raw["thinking"]); effort != "" {
 		body["reasoning_effort"] = effort
 	}
 	if boolValue(body["stream"]) {
@@ -141,112 +155,141 @@ func toolNameKey(tool map[string]any) string {
 	return strings.ToLower(stringValue(tool["name"]))
 }
 
-// ExtractPromptCacheKey derives a sticky cache key from Anthropic cache_control
-// markers or metadata. Upstream Grok ignores Anthropic prompt caching, but
-// multi-turn Claude Code sessions still benefit from sticky account routing.
+// ExtractPromptCacheKey derives a sticky cache key for multi-turn routing.
+// Upstream Grok prompt-cache hits need the SAME account + stable prompt_cache_key.
+//
+// Priority:
+//  1. explicit metadata/session ids
+//  2. hash of stable conversation seed: system prefix + FIRST user message only
+//
+// Intentionally NOT hashing the tools list: Claude Code / MCP tool sets change
+// mid-session and would mint a new key (and hop accounts) every turn.
+// Intentionally NOT hashing later messages: they grow every turn.
 func ExtractPromptCacheKey(raw map[string]any) string {
 	if raw == nil {
 		return ""
 	}
 	if meta, ok := raw["metadata"].(map[string]any); ok {
-		for _, key := range []string{"prompt_cache_key", "promptCacheKey", "cache_key", "cacheKey", "session_id", "sessionId", "user_id"} {
+		// Prefer real session identifiers. Skip bare user_id — some clients send a
+		// global user id that is shared across unrelated conversations.
+		for _, key := range []string{"prompt_cache_key", "promptCacheKey", "cache_key", "cacheKey", "session_id", "sessionId", "conversation_id", "thread_id"} {
 			if value := stringValue(meta[key]); value != "" {
-				if len(value) > 240 {
-					return value[:240]
-				}
-				return value
+				return truncateKey(value)
 			}
 		}
+		// Claude Code: metadata.user_id often embeds session_<uuid>.
+		if sid := ExtractClaudeCodeSessionID(stringValue(meta["user_id"])); sid != "" {
+			return sid
+		}
 	}
-	pieces := make([]string, 0, 12)
+	for _, key := range []string{"prompt_cache_key", "session_id", "sessionId", "conversation_id", "thread_id"} {
+		if value := stringValue(raw[key]); value != "" {
+			return truncateKey(value)
+		}
+	}
+	// Top-level user / user_id may also carry Claude Code session markers.
+	for _, key := range []string{"user_id", "user"} {
+		if sid := ExtractClaudeCodeSessionID(stringValue(raw[key])); sid != "" {
+			return sid
+		}
+	}
+
+	pieces := make([]string, 0, 4)
+	// Stable system prefix (truncate; ignore cache_control noise).
 	switch system := raw["system"].(type) {
+	case string:
+		text := strings.TrimSpace(system)
+		if text != "" {
+			if len(text) > 160 {
+				text = text[:160]
+			}
+			pieces = append(pieces, "sys:"+text)
+		}
 	case []any:
+		var b strings.Builder
 		for _, item := range system {
-			block, ok := item.(map[string]any)
-			if !ok {
-				continue
+			switch block := item.(type) {
+			case string:
+				b.WriteString(block)
+			case map[string]any:
+				b.WriteString(stringValue(block["text"]))
 			}
-			if mark := cacheControlFingerprint(block); mark != "" {
-				text := stringValue(block["text"])
-				if len(text) > 120 {
-					text = text[:120]
-				}
-				pieces = append(pieces, "sys:"+mark+":"+text)
+			if b.Len() > 160 {
+				break
 			}
+		}
+		text := strings.TrimSpace(b.String())
+		if text != "" {
+			if len(text) > 160 {
+				text = text[:160]
+			}
+			pieces = append(pieces, "sys:"+text)
 		}
 	case map[string]any:
-		if mark := cacheControlFingerprint(system); mark != "" {
-			text := stringValue(system["text"])
-			if len(text) > 120 {
-				text = text[:120]
+		text := strings.TrimSpace(stringValue(system["text"]))
+		if text != "" {
+			if len(text) > 160 {
+				text = text[:160]
 			}
-			pieces = append(pieces, "sys:"+mark+":"+text)
+			pieces = append(pieces, "sys:"+text)
 		}
 	}
-	if tools, ok := raw["tools"].([]any); ok {
-		for _, item := range tools {
-			tool, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			mark := cacheControlFingerprint(tool)
-			if mark == "" {
-				continue
-			}
-			name := stringValue(tool["name"])
-			if name == "" {
-				if fn, ok := tool["function"].(map[string]any); ok {
-					name = stringValue(fn["name"])
-				}
-			}
-			if len(name) > 80 {
-				name = name[:80]
-			}
-			pieces = append(pieces, "tool:"+mark+":"+name)
-		}
-	}
+	// First user message only (stable as history grows).
 	if messages, ok := raw["messages"].([]any); ok {
-		limit := len(messages)
-		if limit > 4 {
-			limit = 4
-		}
-		for _, item := range messages[:limit] {
+		for _, item := range messages {
 			message, ok := item.(map[string]any)
 			if !ok {
 				continue
 			}
-			content, ok := message["content"].([]any)
-			if !ok {
+			role := strings.ToLower(strings.TrimSpace(stringValue(message["role"])))
+			if role != "user" {
 				continue
 			}
-			for _, blockItem := range content {
-				block, ok := blockItem.(map[string]any)
-				if !ok {
-					continue
-				}
-				mark := cacheControlFingerprint(block)
-				if mark == "" {
-					continue
-				}
-				btype := stringValue(block["type"])
-				if len(btype) > 32 {
-					btype = btype[:32]
-				}
-				pieces = append(pieces, "msg:"+mark+":"+btype)
-				if len(pieces) >= 12 {
-					break
-				}
+			text := strings.TrimSpace(asText(message["content"]))
+			if text == "" {
+				continue
 			}
-			if len(pieces) >= 12 {
-				break
+			if len(text) > 160 {
+				text = text[:160]
 			}
+			pieces = append(pieces, "u0:"+text)
+			break
 		}
 	}
 	if len(pieces) == 0 {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(strings.Join(pieces, "|")))
-	return "acc:" + hex.EncodeToString(sum[:16])
+	return "sess:" + hex.EncodeToString(sum[:16])
+}
+
+// ExtractClaudeCodeSessionID pulls session_<id> out of Claude Code user_id strings.
+// Returns empty when no session marker is present (bare global user ids are ignored).
+func ExtractClaudeCodeSessionID(userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return ""
+	}
+	// Direct session id.
+	if strings.HasPrefix(strings.ToLower(userID), "session_") {
+		return truncateKey(userID)
+	}
+	match := claudeCodeSessionRE.FindString(userID)
+	if match == "" {
+		return ""
+	}
+	return truncateKey(match)
+}
+
+func truncateKey(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if len(value) > 240 {
+		return value[:240]
+	}
+	return value
 }
 
 func cacheControlFingerprint(block map[string]any) string {
@@ -521,58 +564,11 @@ func ToolChoiceToOpenAI(choice any) any {
 	}
 }
 
+// ThinkingToReasoningEffort maps Anthropic thinking / Claude Code effort labels
+// (and Codex aliases auto/default/standard/extra-high) onto Grok
+// low|medium|high|xhigh.
 func ThinkingToReasoningEffort(thinking any) string {
-	switch value := thinking.(type) {
-	case nil:
-		return ""
-	case bool:
-		if value {
-			return "medium"
-		}
-		return ""
-	case string:
-		low := strings.ToLower(strings.TrimSpace(value))
-		switch low {
-		case "", "disabled", "none", "false", "0":
-			return ""
-		case "enabled", "true", "1", "on":
-			return "medium"
-		case "low", "medium", "high", "xhigh":
-			return low
-		default:
-			return low
-		}
-	case map[string]any:
-		typeName := strings.ToLower(stringValue(value["type"]))
-		switch typeName {
-		case "", "disabled", "none":
-			return ""
-		case "enabled", "true", "on":
-			// continue to budget mapping below
-		case "low", "medium", "high", "xhigh":
-			return typeName
-		default:
-			if effort := stringValue(value["effort"]); effort != "" {
-				return strings.ToLower(effort)
-			}
-		}
-		budget, ok := numericInt(value["budget_tokens"])
-		if !ok || budget <= 0 {
-			return "medium"
-		}
-		if budget <= 2048 {
-			return "low"
-		}
-		if budget <= 8192 {
-			return "medium"
-		}
-		if budget <= 48000 {
-			return "high"
-		}
-		return "xhigh"
-	default:
-		return ""
-	}
+	return reasoning.Normalize(thinking)
 }
 
 func copyIfPresent(dst, src map[string]any, key string) {

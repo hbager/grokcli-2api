@@ -531,34 +531,8 @@ def cooldown_defaults() -> dict[str, float]:
     }
 
 
-def upstream_retry_count() -> int:
-    cache_key = "upstream_retry_count_effective"
-    now = time.time()
-    hit = _policy_cache.get(cache_key)
-    if hit is not None and now - hit[0] < _POLICY_CACHE_TTL:
-        return int(hit[1])
-
-    try:
-        from grok2api.admin.settings_store import _get_setting_value
-
-        raw = _get_setting_value("upstream_retry_count", None)
-        if raw is not None and str(raw).strip() != "":
-            value = max(0, min(63, int(float(raw))))
-        else:
-            legacy = _get_setting_value("max_failover_attempts", None)
-            if legacy is not None and str(legacy).strip() != "":
-                value = max(0, min(63, int(float(legacy)) - 1))
-            else:
-                value = max(0, min(63, int(MAX_FAILOVER_ATTEMPTS) - 1))
-    except Exception:
-        value = max(0, min(63, int(MAX_FAILOVER_ATTEMPTS) - 1))
-
-    _policy_cache[cache_key] = (now, float(value))
-    return value
-
-
 def max_failover_attempts() -> int:
-    return upstream_retry_count() + 1
+    return _policy_int("max_failover_attempts", MAX_FAILOVER_ATTEMPTS, minimum=1, maximum=64)
 
 
 def _jitter(seconds: float) -> float:
@@ -2638,8 +2612,8 @@ def try_acquire_sequence(
     # ── Sticky affinity fast path (dominant multi-turn TTFT win) ──────────
     # Load only the preferred account + durable meta. Avoid list_live over
     # 1k accounts and full account_pool SELECT when the conversation is pinned.
-    # Policy lookup uses a short in-process cache and is invalidated immediately
-    # by admin writes, so sticky requests honor the same retry limit as cold picks.
+    # Intentionally avoid max_failover_attempts()/settings hydrate here — first
+    # policy read after a worker starts can cost hundreds of ms.
     if prefer_account_id:
         sticky = peek_credentials_by_id(prefer_account_id)
         if sticky is not None and sticky.auth_key:
@@ -2673,12 +2647,12 @@ def try_acquire_sequence(
                 # Optional backups only from warm live-creds cache. Never
                 # rebuild full pool / full pool-state just for backups.
                 backups: list[GrokCredentials] = []
-                limit = 1
                 try:
                     if max_attempts is not None:
                         limit = max(1, int(max_attempts))
                     else:
-                        limit = max_failover_attempts()
+                        # Compile-time default only — no settings IO on hot path.
+                        limit = max(1, int(MAX_FAILOVER_ATTEMPTS))
                     if limit > 1:
                         cached = get_cached_live_credentials(
                             include_expired=True
@@ -2725,8 +2699,7 @@ def try_acquire_sequence(
                                 break
                 except Exception:
                     backups = []
-                if len(backups) >= max(0, limit - 1):
-                    return ([first] + backups)[:limit]
+                return [first] + backups
 
     mode = get_account_mode()
     # Prefer warm process-local pool-state. Full SELECT of 1k+ rows is the main
@@ -2751,7 +2724,7 @@ def try_acquire_sequence(
     limit_target = (
         max(1, int(max_attempts))
         if max_attempts is not None
-        else max(1, int(max_failover_attempts()))
+        else max(1, int(MAX_FAILOVER_ATTEMPTS))
     )
     # Over-fetch a bit so cooldowns/blocks inside the window still leave a chain.
     window_n = min(len(pool_order), max(24, limit_target * 12))

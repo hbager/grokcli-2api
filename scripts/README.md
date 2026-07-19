@@ -1,6 +1,6 @@
 # scripts/
 
-运维与回归脚本（不进运行时热路径）。
+运维与 Python sidecar 脚本。公开 API / 管理台主路径已迁到 Go。
 
 ## 构建 / 运维
 
@@ -8,33 +8,32 @@
 |------|------|
 | `build_admin_assets.py` | 管理台静态资源打包（`static/js` → `static/dist`） |
 | `upgrade_from_file_backend.sh` | file 后端 → hybrid（PG/Redis）升级迁移 |
+| `smoke_go_messages.sh` | Go messages 冒烟 |
 
-## 回归测试（`_test_*.py`）
-
-本地直接跑，不依赖 pytest 插件：
+JSON → PG 迁移请用 Go：
 
 ```bash
-python3 scripts/_test_task_status_terminal.py
-python3 scripts/_test_cpa_affinity_improvements.py
-python3 scripts/_test_strict_cooldown_rotation.py
-python3 scripts/_test_rotation_load_spread.py
-python3 scripts/_test_free_usage_hard_kick.py
-python3 scripts/_test_tool_call_parse_fix.py
-python3 scripts/_test_upstream_account_retry.py
+go run ./cmd/grok2api-migrate
+# 或镜像内
+/app/bin/grok2api-migrate
 ```
 
-| 路径 | 覆盖 |
-|------|------|
-| `_test_task_status_terminal.py` | TaskUpdate / Update 路径 / 终态帧 |
-| `_test_cpa_affinity_improvements.py` | 会话粘性：Claude session / messages hash / model 隔离 / 清绑定 |
-| `_test_strict_cooldown_rotation.py` | 冷却池硬排除 live 轮询 |
-| `_test_rotation_load_spread.py` | pick-time inflight 负载分散 |
-| `_test_free_usage_hard_kick.py` | 没额度立即冷却踢出 |
-| `_test_tool_call_parse_fix.py` | 空 schema / tool_use 解析回归 |
-| `_test_upstream_account_retry.py` | 上游错误换号、重试上限、串流提交边界与耗尽错误 |
+## Python sidecar（必须保留）
 
-> 不要把一次性 release 脚本、第三方安装器、临时研究抓取脚本放进本目录。
+| 路径 | 说明 |
+|------|------|
+| `registration_service.py` | 注册机 + SSO 内部 HTTP（`127.0.0.1:18070`） |
+| `sso_to_auth_json.py` | SSO cookie → token 设备流转换 |
+
+相关实现：
+
+- `grok2api/admin/sso_import.py` — SSO 导入任务
+- `grok2api/upstream/grok_build_adapter.py` — 注册编排
+- `turnstile-solver/` — 本地过盾
+- `grok-build-auth/` — 协议注册引擎
+
+边界说明见 `docs/ARCHITECTURE_GO_PYTHON_BOUNDARY.md` 与 `docs/PYTHON_SIDECAR.md`。
 
 ## 包结构约定
 
-回归脚本优先导入 `grok2api.*` 包路径，避免继续把根目录 shim 当作真实实现。根目录 `app.py`、`migrate_json_to_pg.py`、`sso_to_auth_json.py` 仅作为兼容入口保留。
+Sidecar 代码优先导入 `grok2api.*`。根目录 `sso_to_auth_json.py` 仅为兼容包装。

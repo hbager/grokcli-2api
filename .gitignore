@@ -30,7 +30,8 @@ docker-rebuild.local.sh
 
 # Local tooling / release pins
 .claude/
-.release-commit
+# release pin tracked for CI version gate
+# .release-commit
 
 # Built Go binaries (source lives under cmd/; do not ignore grok2api/ package dir)
 /grok2api-migrate

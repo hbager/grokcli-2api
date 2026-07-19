@@ -5,23 +5,72 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
+	"github.com/hm2899/grokcli-2api/internal/upstream/outboundproxy"
 )
 
 type Service struct {
-	Store    *postgres.Connector
-	Upstream string
-	Workers  int
+	Store      *postgres.Connector
+	Upstream   string
+	Workers    int
+	httpClient *http.Client
 }
 
 func New(store *postgres.Connector, upstream string) *Service {
-	return &Service{Store: store, Upstream: strings.TrimRight(upstream, "/"), Workers: 4}
+	return &Service{
+		Store:      store,
+		Upstream:   strings.TrimRight(upstream, "/"),
+		Workers:    envInt("GROK2API_QUOTA_WORKERS", 8, 1, 32),
+		httpClient: newQuotaHTTPClient(http.ProxyFromEnvironment),
+	}
+}
+
+func newQuotaHTTPClient(proxy func(*http.Request) (*url.URL, error)) *http.Client {
+	return &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			Proxy:                 proxy,
+			MaxIdleConns:          128,
+			MaxIdleConnsPerHost:   64,
+			MaxConnsPerHost:       96,
+			IdleConnTimeout:       60 * time.Second,
+			TLSHandshakeTimeout:   8 * time.Second,
+			ResponseHeaderTimeout: 12 * time.Second,
+			ForceAttemptHTTP2:     true,
+			DialContext: (&net.Dialer{
+				Timeout:   6 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		},
+	}
+}
+
+func (s *Service) client() *http.Client {
+	if s != nil && s.httpClient != nil {
+		return s.httpClient
+	}
+	return newQuotaHTTPClient(http.ProxyFromEnvironment)
+}
+
+func (s *Service) SetProxy(proxy func(*http.Request) (*url.URL, error)) {
+	if s == nil {
+		return
+	}
+	previous := s.httpClient
+	s.httpClient = newQuotaHTTPClient(proxy)
+	if previous != nil {
+		previous.CloseIdleConnections()
+	}
 }
 
 func (s *Service) FetchCached(ctx context.Context) (map[string]any, error) {
@@ -31,17 +80,36 @@ func (s *Service) FetchCached(ctx context.Context) (map[string]any, error) {
 	return s.Store.ListCachedQuotas(ctx)
 }
 
+func (s *Service) FetchOne(ctx context.Context, accountID string) (map[string]any, error) {
+	if s.Store == nil {
+		return map[string]any{"ok": false, "error": "store unavailable"}, nil
+	}
+	auth, err := s.Store.GetAccountAuth(ctx, accountID)
+	if err != nil || auth == nil {
+		return map[string]any{"ok": false, "account_id": accountID, "error": "account not found or has no token"}, nil
+	}
+	item := s.fetchOne(ctx, *auth)
+	// SaveQuotaSnapshot writes last_quota AND syncs pool status (quota_disabled / re-enable).
+	_ = s.Store.SaveQuotaSnapshot(ctx, auth.ID, item)
+	if item["exhausted"] == true {
+		item["auto_disabled"] = true
+		item["pool_disabled"] = true
+	}
+	return item, nil
+}
+
 func (s *Service) FetchAll(ctx context.Context) (map[string]any, error) {
 	if s.Store == nil {
 		return map[string]any{"ok": false, "error": "store unavailable"}, nil
 	}
-	auths, err := s.Store.ListAccountAuths(ctx, 500, false)
+	// Include disabled accounts so recovery can re-enable them after billing heals.
+	auths, err := s.Store.ListAccountAuths(ctx, 2000, false)
 	if err != nil {
 		return nil, err
 	}
 	workers := s.Workers
 	if workers <= 0 {
-		workers = 4
+		workers = 8
 	}
 	if workers > len(auths) && len(auths) > 0 {
 		workers = len(auths)
@@ -57,10 +125,11 @@ func (s *Service) FetchAll(ctx context.Context) (map[string]any, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			item := s.fetchOne(ctx, a)
+			// Real-time DB sync: last_quota + disabled_for_quota / pool_status / re-enable.
 			_ = s.Store.SaveQuotaSnapshot(ctx, a.ID, item)
 			if item["exhausted"] == true {
-				_, _ = s.Store.SetAccountEnabled(ctx, a.ID, false)
 				item["auto_disabled"] = true
+				item["pool_disabled"] = true
 			}
 			ch <- result{item: item}
 		}(auth)
@@ -106,18 +175,20 @@ func (s *Service) FetchAll(ctx context.Context) (map[string]any, error) {
 		"total_used":          totalUsed,
 		"total_monthly_limit": totalLimit,
 		"total_remaining":     totalRemaining,
+		"workers":             workers,
 		"accounts":            results,
 	}, nil
 }
 
 func (s *Service) fetchOne(ctx context.Context, auth postgres.AccountAuth) map[string]any {
+	ctx = outboundproxy.WithAccountID(ctx, auth.ID)
 	out := map[string]any{
 		"ok":         false,
 		"account_id": auth.ID,
 		"email":      auth.Email,
 		"fetched_at": time.Now().Unix(),
+		"source":     "billing",
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.Upstream+"/billing", nil)
 	if err != nil {
 		out["error"] = err.Error()
@@ -129,7 +200,7 @@ func (s *Service) fetchOne(ctx context.Context, auth postgres.AccountAuth) map[s
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := client.Do(req)
+	resp, err := s.client().Do(req)
 	if err != nil {
 		out["error"] = err.Error()
 		return out
@@ -152,6 +223,24 @@ func (s *Service) fetchOne(ctx context.Context, auth postgres.AccountAuth) map[s
 	}
 	out["ok"] = norm["ok"] != false && norm["error"] == nil
 	return out
+}
+
+func envInt(name string, fallback, min, max int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	if n < min {
+		return min
+	}
+	if n > max {
+		return max
+	}
+	return n
 }
 
 func normalizeBilling(raw map[string]any) map[string]any {
@@ -248,4 +337,39 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func quotaTransport() http.RoundTripper {
+	// Prefer explicit env proxy; DefaultTransport already honors HTTP(S)_PROXY.
+	proxyURL := firstNonEmpty(
+		os.Getenv("GROK2API_XAI_PROXY"),
+		os.Getenv("GROK2API_PROXY"),
+		os.Getenv("HTTPS_PROXY"),
+		os.Getenv("HTTP_PROXY"),
+		os.Getenv("https_proxy"),
+		os.Getenv("http_proxy"),
+	)
+	base, _ := http.DefaultTransport.(*http.Transport)
+	if base == nil {
+		return http.DefaultTransport
+	}
+	tr := base.Clone()
+	if proxyURL == "" {
+		return tr
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return tr
+	}
+	tr.Proxy = http.ProxyURL(u)
+	return tr
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
 }

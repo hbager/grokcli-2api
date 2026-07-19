@@ -19,7 +19,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     GROK2API_PORT=40081 \
     GROK2API_OPEN_BROWSER=0 \
     GROK2API_STORE_BACKEND=hybrid \
-    GROK2API_RUNTIME=python \
+    GROK2API_RUNTIME=go \
+    GROK2API_GO_PUBLIC_READ=1 \
+    GROK2API_GO_CHAT=1 \
+    GROK2API_GO_MESSAGES=1 \
+    GROK2API_GO_RESPONSES=1 \
+    GROK2API_GO_ADMIN_READ=1 \
+    GROK2API_GO_ADMIN_WRITE=1 \
+    GROK2API_GO_MAINTAINER=1 \
+    GROK2API_GO_WRITES=1 \
+    GROK2API_GO_OWNERSHIP_MODE=all \
     GROK2API_WORKERS=2 \
     # App code + vendored registration protocol client
     PYTHONPATH=/app:/app/grok-build-auth \
@@ -99,15 +108,14 @@ COPY --from=go-builder /out/grok2api-migrate /app/bin/grok2api-migrate
 RUN chmod +x /app/entrypoint.sh /app/bin/grok2api /app/bin/grok2api-migrate \
     && mkdir -p /app/turnstile-solver/logs /app/turnstile-solver/keys \
     && test -f /app/grok-build-auth/xconsole_client/client.py \
-    && test -f /app/grok2api/app.py \
     && test -f /app/grok2api/upstream/grok_build_adapter.py \
-    && test -f /app/app.py \
+    && test -f /app/grok2api/admin/sso_import.py \
     && test -f /app/turnstile-solver/api_solver.py \
     && test -f /app/scripts/registration_service.py \
     && test -f /app/scripts/sso_to_auth_json.py \
     && test -x /app/bin/grok2api \
     && test -x /app/bin/grok2api-migrate \
-    && python -c "import app; import grok2api.app as pkg_app; from grok2api.upstream import grok_build_adapter; import scripts.registration_service as regsvc; print('build-check', pkg_app.APP_VERSION, grok_build_adapter.ADAPTER_BUILD, app.APP_VERSION, 'reg-sidecar-ok')"
+    && python -c "from grok2api.upstream import grok_build_adapter; from grok2api.admin import sso_import; import scripts.registration_service as regsvc; print('build-check', grok_build_adapter.ADAPTER_BUILD, 'sso-import-ok', 'reg-sidecar-ok')"
 
 EXPOSE 40081 5072
 
@@ -115,4 +123,4 @@ EXPOSE 40081 5072
 VOLUME ["/app/data"]
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["python", "app.py"]
+CMD ["/app/bin/grok2api"]

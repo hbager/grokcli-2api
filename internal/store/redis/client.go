@@ -9,14 +9,45 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const adminSessionTTLSeconds = 7 * 24 * 3600
 
+const (
+	defaultPoolSize    = 32
+	defaultDialTimeout = 800 * time.Millisecond
+	defaultIdleTimeout = 45 * time.Second
+	defaultCmdTimeout  = 2 * time.Second
+)
+
 type Client struct {
 	URL    string
 	Prefix string
+
+	poolOnce sync.Once
+	pool     *connPool
+}
+
+type connPool struct {
+	addr     string
+	password string
+	db       string
+
+	maxIdle int
+	idle    chan *pooledConn
+	dialer  net.Dialer
+
+	// closed is set on process exit paths (best-effort); pool still works if unset.
+	closed atomic.Bool
+}
+
+type pooledConn struct {
+	net.Conn
+	reader   *bufio.Reader
+	lastUsed time.Time
 }
 
 func New(urlValue, prefix string) *Client {
@@ -308,6 +339,49 @@ func (c *Client) commandArray(ctx context.Context, args ...string) ([]string, er
 	}
 }
 
+// pipeline runs multiple commands on one pooled connection (one RTT).
+func (c *Client) pipeline(ctx context.Context, cmds [][]string) ([]any, error) {
+	if !c.Enabled() {
+		return nil, errors.New("redis unavailable")
+	}
+	if len(cmds) == 0 {
+		return nil, nil
+	}
+	for _, cmd := range cmds {
+		if len(cmd) == 0 {
+			return nil, errors.New("empty redis command")
+		}
+	}
+	pool, err := c.ensurePool()
+	if err != nil {
+		return nil, err
+	}
+	pc, err := pool.borrow(ctx)
+	if err != nil {
+		return nil, err
+	}
+	deadline := deadlineFrom(ctx, defaultCmdTimeout)
+	_ = pc.SetDeadline(deadline)
+
+	for _, cmd := range cmds {
+		if err := writeRESP(pc.Conn, cmd...); err != nil {
+			pool.discard(pc)
+			return nil, err
+		}
+	}
+	out := make([]any, len(cmds))
+	for i := range cmds {
+		value, err := readRESPValue(pc.reader)
+		if err != nil {
+			pool.discard(pc)
+			return nil, err
+		}
+		out[i] = value
+	}
+	pool.put(pc)
+	return out, nil
+}
+
 func (c *Client) do(ctx context.Context, args ...string) (any, error) {
 	if !c.Enabled() {
 		return nil, errors.New("redis unavailable")
@@ -315,42 +389,148 @@ func (c *Client) do(ctx context.Context, args ...string) (any, error) {
 	if len(args) == 0 {
 		return nil, errors.New("empty redis command")
 	}
-	addr, password, db, err := parseRedisURL(c.URL)
+	pool, err := c.ensurePool()
 	if err != nil {
 		return nil, err
 	}
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	pc, err := pool.borrow(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(2 * time.Second)
+	deadline := deadlineFrom(ctx, defaultCmdTimeout)
+	_ = pc.SetDeadline(deadline)
+	if err := writeRESP(pc.Conn, args...); err != nil {
+		pool.discard(pc)
+		return nil, err
 	}
+	value, err := readRESPValue(pc.reader)
+	if err != nil {
+		pool.discard(pc)
+		return nil, err
+	}
+	pool.put(pc)
+	return value, nil
+}
+
+func (c *Client) ensurePool() (*connPool, error) {
+	var initErr error
+	c.poolOnce.Do(func() {
+		addr, password, db, err := parseRedisURL(c.URL)
+		if err != nil {
+			initErr = err
+			return
+		}
+		c.pool = &connPool{
+			addr:     addr,
+			password: password,
+			db:       db,
+			maxIdle:  defaultPoolSize,
+			idle:     make(chan *pooledConn, defaultPoolSize),
+			dialer: net.Dialer{
+				Timeout:   defaultDialTimeout,
+				KeepAlive: 30 * time.Second,
+			},
+		}
+	})
+	if initErr != nil {
+		return nil, initErr
+	}
+	if c.pool == nil {
+		return nil, errors.New("redis pool unavailable")
+	}
+	return c.pool, nil
+}
+
+func (p *connPool) borrow(ctx context.Context) (*pooledConn, error) {
+	if p == nil {
+		return nil, errors.New("redis pool unavailable")
+	}
+	for {
+		select {
+		case pc := <-p.idle:
+			if pc == nil {
+				continue
+			}
+			if time.Since(pc.lastUsed) > defaultIdleTimeout {
+				_ = pc.Close()
+				continue
+			}
+			// No PING on borrow: extra RTT would defeat TTFT pooling gains.
+			// Dead conns are discarded on the next command error path.
+			_ = pc.SetDeadline(time.Time{})
+			return pc, nil
+		default:
+			return p.dial(ctx)
+		}
+	}
+}
+
+func (p *connPool) dial(ctx context.Context) (*pooledConn, error) {
+	conn, err := p.dialer.DialContext(ctx, "tcp", p.addr)
+	if err != nil {
+		return nil, err
+	}
+	deadline := deadlineFrom(ctx, defaultCmdTimeout)
 	_ = conn.SetDeadline(deadline)
 	reader := bufio.NewReader(conn)
-	if password != "" {
-		if err := writeRESP(conn, "AUTH", password); err != nil {
+	if p.password != "" {
+		if err := writeRESP(conn, "AUTH", p.password); err != nil {
+			_ = conn.Close()
 			return nil, err
 		}
 		if _, err := readRESPValue(reader); err != nil {
+			_ = conn.Close()
 			return nil, err
 		}
 	}
-	if db != "" && db != "0" {
-		if err := writeRESP(conn, "SELECT", db); err != nil {
+	if p.db != "" && p.db != "0" {
+		if err := writeRESP(conn, "SELECT", p.db); err != nil {
+			_ = conn.Close()
 			return nil, err
 		}
 		if _, err := readRESPValue(reader); err != nil {
+			_ = conn.Close()
 			return nil, err
 		}
 	}
-	if err := writeRESP(conn, args...); err != nil {
-		return nil, err
+	_ = conn.SetDeadline(time.Time{})
+	return &pooledConn{Conn: conn, reader: reader, lastUsed: time.Now()}, nil
+}
+
+func (p *connPool) put(pc *pooledConn) {
+	if pc == nil {
+		return
 	}
-	return readRESPValue(reader)
+	if p == nil || p.closed.Load() {
+		_ = pc.Close()
+		return
+	}
+	_ = pc.SetDeadline(time.Time{})
+	pc.lastUsed = time.Now()
+	// Reset any leftover buffered data (should be empty after clean command).
+	if pc.reader.Buffered() > 0 {
+		_, _ = pc.reader.Discard(pc.reader.Buffered())
+	}
+	select {
+	case p.idle <- pc:
+	default:
+		_ = pc.Close()
+	}
+}
+
+func (p *connPool) discard(pc *pooledConn) {
+	if pc != nil {
+		_ = pc.Close()
+	}
+}
+
+func deadlineFrom(ctx context.Context, fallback time.Duration) time.Time {
+	if ctx != nil {
+		if deadline, ok := ctx.Deadline(); ok {
+			return deadline
+		}
+	}
+	return time.Now().Add(fallback)
 }
 
 func parseRedisURL(raw string) (addr, password, db string, err error) {
@@ -429,7 +609,7 @@ func readRESPValue(reader *bufio.Reader) (any, error) {
 			return nil, nil
 		}
 		buf := make([]byte, length+2)
-		if _, err := reader.Read(buf); err != nil {
+		if _, err := ioReadFull(reader, buf); err != nil {
 			return nil, err
 		}
 		return string(buf[:length]), nil
@@ -466,4 +646,17 @@ func readRESPValue(reader *bufio.Reader) (any, error) {
 	default:
 		return nil, fmt.Errorf("unexpected RESP prefix %q", prefix)
 	}
+}
+
+// ioReadFull is a tiny local helper so client.go stays free of io import churn in tests.
+func ioReadFull(r *bufio.Reader, buf []byte) (int, error) {
+	n := 0
+	for n < len(buf) {
+		nn, err := r.Read(buf[n:])
+		n += nn
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }

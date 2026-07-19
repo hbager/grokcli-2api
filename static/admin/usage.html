@@ -68,11 +68,11 @@
       try {
         var t = localStorage.getItem("g2a_theme");
         if (t !== "light" && t !== "dark") {
-          t = "dark";
+          t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
         }
         document.documentElement.setAttribute("data-theme", t);
         document.documentElement.style.colorScheme = t;
-        document.documentElement.style.background = t === "light" ? "#f6f1e7" : "#171713";
+        document.documentElement.style.background = t === "light" ? "#f5f7fb" : "#0a0a0f";
         var tok = localStorage.getItem("g2a_admin_token") || "";
         var ts = Number(localStorage.getItem("g2a_admin_token_ts") || 0) || 0;
         var grace = tok && ts && (Date.now() - ts) < 7 * 24 * 3600 * 1000;
@@ -95,7 +95,7 @@
   <title>用量 · grokcli-2api</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Azeret+Mono:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700;800&family=Barlow:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
   <link rel="stylesheet" href="/static/dist/admin-antd.880e6214a1.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
@@ -114,8 +114,7 @@
       <nav class="g2a-menu">
         <a class="g2a-menu-item " href="/admin" data-page="overview"><span class="g2a-menu-ico">◫</span><span>概览</span></a>
         <a class="g2a-menu-item " href="/admin/keys" data-page="keys"><span class="g2a-menu-ico">🔑</span><span>API Keys</span></a>
-        <a class="g2a-menu-item " href="/admin/accounts" data-page="accounts"><span class="g2a-menu-ico">👥</span><span>账号</span></a>
-        <a class="g2a-menu-item " href="/admin/rotation" data-page="rotation"><span class="g2a-menu-ico">⇄</span><span>轮询</span></a>
+        <a class="g2a-menu-item " href="/admin/accounts" data-page="accounts"><span class="g2a-menu-ico">👥</span><span>账号 / 轮询</span></a>
         <a class="g2a-menu-item is-active" href="/admin/usage" data-page="usage"><span class="g2a-menu-ico">Σ</span><span>用量</span></a>
         <a class="g2a-menu-item " href="/admin/logs" data-page="logs"><span class="g2a-menu-ico">📜</span><span>任务日志</span></a>
         <a class="g2a-menu-item " href="/admin/models" data-page="models"><span class="g2a-menu-ico">▣</span><span>模型</span></a>
@@ -331,6 +330,6 @@
   <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.d65f32a200.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.720aaf9d28.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.5b68f5842a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

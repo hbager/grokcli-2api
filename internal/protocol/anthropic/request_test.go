@@ -102,15 +102,44 @@ func TestExtractPromptCacheKeyFromMetadataAndCacheControl(t *testing.T) {
 	if got := ExtractPromptCacheKey(map[string]any{"metadata": map[string]any{"session_id": "sess-1"}}); got != "sess-1" {
 		t.Fatalf("metadata key = %q", got)
 	}
+	// Claude Code embeds session_<uuid> inside metadata.user_id.
+	ccUID := "user_abc_account__session_01234567-89ab-cdef-0123-456789abcdef"
+	if got := ExtractPromptCacheKey(map[string]any{"metadata": map[string]any{"user_id": ccUID}}); got != "session_01234567-89ab-cdef-0123-456789abcdef" {
+		t.Fatalf("claude code user_id session = %q", got)
+	}
+	// Bare global user_id must NOT become the sticky key (would pin all users to one account).
+	if got := ExtractPromptCacheKey(map[string]any{"metadata": map[string]any{"user_id": "user_only_global"}}); strings.HasPrefix(got, "user_") || got == "user_only_global" {
+		t.Fatalf("bare user_id should not be sticky key, got %q", got)
+	}
+	// System text alone yields a stable sess: digest (used for sticky/affinity when
+	// no explicit session id is present). Tools/cache_control markers are not required.
 	key := ExtractPromptCacheKey(map[string]any{
 		"system": []any{map[string]any{"type": "text", "text": "sys", "cache_control": map[string]any{"type": "ephemeral"}}},
 		"tools":  []any{map[string]any{"name": "Edit", "cache_control": map[string]any{"type": "ephemeral"}}},
 	})
-	if !strings.HasPrefix(key, "acc:") || len(key) < 10 {
-		t.Fatalf("cache_control key = %q", key)
+	if !strings.HasPrefix(key, "sess:") || len(key) < 10 {
+		t.Fatalf("system digest key = %q", key)
 	}
-	if ExtractPromptCacheKey(map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hi"}}}) != "" {
-		t.Fatalf("expected empty key without markers")
+	// First user message alone also yields sess: (sticky across growing history).
+	userKey := ExtractPromptCacheKey(map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hi"}}})
+	if !strings.HasPrefix(userKey, "sess:") || len(userKey) < 10 {
+		t.Fatalf("user digest key = %q", userKey)
+	}
+	// Truly empty body has no sticky key.
+	if ExtractPromptCacheKey(map[string]any{}) != "" {
+		t.Fatalf("expected empty key for empty body")
+	}
+}
+
+func TestExtractClaudeCodeSessionID(t *testing.T) {
+	if got := ExtractClaudeCodeSessionID("user_x__session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"); got != "session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" {
+		t.Fatalf("embedded = %q", got)
+	}
+	if got := ExtractClaudeCodeSessionID("session_plainid12345"); got != "session_plainid12345" {
+		t.Fatalf("direct = %q", got)
+	}
+	if got := ExtractClaudeCodeSessionID("user_no_session_here"); got != "" {
+		t.Fatalf("no session = %q", got)
 	}
 }
 
