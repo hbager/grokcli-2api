@@ -719,10 +719,9 @@ class XConsoleAuthClient:
 
         # Unknown non-error HTTP 200 body: continue pipeline, let SSO extraction decide.
         # This avoids false negatives on new RSC shapes.
-        if not any(x in text_l for x in hard_fail):
-            return True
-
-        return False
+        # (extract_signup_error already ran at line 660; if we reach here, no
+        # structured error was found — be permissive.)
+        return True
 
     # ----------------------------------------------------------------- SSO extraction
     def _read_sso_from_jar(self) -> Optional[str]:

@@ -3504,6 +3504,7 @@ const REG_MAIL_DOMAIN_SLOTS = {
   cfmail: "cfmail_domain",
 };
 let regMailKeys = { moemail: "", yyds: "", gptmail: "", cfmail: "" };
+let regMailKeySet = { moemail: false, yyds: false, gptmail: false, cfmail: false };
 let regMailDomains = { moemail: "", yyds: "", gptmail: "", cfmail: "" };
 // Self-hosted hosts kept per provider so MoeMail / CF never overwrite each other.
 let regMailBaseUrls = { moemail: "", cfmail: "" };
@@ -3582,13 +3583,16 @@ function syncRegMailProviderUI() {
           : "MoeMail API Key";
   }
   if ($("reg-api-key")) {
-    $("reg-api-key").placeholder = isYyds
+    const keyPlaceholder = isYyds
       ? "AC-..."
       : isGpt
         ? "sk-...（自有 Key）"
         : isCf
           ? "管理后台密码（x-admin-auth）"
           : "mk_...";
+    $("reg-api-key").placeholder = regMailKeySet[mail]
+      ? "已保存，留空不改"
+      : keyPlaceholder;
     // Show the key stored for this provider only.
     $("reg-api-key").value = regMailKeys[mail] || "";
   }
@@ -3733,6 +3737,11 @@ function applyRegConfig(cfg) {
   // provider. Never invent values for other providers.
   const hasSecretState = ["api_key", "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key"]
     .some((key) => Object.prototype.hasOwnProperty.call(cfg, key + "_set"));
+  // Track per-provider saved state for placeholder hints.
+  for (const prov of ["moemail", "yyds", "gptmail", "cfmail"]) {
+    const slot = REG_MAIL_KEY_SLOTS[prov] + "_set";
+    regMailKeySet[prov] = !!(cfg[slot] === true || cfg[slot] === "true");
+  }
   const activeKey = hasSecretState ? "" : (cfg.api_key == null ? "" : String(cfg.api_key));
   const activeDomain = cfg.domain == null ? "" : String(cfg.domain);
   regMailKeys = hasSecretState ? { moemail: "", yyds: "", gptmail: "", cfmail: "" } : {
