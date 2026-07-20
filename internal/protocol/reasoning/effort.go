@@ -1,18 +1,18 @@
 // Package reasoning normalizes thinking / reasoning effort labels across clients.
 //
-// Grok / cli-chat-proxy only has THREE outbound levels:
+// cli-chat-proxy (Grok upstream) accepts FOUR outbound levels:
 //
-//	low | medium | high
+//	low | medium | high | xhigh
 //
-// Client labels are folded onto those three:
+// Client labels are folded onto those four:
 //
 //	Codex:        auto | default | standard | extra-high
 //	Claude Code:  low  | medium  | high     | xhigh
 //
-//	auto / low / minimal     → low
-//	default / medium / med   → medium
-//	standard / high          → high
-//	extra-high / xhigh / max → high   (no separate xhigh on Grok)
+//	auto / low / minimal     -> low
+//	default / medium / med   -> medium
+//	standard / high          -> high
+//	extra-high / xhigh / max -> xhigh   (upstream accepts xhigh; rejects max/extra-high)
 package reasoning
 
 import (
@@ -21,19 +21,16 @@ import (
 	"strings"
 )
 
-// Canonical levels emitted upstream (Grok 3-tier only).
+// Canonical levels emitted upstream (Grok 4-tier).
 const (
 	Low    = "low"
 	Medium = "medium"
 	High   = "high"
+	XHigh  = "xhigh"
 )
 
-// XHigh is accepted from Claude Code / Codex clients but always folded to High
-// because Grok has no fourth tier. Kept as a name for call-site readability.
-const XHigh = High
-
 // Normalize maps free-form client effort labels (and budgets) to Grok's
-// low|medium|high. Empty means "no reasoning effort" (disabled/none).
+// low|medium|high|xhigh. Empty means "no reasoning effort" (disabled/none).
 func Normalize(value any) string {
 	switch v := value.(type) {
 	case nil:
@@ -82,10 +79,10 @@ func Normalize(value any) string {
 		switch tt {
 		case "", "disabled", "none", "false", "off", "0":
 			// fall through to enabled flag
-		case Low, Medium, High:
+		case Low, Medium, High, XHigh:
 			return tt
-		case "xhigh", "x-high":
-			return High // Claude Code top tier → Grok high
+		case "x-high":
+			return XHigh
 		case "enabled", "true", "on", "adaptive":
 			if got := Normalize(v["budget_tokens"]); got != "" {
 				return got
@@ -120,31 +117,31 @@ func normalizeString(raw string) string {
 	switch s {
 	case "none", "null", "false", "off", "disabled", "0", "no":
 		return ""
-	// ── low tier ──────────────────────────────────────────────
-	// Claude Code: low · Codex: auto · misc: minimal/fast
+	// low tier: Claude Code low, Codex auto, misc minimal/fast
 	case Low, "minimal", "min", "l", "lite", "fast", "auto":
 		return Low
-	// ── medium tier ───────────────────────────────────────────
-	// Claude Code: medium · Codex: default · misc: adaptive/enabled
+	// medium tier: Claude Code medium, Codex default
 	case Medium, "default", "normal", "balanced", "mid", "m", "med",
 		"adaptive", "enabled", "true", "on", "1":
 		return Medium
-	// ── high tier (Grok top; absorbs xhigh / extra-high) ───────
-	// Claude Code: high|xhigh · Codex: standard|extra-high
-	case High, "standard", "std", "h", "hard", "deep",
-		"xhigh", "x-high", "extra-high", "extrahigh", "extra",
+	// high tier: Claude Code high, Codex standard
+	case High, "standard", "std", "h", "hard", "deep":
+		return High
+	// xhigh tier (upstream top). Accepts "xhigh" only; fold aliases.
+	// Note: upstream rejects literal "max"/"extra-high"; fold them to xhigh.
+	case XHigh, "x-high", "extra-high", "extrahigh", "extra",
 		"max", "maximum", "maxi", "ultra", "ultra-high", "ultrahigh",
 		"highest", "maxx":
-		return High
+		return XHigh
 	}
 	if strings.HasPrefix(s, "extra") && strings.Contains(s, "high") {
-		return High
+		return XHigh
 	}
 	// Unknown non-empty labels: do not pass garbage upstream.
 	return ""
 }
 
-// BudgetToLevel maps Claude-style thinking.budget_tokens onto Grok's 3 tiers.
+// BudgetToLevel maps Claude-style thinking.budget_tokens onto Grok's 4 tiers.
 func BudgetToLevel(n int) string {
 	if n <= 0 {
 		return ""
@@ -155,8 +152,11 @@ func BudgetToLevel(n int) string {
 	if n <= 8192 {
 		return Medium
 	}
-	// Everything above (including former "xhigh" budgets) → high.
-	return High
+	if n <= 24576 {
+		return High
+	}
+	// Very large budgets -> xhigh (upstream top tier).
+	return XHigh
 }
 
 // FromRequest extracts effort from a chat/completions or Responses-shaped body.
@@ -191,7 +191,7 @@ func FromRequest(raw map[string]any) string {
 }
 
 // ApplyCanonical writes a normalized reasoning_effort into body when present.
-// Returns the canonical level (may be empty). Always low|medium|high (never xhigh).
+// Returns the canonical level (may be empty). Always low|medium|high|xhigh.
 func ApplyCanonical(body map[string]any) string {
 	if body == nil {
 		return ""

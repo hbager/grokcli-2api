@@ -552,3 +552,22 @@ func TestReadSSEWithIdleKeepalive(t *testing.T) {
 		t.Fatalf("expected keepalive idle ticks, got %d", idleN)
 	}
 }
+
+func TestClampGrokEffort(t *testing.T) {
+	cases := map[string]string{
+		"low":        "low",
+		"medium":     "medium",
+		"high":       "high",
+		"xhigh":      "xhigh",
+		"extra-high": "xhigh",
+		"max":        "xhigh",
+		"standard":   "high",
+		"auto":       "low",
+		"default":    "medium",
+	}
+	for in, want := range cases {
+		if got := clampGrokEffort(in); got != want {
+			t.Fatalf("clampGrokEffort(%q)=%q want %q", in, got, want)
+		}
+	}
+}

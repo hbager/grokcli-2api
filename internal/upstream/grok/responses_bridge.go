@@ -878,9 +878,9 @@ func asInt64(value any) (int64, bool) {
 // Ensure unused import guard for bytes in case of future binary ops.
 var _ = bytes.MinRead
 
-// clampGrokEffort folds client 4-tier labels onto Grok's three levels.
-// Grok accepts only low|medium|high — xhigh/extra-high/max must become high
-// or the upstream request can fail / be ignored.
+// clampGrokEffort folds client labels onto Grok's four levels.
+// cli-chat-proxy accepts low|medium|high|xhigh.
+// Aliases like max/extra-high are rejected upstream, so fold them to xhigh.
 func clampGrokEffort(effort string) string {
 	s := strings.ToLower(strings.TrimSpace(effort))
 	s = strings.ReplaceAll(s, "_", "-")
@@ -892,13 +892,20 @@ func clampGrokEffort(effort string) string {
 		return "low"
 	case "medium", "default", "normal", "med", "m", "adaptive", "enabled", "true", "on", "1", "balanced":
 		return "medium"
-	case "high", "standard", "std", "h",
-		"xhigh", "x-high", "extra-high", "extrahigh", "extra",
-		"max", "maximum", "ultra", "ultra-high", "highest":
+	case "high", "standard", "std", "h", "hard", "deep":
 		return "high"
+	case "xhigh", "x-high", "extra-high", "extrahigh", "extra",
+		"max", "maximum", "ultra", "ultra-high", "highest", "maxx":
+		return "xhigh"
 	default:
-		// unknown → medium (safe middle) rather than pass-through garbage
-		if strings.Contains(s, "high") || strings.Contains(s, "max") {
+		// unknown -> medium (safe middle) rather than pass-through garbage
+		if strings.HasPrefix(s, "extra") && strings.Contains(s, "high") {
+			return "xhigh"
+		}
+		if strings.Contains(s, "max") || strings.Contains(s, "ultra") {
+			return "xhigh"
+		}
+		if strings.Contains(s, "high") {
 			return "high"
 		}
 		if strings.Contains(s, "low") || s == "auto" {
