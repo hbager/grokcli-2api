@@ -68,7 +68,7 @@ _DEVICE_FLOW_LAST_TS = 0.0
 
 def _device_flow_gap_sec() -> float:
     try:
-        return max(0.0, float(os.getenv("GROK2API_SSO_DEVICE_GAP_SEC", "0.85") or 0.85))
+        return max(0.0, float(os.getenv("GROK2API_SSO_DEVICE_GAP_SEC", "0.35") or 0.35))
     except (TypeError, ValueError):
         return 0.85
 
@@ -84,14 +84,14 @@ def _device_flow_retries() -> int:
 
 def _device_flow_backoff_sec(attempt: int) -> float:
     # attempt is 1-based after a failure. Mild exponential — prefer throughput.
-    base = 1.4 * (1.45 ** max(0, attempt - 1))
+    base = 0.9 * (1.35 ** max(0, attempt - 1))
     try:
         override = os.getenv("GROK2API_SSO_DEVICE_BACKOFF_SEC")
         if override:
             base = float(override)
     except (TypeError, ValueError):
         pass
-    return max(0.8, min(25.0, base))
+    return max(0.5, min(12.0, base))
 
 
 def _wait_device_flow_slot() -> None:
@@ -398,20 +398,26 @@ def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
     timeout = _http_timeout()
     proxy_kw = _proxy_kwargs()
 
-    try:
-        r = s.get(
-            "https://accounts.x.ai/",
-            impersonate="chrome",
-            timeout=timeout,
-            **proxy_kw,
-        )
-    except Exception as e:
-        log(f"  ❌ 网络错误: {e}")
-        return None
-    if "sign-in" in r.url or "sign-up" in r.url:
-        log("  ❌ sso 无效")
-        return None
-    log("  ✅ sso 有效")
+    # Skip accounts.x.ai preflight when cookie looks like a JWT — saves 0.5-2s
+    # and avoids an extra CF challenge under proxy pressure.
+    sso_looks_jwt = str(sso_cookie or "").count(".") >= 2 and len(str(sso_cookie or "")) > 40
+    if not sso_looks_jwt:
+        try:
+            r = s.get(
+                "https://accounts.x.ai/",
+                impersonate="chrome",
+                timeout=timeout,
+                **proxy_kw,
+            )
+        except Exception as e:
+            log(f"  ❌ 网络错误: {e}")
+            return None
+        if "sign-in" in r.url or "sign-up" in r.url:
+            log("  ❌ sso 无效")
+            return None
+        log("  ✅ sso 有效")
+    else:
+        log("  ✅ sso shape ok (skip preflight)")
 
     retries = _device_flow_retries()
     for attempt in range(1, retries + 1):
@@ -494,7 +500,7 @@ def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
             dc["device_code"],
             dc.get("interval", 1),
             dc.get("expires_in", 1800),
-            timeout=float(os.getenv("GROK2API_SSO_POLL_TIMEOUT", "45") or 45),
+            timeout=float(os.getenv("GROK2API_SSO_POLL_TIMEOUT", "30") or 30),
             session=s,
             immediate=True,
         )

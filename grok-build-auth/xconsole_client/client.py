@@ -41,7 +41,10 @@ import gzip
 import http.cookiejar
 import io
 import json
+import os
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,6 +55,101 @@ from . import config as C
 from . import grpcweb
 from .models import GrpcResult, PasswordStrength, SignupResult
 from .sso import SSOExtractor
+
+# Process-wide scrape cache: next-action / router-state-tree / sitekey are
+# deployment-stable for minutes-hours. Re-downloading every JS chunk per
+# account was the #1 latency cost (~5-30s) and also crashed on empty chunk
+# lists (max_workers=0 after CF 403 HTML).
+_SCRAPE_CACHE_LOCK = threading.RLock()
+_SCRAPE_CACHE: Dict[str, dict] = {}
+try:
+    _SCRAPE_CACHE_TTL_SEC = max(
+        30.0,
+        min(
+            3600.0,
+            float(os.environ.get("GROK2API_SIGNUP_SCRAPE_TTL_SEC", "600") or 600),
+        ),
+    )
+except (TypeError, ValueError):
+    _SCRAPE_CACHE_TTL_SEC = 600.0
+
+
+def _scrape_cache_key(signup_url: str) -> str:
+    return (signup_url or C.SIGNUP_URL or "").strip() or C.SIGNUP_URL
+
+
+def get_cached_signup_scrape(signup_url: str = "") -> Optional[dict]:
+    """Return cached scrape payload if still fresh (shared across clients)."""
+    key = _scrape_cache_key(signup_url)
+    now = time.time()
+    with _SCRAPE_CACHE_LOCK:
+        hit = _SCRAPE_CACHE.get(key)
+        if not hit:
+            return None
+        if float(hit.get("expires_at") or 0) <= now:
+            _SCRAPE_CACHE.pop(key, None)
+            return None
+        return dict(hit)
+
+
+def put_cached_signup_scrape(
+    signup_url: str,
+    *,
+    next_action_id: str,
+    next_router_state_tree: str,
+    turnstile_sitekey: Optional[str] = None,
+) -> None:
+    key = _scrape_cache_key(signup_url)
+    if not next_action_id or not next_router_state_tree:
+        return
+    with _SCRAPE_CACHE_LOCK:
+        _SCRAPE_CACHE[key] = {
+            "next_action_id": next_action_id,
+            "next_router_state_tree": next_router_state_tree,
+            "turnstile_sitekey": turnstile_sitekey
+            or getattr(C, "TURNSTILE_SITEKEY", None),
+            "expires_at": time.time() + _SCRAPE_CACHE_TTL_SEC,
+            "cached_at": time.time(),
+        }
+
+
+def warm_signup_scrape(
+    *,
+    proxy: Optional[str] = None,
+    signup_url: Optional[str] = None,
+    impersonate: str = "chrome131",
+    force: bool = False,
+) -> dict:
+    """Warm process scrape cache (call once per batch). Returns cache dict."""
+    url = signup_url or C.SIGNUP_URL
+    if not force:
+        hit = get_cached_signup_scrape(url)
+        if hit:
+            return {"ok": True, "cached": True, **hit}
+    client = XConsoleAuthClient(
+        transport="curl_cffi",
+        impersonate=impersonate,
+        debug=False,
+        proxy=proxy,
+        signup_url=url,
+    )
+    try:
+        status = client.load_signup_page(force_refresh=True)
+        live = bool(getattr(client, "_scrape_from_live", False) and client.next_action_id)
+        return {
+            "ok": live and status == 200,
+            "cached": False,
+            "http_status": status,
+            "next_action_id": client.next_action_id if live else None,
+            "next_router_state_tree": client.next_router_state_tree if live else None,
+            "turnstile_sitekey": client.turnstile_sitekey,
+            "scrape_from_live": live,
+        }
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -108,7 +206,7 @@ class XConsoleAuthClient:
         transport: str = "curl_cffi",
         impersonate: str = "chrome131",
         debug: bool = False,
-        timeout: float = 30.0,
+        timeout: float = 18.0,
         proxy: Optional[str] = None,
         signup_url: Optional[str] = None,
     ):
@@ -181,25 +279,128 @@ class XConsoleAuthClient:
         status, _, _, _ = self._request("GET", C.HOME_URL, headers=h)
         return status
 
-    def load_signup_page(self) -> int:
+    def load_signup_page(self, *, force_refresh: bool = False) -> int:
         """GET the sign-up page AND scrape the current next-action / router-state-tree.
 
         The scraped values are stored on the instance and used automatically by
-        ``create_account()``.  Calling this is REQUIRED before ``create_account()``
+        create_account().  Calling this is REQUIRED before create_account()
         so the values are fresh.
+
+        When a process-wide scrape cache is warm (TTL default 600s), skip the
+        expensive JS-chunk crawl and only load cookies / CF state from the page.
+        Pass force_refresh=True to bust the cache (used by warm_signup_scrape).
         """
+        cached = None if force_refresh else get_cached_signup_scrape(self.signup_url)
+        if cached and cached.get("next_action_id") and cached.get("next_router_state_tree"):
+            self._next_action_id = str(cached["next_action_id"])
+            self._next_router_state_tree = str(cached["next_router_state_tree"])
+            self.turnstile_sitekey = cached.get("turnstile_sitekey") or getattr(
+                C, "TURNSTILE_SITEKEY", None
+            )
+            if self.debug:
+                print(
+                    f"  [scrape] cache-hit action={self._next_action_id[:16]}... "
+                    f"sitekey={self.turnstile_sitekey}"
+                )
+
         h = self._base_headers()
         h.update({"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                   "sec-fetch-site": "same-site", "sec-fetch-mode": "navigate",
                   "sec-fetch-dest": "document", "referer": "https://console.x.ai/"})
-        status, _hdrs, _sc, raw = self._request("GET", self.signup_url, headers=h)
-        html = raw.decode("utf-8", "replace")
+        # CF/proxy often returns 403 on the first hop. Retry a few times and
+        # re-check process scrape cache (background warm may land mid-retry).
+        status = 0
+        html = ""
+        alt_urls = []
+        base_url = self.signup_url
+        for u in (
+            base_url,
+            "https://accounts.x.ai/sign-up?redirect=grok-com",
+            "https://accounts.x.ai/sign-up?redirect=cloud-console",
+            "https://accounts.x.ai/sign-up",
+        ):
+            if u and u not in alt_urls:
+                alt_urls.append(u)
+
+        last_status = 0
+        last_html = ""
+        for attempt in range(1, 4):
+            # Mid-flight cache from another worker / bg warm.
+            if not cached:
+                cached = get_cached_signup_scrape(self.signup_url)
+                if cached and cached.get("next_action_id") and cached.get("next_router_state_tree"):
+                    self._next_action_id = str(cached["next_action_id"])
+                    self._next_router_state_tree = str(cached["next_router_state_tree"])
+                    self.turnstile_sitekey = cached.get("turnstile_sitekey") or getattr(
+                        C, "TURNSTILE_SITEKEY", None
+                    )
+                    if self.debug:
+                        print("  [scrape] cache became available mid-load")
+
+            url = alt_urls[(attempt - 1) % len(alt_urls)]
+            status, _hdrs, _sc, raw = self._request("GET", url, headers=h)
+            html = raw.decode("utf-8", "replace") if raw is not None else ""
+            self._last_signup_html = html
+            last_status, last_html = status, html
+            if self.debug:
+                print(f"  [scrape] GET {url} -> HTTP {status} bytes={len(html)} try={attempt}")
+
+            if cached and status != 200:
+                # Action id already known; cookies may still be partial — OK to continue.
+                if self.debug:
+                    print(f"  [scrape] cache-hit with page HTTP {status}; skip re-scrape")
+                return status
+            if status == 200 and ("__next_f" in html or "/_next/static" in html or len(html) > 20000):
+                break
+            if cached and status == 200:
+                break
+            # 403/429/5xx: brief backoff then retry (often proxy/CF flake).
+            if attempt < 3:
+                time.sleep(0.35 * attempt + (0.15 * attempt))
+
+        status, html = last_status, last_html
         self._last_signup_html = html
 
+        if cached and cached.get("next_action_id") and cached.get("next_router_state_tree"):
+            if status == 200:
+                live_key = self._scrape_turnstile_sitekey(html)
+                if live_key:
+                    self.turnstile_sitekey = live_key
+            return status
+
         # ---- scrape Next.js build-specific values from the live page ----
+        self._scrape_from_live = False
+        if status != 200:
+            # One last cache check after retries (bg warm).
+            late = get_cached_signup_scrape(self.signup_url)
+            if late and late.get("next_action_id") and late.get("next_router_state_tree"):
+                self._next_action_id = str(late["next_action_id"])
+                self._next_router_state_tree = str(late["next_router_state_tree"])
+                self.turnstile_sitekey = late.get("turnstile_sitekey") or getattr(
+                    C, "TURNSTILE_SITEKEY", None
+                )
+                if self.debug:
+                    print(f"  [scrape] late cache-hit after HTTP {status}")
+                return status
+            raise RuntimeError(
+                f"sign-up page HTTP {status}; cannot scrape next-action "
+                f"(proxy/CF). body_bytes={len(html)}. "
+                f"Fix outbound proxy / rotate IP; scrape cache empty."
+            )
         try:
             self._scrape_rsc_payload(html)
+            self._scrape_from_live = bool(self._next_action_id and self._next_router_state_tree)
         except Exception as exc:
+            late = get_cached_signup_scrape(self.signup_url)
+            if late and late.get("next_action_id") and late.get("next_router_state_tree"):
+                self._next_action_id = str(late["next_action_id"])
+                self._next_router_state_tree = str(late["next_router_state_tree"])
+                self.turnstile_sitekey = late.get("turnstile_sitekey") or getattr(
+                    C, "TURNSTILE_SITEKEY", None
+                )
+                if self.debug:
+                    print(f"  [scrape] scrape failed but late cache ok: {exc}")
+                return status
             raise RuntimeError(
                 "Failed to extract next-action / next-router-state-tree from the "
                 "live sign-up page.  The x.ai deployment may have changed its "
@@ -211,8 +412,23 @@ class XConsoleAuthClient:
             C, "TURNSTILE_SITEKEY", None
         )
 
+        # Only cache real live scrapes (never CF-403 config fallback — that
+        # produces next-action 404 on create_account).
+        if (
+            self._next_action_id
+            and self._next_router_state_tree
+            and getattr(self, "_scrape_from_live", False)
+            and status == 200
+        ):
+            put_cached_signup_scrape(
+                self.signup_url,
+                next_action_id=self._next_action_id,
+                next_router_state_tree=self._next_router_state_tree,
+                turnstile_sitekey=self.turnstile_sitekey,
+            )
+
         if self.debug:
-            print(f"  [scrape] next-action={self._next_action_id[:16]}... "
+            print(f"  [scrape] next-action={(self._next_action_id or '')[:16]}... "
                   f"({len(self._next_action_id or '')} chars)")
             print(f"  [scrape] router-state-tree len={len(self._next_router_state_tree or '')}")
             print(f"  [scrape] turnstile_sitekey={self.turnstile_sitekey}")
@@ -390,7 +606,15 @@ class XConsoleAuthClient:
             except Exception:
                 return (None, False)
 
-        with ThreadPoolExecutor(max_workers=min(8, len(ordered))) as ex:
+        if not ordered:
+            raise RuntimeError(
+                "Could not find JS chunks on the sign-up page (HTTP challenge or "
+                "empty HTML). Retry with a working proxy."
+            )
+
+        # Early-exit once sign-up action chunk is found. Never pass max_workers=0.
+        workers = max(1, min(12, len(ordered)))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {ex.submit(_fetch_and_search, url): url for url in ordered}
             for f in as_completed(futures):
                 h, is_signup = f.result()
@@ -398,6 +622,9 @@ class XConsoleAuthClient:
                     continue
                 if is_signup:
                     signup_hash = h
+                    for pending in futures:
+                        pending.cancel()
+                    break
                 elif fallback_hash is None:
                     fallback_hash = h
 
@@ -405,8 +632,7 @@ class XConsoleAuthClient:
         if action_hash is None:
             raise RuntimeError(
                 "Could not find the server action ID in any JS chunk.  "
-                "The page structure may have changed.  "
-                "As a workaround, manually set NEXT_ACTION_SIGNUP in config.py."
+                "The page structure may have changed."
             )
 
         # 4. The 42-char hex string IS the complete action ID.
@@ -450,7 +676,16 @@ class XConsoleAuthClient:
                 ok=False, http_status=status, grpc_status=None,
                 messages=[], trailers={}, raw=raw,
             )
-        parsed = grpcweb.parse_response(raw)
+        try:
+            parsed = grpcweb.parse_response(raw)
+        except Exception as parse_err:  # noqa: BLE001
+            if self.debug:
+                print(f"  [grpc] parse_response failed: {parse_err}")
+            return GrpcResult(
+                ok=False, http_status=status, grpc_status=None,
+                messages=[], trailers={"parse_error": str(parse_err)[:200]},
+                raw=raw,
+            )
         return GrpcResult(
             ok=(status == 200 and parsed["grpc_status"] == 0),
             http_status=status, grpc_status=parsed["grpc_status"],

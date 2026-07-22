@@ -4500,6 +4500,37 @@ func sharedRegistrationHTTP() *http.Client {
 	return regHTTPClient
 }
 
+// registrationStartHTTP is used only for mutating registration RPCs (start /
+// stop / reclaim / resume). Poll endpoints keep the short shared client so the
+// admin log UI stays snappy; start must tolerate mailbox create + thread spawn
+// (a few seconds), not a 600ms header timeout.
+func registrationStartHTTP() *http.Client {
+	return &http.Client{
+		Timeout: 20 * time.Second,
+		Transport: &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
+			MaxIdleConns:          64,
+			MaxIdleConnsPerHost:   32,
+			MaxConnsPerHost:       32,
+			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
+			ForceAttemptHTTP2:     true,
+		},
+	}
+}
+
+func registrationMutatingClient(options Options) *regclient.Client {
+	base := registrationClient(options)
+	if base == nil {
+		return nil
+	}
+	return &regclient.Client{
+		BaseURL: base.BaseURL,
+		Token:   base.Token,
+		HTTP:    registrationStartHTTP(),
+	}
+}
+
 func registrationClient(options Options) *regclient.Client {
 	base := strings.TrimSpace(options.RegistrationURL)
 	if base == "" {
@@ -6047,7 +6078,7 @@ func serveRegistrationStart(w http.ResponseWriter, r *http.Request, options Opti
 	if !requireAdminReadWrite(w, r, options, true) {
 		return
 	}
-	client := registrationClient(options)
+	client := registrationMutatingClient(options)
 	if client == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
 		return
@@ -6085,7 +6116,11 @@ func serveRegistrationStart(w http.ResponseWriter, r *http.Request, options Opti
 	if idem == "" {
 		idem = strings.TrimSpace(stringValue(body["idempotency_key"]))
 	}
-	payload, err := client.Start(r.Context(), body, idem)
+	// Start may create mailboxes + spawn workers; allow up to 20s (sidecar).
+	// The shared poll client is only 750ms and must not be used here.
+	startCtx, startCancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer startCancel()
+	payload, err := client.Start(startCtx, body, idem)
 	if err != nil {
 		writeRegistrationError(w, err)
 		return
@@ -6097,7 +6132,7 @@ func serveRegistrationReclaim(w http.ResponseWriter, r *http.Request, options Op
 	if !requireAdminReadWrite(w, r, options, true) {
 		return
 	}
-	client := registrationClient(options)
+	client := registrationMutatingClient(options)
 	if client == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
 		return
@@ -6121,7 +6156,7 @@ func serveRegistrationStopAll(w http.ResponseWriter, r *http.Request, options Op
 	if !requireAdminReadWrite(w, r, options, true) {
 		return
 	}
-	client := registrationClient(options)
+	client := registrationMutatingClient(options)
 	if client == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
 		return

@@ -132,8 +132,26 @@ def decode_message(data: bytes) -> List[Dict[str, Any]]:
                            "float": struct.unpack("<f", chunk)[0] if len(chunk) == 4 else None,
                            "uint": struct.unpack("<I", chunk)[0] if len(chunk) == 4 else None,
                            "hex": chunk.hex()})
+        elif wt in (3, 4):
+            # Deprecated protobuf groups. Almost always means the body is not a
+            # real protobuf payload (HTML/CF/JSON mis-framed). Soft-stop.
+            fields.append({
+                "field": field_no,
+                "type": "group_marker",
+                "wire_type": wt,
+                "offset": i,
+            })
+            if wt == 3:
+                break
+            continue
         else:
-            raise ValueError(f"unsupported wire type {wt} at offset {i}")
+            fields.append({
+                "field": field_no,
+                "type": "unknown_wire",
+                "wire_type": wt,
+                "offset": i,
+            })
+            break
     return fields
 
 
@@ -153,7 +171,12 @@ def parse_response(body: bytes) -> Dict[str, Any]:
     messages: List[List[Dict[str, Any]]] = []
     trailers: Dict[str, str] = {}
     i = 0
-    n = len(body)
+    n = len(body or b"")
+    if n and n < 5:
+        return {"messages": [], "trailers": {}, "grpc_status": None}
+    head = (body or b"")[:24].lstrip()
+    if head.startswith((b"<", b"{", b"error", b"Error")):
+        return {"messages": [], "trailers": {}, "grpc_status": None}
     while i + 5 <= n:
         flag = body[i]
         length = struct.unpack(">I", body[i + 1:i + 5])[0]
@@ -165,6 +188,19 @@ def parse_response(body: bytes) -> Dict[str, Any]:
                     k, v = line.split(":", 1)
                     trailers[k.strip().lower()] = v.strip()
         else:
-            messages.append(decode_message(payload))
-    grpc_status = int(trailers["grpc-status"]) if "grpc-status" in trailers else None
+            try:
+                messages.append(decode_message(payload))
+            except Exception as exc:  # noqa: BLE001
+                messages.append([{
+                    "field": 0,
+                    "type": "decode_error",
+                    "value": str(exc),
+                    "hex": (payload[:64].hex() if payload else ""),
+                }])
+    grpc_status = None
+    if "grpc-status" in trailers:
+        try:
+            grpc_status = int(trailers["grpc-status"])
+        except (TypeError, ValueError):
+            grpc_status = None
     return {"messages": messages, "trailers": trailers, "grpc_status": grpc_status}

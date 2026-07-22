@@ -7383,7 +7383,19 @@ async function pollRegSession() {
         (Number((batch.imported || 0) + (batch.error || 0) + (batch.cancelled || 0)) > 0 &&
           Number((batch.imported || 0) + (batch.error || 0) + (batch.cancelled || 0)) >=
             Number(batch.total || batch.count || 0) &&
-          !batchRunningNow));
+          !batchRunningNow) ||
+        // Spawner exited: finished>=count and runner_alive=false (status lag).
+        (batch.runner_alive === false &&
+          !batchRunningNow &&
+          Number(batch.finished || batch.done || 0) > 0 &&
+          Number(batch.finished || batch.done || 0) >=
+            Number(batch.total || batch.count || 0)) ||
+        // ok_count+fail_count cover the batch even when done lag.
+        (batch.runner_alive === false &&
+          !batchRunningNow &&
+          Number((batch.ok_count || batch.imported || 0) + (batch.fail_count || batch.error || 0)) >=
+            Number(batch.total || batch.count || 0) &&
+          Number(batch.total || batch.count || 0) > 0));
     const batchStopping =
       !!regStopping ||
       batchStatus === "stopping" ||

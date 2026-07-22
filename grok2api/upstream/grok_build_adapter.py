@@ -31,10 +31,10 @@ ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
 DATA_DIR = ROOT / "data"
 REGISTER_SSO_DIR = DATA_DIR / "register_sso"
-ADAPTER_BUILD = "v1.9.96-reg-mt-captcha-success"
+ADAPTER_BUILD = "v1.9.104-reg-batch-terminal"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
-    os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
+    os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "5") or 5
 )
 
 YESCAPTCHA_KEY = (
@@ -63,11 +63,11 @@ LOCAL_SOLVER_URL = (
 # Batch count is intentionally uncapped — only concurrency bounds parallelism.
 # Local Camoufox ≈ 200–400MB per browser; keep MAX <= TURNSTILE_THREAD_MAX.
 try:
-    MAX_CONCURRENCY = max(1, min(8, int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "4") or 4)))
+    MAX_CONCURRENCY = max(1, min(8, int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "6") or 6)))
 except (TypeError, ValueError):
     MAX_CONCURRENCY = 4
 try:
-    DEFAULT_CONCURRENCY = max(1, min(MAX_CONCURRENCY, int(os.environ.get("GROK2API_REG_CONCURRENCY", "3") or 3)))
+    DEFAULT_CONCURRENCY = max(1, min(MAX_CONCURRENCY, int(os.environ.get("GROK2API_REG_CONCURRENCY", "4") or 4)))
 except (TypeError, ValueError):
     DEFAULT_CONCURRENCY = 3
 # Hard cap when captcha_provider=local. Default 3 so multi-thread reg can use a
@@ -75,7 +75,7 @@ except (TypeError, ValueError):
 try:
     LOCAL_CAPTCHA_MAX_CONCURRENCY = max(
         1,
-        min(6, int(os.environ.get("GROK2API_REG_LOCAL_CONCURRENCY", "3") or 3)),
+        min(6, int(os.environ.get("GROK2API_REG_LOCAL_CONCURRENCY", "4") or 4)),
     )
 except (TypeError, ValueError):
     LOCAL_CAPTCHA_MAX_CONCURRENCY = 3
@@ -127,7 +127,7 @@ try:
         1,
         min(
             8,
-            int(os.environ.get("GROK2API_REG_GLOBAL_INFLIGHT", "4") or 4),
+            int(os.environ.get("GROK2API_REG_GLOBAL_INFLIGHT", "6") or 6),
         ),
     )
 except (TypeError, ValueError):
@@ -1921,6 +1921,49 @@ def start_registration(
         except Exception:
             pass
 
+    # Warm Next.js action/scrape cache in the background. MUST NOT block
+    # POST /jobs — Go admin client only waits ~750ms for response headers,
+    # so a synchronous 5-30s scrape warm made registration appear broken:
+    # net/http: timeout awaiting response headers.
+    try:
+        from xconsole_client.client import get_cached_signup_scrape, warm_signup_scrape
+
+        warm_proxy = ""
+        try:
+            warm_proxy = _pick_proxy_from_pool(
+                _proxy_pool(proxy, username=proxy_username, password=proxy_password),
+                strategy=(proxy_strategy or "round_robin"),
+                index=0,
+            ) or (proxy or "")
+        except Exception:
+            warm_proxy = proxy or ""
+        signup_url = "https://accounts.x.ai/sign-up?redirect=grok-com"
+        if get_cached_signup_scrape(signup_url):
+            print(f"[registration] signup-scrape-warm cache-hit [{ADAPTER_BUILD}]")
+        else:
+            def _bg_warm(px: str = warm_proxy or "") -> None:
+                try:
+                    warm = warm_signup_scrape(
+                        proxy=px or None,
+                        signup_url=signup_url,
+                        force=False,
+                    )
+                    print(
+                        f"[registration] signup-scrape-warm ok={warm.get('ok')} "
+                        f"cached={warm.get('cached')} http={warm.get('http_status')} "
+                        f"[{ADAPTER_BUILD}]"
+                    )
+                except Exception as warm_err:  # noqa: BLE001
+                    print(f"[registration] signup-scrape-warm skipped: {warm_err}")
+
+            threading.Thread(
+                target=_bg_warm,
+                daemon=True,
+                name="gba-signup-scrape-warm",
+            ).start()
+    except Exception as warm_err:  # noqa: BLE001
+        print(f"[registration] signup-scrape-warm spawn failed: {warm_err}")
+
     try:
         n = int(count if count is not None else 1)
     except (TypeError, ValueError):
@@ -1944,9 +1987,9 @@ def start_registration(
         workers = max(1, min(workers, LOCAL_CAPTCHA_MAX_CONCURRENCY, n))
 
     try:
-        stagger = int(stagger_ms if stagger_ms is not None else 400)
+        stagger = int(stagger_ms if stagger_ms is not None else 150)
     except (TypeError, ValueError):
-        stagger = 400
+        stagger = 150
     stagger = max(0, min(stagger, 10_000))
     # Do not raise stagger here — batch runner / resume may apply MIN_STAGGER only
     # when env is set. Admin form value must win by default.
@@ -2955,29 +2998,149 @@ def _run_registration(
         import grok2api.pool.accounts as accounts
         from grok2api.config import UPSTREAM_BASE
 
-        update("registering", "loading signup page")
-        _check_cancel()
-        client = XConsoleAuthClient(
-            debug=False,
-            proxy=proxy or "",
-            signup_url="https://accounts.x.ai/sign-up?redirect=grok-com",
-        )
-        # Skip visit_home() — load_signup_page() handles CF cookies via curl_cffi.
-        # Saves ~1s per account.
-        _check_cancel()
-        client.load_signup_page()
+        signup_url = "https://accounts.x.ai/sign-up?redirect=grok-com"
+        # Prefer process scrape cache (warmed at batch start) for sitekey/action.
+        try:
+            from xconsole_client.client import get_cached_signup_scrape
 
-        sitekey = (
-            getattr(client, "turnstile_sitekey", None)
+            _scrape_hit = get_cached_signup_scrape(signup_url) or {}
+        except Exception:
+            _scrape_hit = {}
+        cached_sitekey = str(
+            (_scrape_hit or {}).get("turnstile_sitekey")
             or getattr(C, "TURNSTILE_SITEKEY", None)
             or ""
         ).strip()
-        website_url = (getattr(client, "signup_url", None) or C.SIGNUP_URL or "").strip()
+        website_url = signup_url
+        sitekey = cached_sitekey
+
+        update(
+            "registering",
+            "loading signup page"
+            + (" (scrape-cache-hit)" if _scrape_hit else " (scrape cold)"),
+        )
+        _check_cancel()
+        # Shorter per-request timeout + fast fail/retry beats hanging 30s on
+        # a dead proxy tunnel (curl 28). Overall wall time still improves.
+        try:
+            client_timeout = float(os.environ.get("GROK2API_REG_HTTP_TIMEOUT", "18") or 18)
+        except (TypeError, ValueError):
+            client_timeout = 18.0
+        client_timeout = max(8.0, min(45.0, client_timeout))
+        client = XConsoleAuthClient(
+            debug=False,
+            proxy=proxy or "",
+            signup_url=signup_url,
+            timeout=client_timeout,
+        )
+        # Skip visit_home() — load_signup_page() handles CF cookies via curl_cffi.
+        # With warm scrape cache this is ~0.3-2s (cookies only), not 5-30s.
+        _check_cancel()
+        t_load0 = time.time()
+        load_err = None
+        # Prefer not to force_refresh on first failures when cache is empty —
+        # force_refresh cannot invent next-action under CF 403. Instead rotate
+        # proxy (if pool) and/or wait for background scrape warm.
+        proxy_pool = []
+        try:
+            proxy_pool = _proxy_pool(proxy) if proxy else []
+        except Exception:
+            proxy_pool = [proxy] if proxy else []
+        if not proxy_pool and proxy:
+            proxy_pool = [proxy]
+
+        for load_try in range(1, 5):
+            try:
+                # Wait briefly for bg warm on early tries when cache empty.
+                try:
+                    from xconsole_client.client import get_cached_signup_scrape as _gcs
+                    if load_try > 1 and not _gcs(signup_url):
+                        time.sleep(min(2.0, 0.5 * load_try))
+                except Exception:
+                    pass
+                client.load_signup_page(force_refresh=False)
+                # Require action id present after load.
+                if not getattr(client, "next_action_id", None) and not getattr(client, "_next_action_id", None):
+                    raise RuntimeError("signup page loaded but next-action missing")
+                load_err = None
+                break
+            except Exception as e:  # noqa: BLE001
+                load_err = e
+                emsg = str(e)
+                update(
+                    "registering",
+                    f"signup page scrape failed try {load_try}/4: {emsg[:180]}",
+                )
+                # Do NOT always bust cache — a warm cache is the recovery path
+                # under CF 403. Only bust if the error looks like stale action.
+                if "404" in emsg or "stale" in emsg.lower():
+                    try:
+                        from xconsole_client.client import (
+                            _SCRAPE_CACHE,
+                            _SCRAPE_CACHE_LOCK,
+                            _scrape_cache_key,
+                        )
+                        with _SCRAPE_CACHE_LOCK:
+                            _SCRAPE_CACHE.pop(_scrape_cache_key(signup_url), None)
+                    except Exception:
+                        pass
+                # Rotate proxy for next attempt when pool has multiple entries.
+                if proxy_pool and load_try < 4:
+                    try:
+                        next_px = proxy_pool[load_try % len(proxy_pool)] or ""
+                        if next_px != (proxy or ""):
+                            proxy = next_px
+                            client = XConsoleAuthClient(
+                                debug=False,
+                                proxy=proxy or "",
+                                signup_url=signup_url,
+                                timeout=client_timeout,
+                            )
+                            update(
+                                "registering",
+                                f"rotated proxy for signup load try {load_try + 1}/4",
+                            )
+                    except Exception:
+                        pass
+                time.sleep(0.5 * load_try)
+        if load_err is not None:
+            # Final recovery: if process cache is warm now, build a fresh client
+            # and load with cache (even if GET is still 403).
+            try:
+                from xconsole_client.client import get_cached_signup_scrape as _gcs2
+                if _gcs2(signup_url):
+                    client = XConsoleAuthClient(
+                        debug=False,
+                        proxy=proxy or "",
+                        signup_url=signup_url,
+                        timeout=client_timeout,
+                    )
+                    client.load_signup_page(force_refresh=False)
+                    load_err = None
+            except Exception as e3:  # noqa: BLE001
+                load_err = e3
+        if load_err is not None:
+            raise RuntimeError(
+                f"signup page load failed: {load_err}. "
+                f"Usually Cloudflare 403 via proxy — rotate/fix XAI proxy pool."
+            ) from load_err
+        load_ms = int((time.time() - t_load0) * 1000)
+        sitekey = (
+            getattr(client, "turnstile_sitekey", None)
+            or sitekey
+            or getattr(C, "TURNSTILE_SITEKEY", None)
+            or ""
+        ).strip()
+        website_url = (getattr(client, "signup_url", None) or signup_url or C.SIGNUP_URL or "").strip()
         if not sitekey:
             raise RuntimeError(
                 "Turnstile sitekey missing. Signup page scrape failed and "
                 "config TURNSTILE_SITEKEY is empty."
             )
+        update(
+            "registering",
+            f"signup page ready in {load_ms}ms sitekey={sitekey[:18]}… [{ADAPTER_BUILD}]",
+        )
 
         provider = (
             CAPTCHA_PROVIDER
@@ -3041,7 +3204,7 @@ def _run_registration(
             endpoint=endpoint,
             # Keep captcha wait bounded; cancel still interrupts via on_progress.
             timeout=float(os.environ.get("GROK2API_YESCAPTCHA_TIMEOUT", "120") or 120),
-            poll_interval=float(os.environ.get("GROK2API_YESCAPTCHA_POLL", "2") or 2),
+            poll_interval=float(os.environ.get("GROK2API_YESCAPTCHA_POLL", "1") or 1),
             debug=False,
             on_progress=_turnstile_progress,
             # Local: no cloud fallback. YesCaptcha: allow cn/global peer fallback.
@@ -3218,7 +3381,7 @@ def _run_registration(
             code = receiver.wait_for_code(
                 timeout=120.0,
                 should_cancel=_mail_should_cancel,
-                poll_interval=1.0,
+                poll_interval=0.5,
                 on_tick=_mail_on_tick,
             )
         except TypeError:
@@ -3317,7 +3480,7 @@ def _run_registration(
                 # Brief cool-down so CF/Turnstile risk score can drop.
                 try:
                     cool = float(
-                        os.environ.get("GROK2API_REG_CREATE_COOLDOWN_SEC", "2.5")
+                        os.environ.get("GROK2API_REG_CREATE_COOLDOWN_SEC", "1.2")
                         or 2.5
                     )
                 except (TypeError, ValueError):
@@ -3341,7 +3504,7 @@ def _run_registration(
                             code = receiver.wait_for_code(
                                 timeout=120,
                                 should_cancel=_mail_should_cancel,
-                                poll_interval=1.0,
+                                poll_interval=0.5,
                                 on_tick=_mail_on_tick,
                             )
                         except TypeError:
@@ -3360,7 +3523,8 @@ def _run_registration(
                         print(f"[grok-build-auth] email code refresh failed: {mail_err}")
                         break
 
-            # verify immediately before create_account (same second when possible)
+            # verify immediately before create_account (same second when possible).
+            # Treat verify timeouts as soft: create_account still carries the code.
             try:
                 vres = client.verify_email_validation_code(email, code)
                 print(
@@ -3370,22 +3534,48 @@ def _run_registration(
                     f"grpc={getattr(vres, 'grpc_status', None)}"
                 )
             except Exception as v_err:  # noqa: BLE001
+                vmsg = str(v_err)
                 print(f"[grok-build-auth] verify_email error: {v_err}")
+                # Proxy tunnel death on verify should not burn full create timeout.
+                if any(x in vmsg.lower() for x in ("timed out", "timeout", "curl: (28)", "curl: (56)", "connect tunnel")):
+                    _note_reg_pressure(f"verify timeout: {v_err}", pause_sec=2)
 
             update(
                 "creating_account",
                 f"creating xAI account (attempt {ca}/{create_attempts})",
             )
-            res = client.create_account(
-                email=email,
-                given_name="User",
-                family_name="Grok",
-                password=password,
-                email_validation_code=code,
-                turnstile_token=turnstile,
-                castle_request_token="",
-                conversion_id=str(uuid.uuid4()),
-            )
+            try:
+                res = client.create_account(
+                    email=email,
+                    given_name="User",
+                    family_name="Grok",
+                    password=password,
+                    email_validation_code=code,
+                    turnstile_token=turnstile,
+                    castle_request_token="",
+                    conversion_id=str(uuid.uuid4()),
+                )
+            except Exception as create_exc:  # noqa: BLE001
+                cmsg = str(create_exc)
+                print(f"[grok-build-auth] create_account transport exception: {create_exc}")
+                if ca < create_attempts and any(
+                    x in cmsg.lower()
+                    for x in (
+                        "timed out",
+                        "timeout",
+                        "curl: (28)",
+                        "curl: (56)",
+                        "curl: (35)",
+                        "connect tunnel",
+                        "connection reset",
+                        "connection aborted",
+                    )
+                ):
+                    _note_reg_pressure(f"create transport: {create_exc}", pause_sec=3)
+                    signup_err = cmsg[:200]
+                    need_fresh_email_code = False
+                    continue
+                raise
             sc = list(getattr(res, "set_cookies", None) or [])
             rsc_body = getattr(res, "rsc_body", "") or ""
             rsc_size = len(rsc_body.encode("utf-8"))
@@ -3408,8 +3598,32 @@ def _run_registration(
 
 
             if http_status != 200:
+                # 404 almost always means stale next-action id (xAI redeploy).
+                if http_status == 404 and ca < create_attempts:
+                    update(
+                        "registering",
+                        f"create_account HTTP 404 (stale next-action?); re-scrape signup [{ADAPTER_BUILD}]",
+                    )
+                    try:
+                        from xconsole_client.client import (
+                            _SCRAPE_CACHE,
+                            _SCRAPE_CACHE_LOCK,
+                            _scrape_cache_key,
+                        )
+
+                        with _SCRAPE_CACHE_LOCK:
+                            _SCRAPE_CACHE.pop(_scrape_cache_key(signup_url), None)
+                    except Exception:
+                        pass
+                    try:
+                        client.load_signup_page(force_refresh=True)
+                        need_fresh_email_code = True
+                        signup_err = signup_err or "http_404_stale_action"
+                        continue
+                    except Exception as re_scrape_err:  # noqa: BLE001
+                        print(f"[grok-build-auth] re-scrape after 404 failed: {re_scrape_err}")
                 # Non-200: retry on 403/408/429/5xx (CF hold / rate / upstream flake).
-                retryable_http = http_status in (403, 408, 409, 425, 429) or http_status >= 500
+                retryable_http = http_status in (403, 404, 408, 409, 425, 429) or http_status >= 500
                 if retryable_http and ca < create_attempts:
                     need_fresh_email_code = False
                     _note_reg_pressure(
@@ -3465,15 +3679,43 @@ def _run_registration(
 
         sso = None
         sso_attempts: list[str] = []
+        # Fast path first: Set-Cookie / RSC body (0 network). Successful create
+        # usually already carries sso — the multi-hop fetch_sso_token path was
+        # adding 10-20s after account creation.
         try:
-            sso = client.fetch_sso_token(
-                email=email, password=password, save=True, retries=5
+            from xconsole_client.sso import (
+                SSOExtractor,
+                parse_sso_from_set_cookies,
+                parse_sso_token_from_text,
             )
+
+            sso = parse_sso_from_set_cookies(sc) or parse_sso_token_from_text(rsc_body)
+            if not sso:
+                try:
+                    sso = client._read_sso_from_jar()  # type: ignore[attr-defined]
+                    if sso:
+                        sso_attempts.append("cookie_jar")
+                except Exception:
+                    pass
             if sso:
-                sso_attempts.append("fetch_sso_token")
-        except Exception as sso_fetch_err:  # noqa: BLE001
-            print(f"[grok-build-auth] fetch_sso_token error: {sso_fetch_err}")
-            sso_attempts.append(f"fetch_sso_token_err:{sso_fetch_err}")
+                sso_attempts.append("parse_set_cookie_or_rsc")
+                print(
+                    f"[grok-build-auth] fast SSO hit via {sso_attempts[-1]} "
+                    f"len={len(str(sso))}"
+                )
+        except Exception as parse_err:  # noqa: BLE001
+            print(f"[grok-build-auth] fast SSO parse error: {parse_err}")
+
+        if not sso:
+            try:
+                sso = client.fetch_sso_token(
+                    email=email, password=password, save=True, retries=2
+                )
+                if sso:
+                    sso_attempts.append("fetch_sso_token")
+            except Exception as sso_fetch_err:  # noqa: BLE001
+                print(f"[grok-build-auth] fetch_sso_token error: {sso_fetch_err}")
+                sso_attempts.append(f"fetch_sso_token_err:{sso_fetch_err}")
 
         if not sso:
             try:
@@ -3487,7 +3729,7 @@ def _run_registration(
                     rsc_body
                 )
                 if sso:
-                    sso_attempts.append("parse_set_cookie_or_rsc")
+                    sso_attempts.append("parse_set_cookie_or_rsc_retry")
                 if not sso and rsc_body:
                     extractor = SSOExtractor(
                         transport_request=client._request,
@@ -3659,14 +3901,70 @@ def _run_registration(
         )
         import scripts.sso_to_auth_json as sso_import
 
-        token = sso_import.sso_to_token(sso)
+        token = sso_import.sso_to_token(sso, quiet=True)
         if not token or not token.get("access_token"):
-            _note_reg_pressure("device-flow conversion failed", pause_sec=10)
+            _note_reg_pressure("device-flow conversion failed", pause_sec=6)
+            # Soft-success path: account + SSO are real. Persist SSO now so
+            # admin can re-run SSO import later without re-registering. Do not
+            # hard-fail the whole registration after create_account already
+            # succeeded (mailbox/email already burned).
+            update(
+                "importing",
+                f"device-flow rate-limited; importing SSO-only account for later convert [{ADAPTER_BUILD}]",
+            )
+            sso_cookie = str(sso or "").strip()
+            reg_password = str(password or sess.get("password") or "").strip()
+            import_payload = {
+                "key": f"sso-pending:{email}",
+                "auth_mode": "sso_pending",
+                "email": email,
+                "source": "register-email",
+                "registration_session_id": sid,
+                "sso": sso_cookie,
+                "sso_cookie": sso_cookie,
+                "sso_token": sso_cookie,
+                "session_cookies": {"sso": sso_cookie, "sso-rw": sso_cookie},
+                "cookie": f"sso={sso_cookie}",
+                "password": reg_password,
+                "register_password": reg_password,
+                "needs_sso_convert": True,
+            }
+            if sess.get("batch_id"):
+                import_payload["registration_batch_id"] = sess.get("batch_id")
+            try:
+                from grok2api.pool.accounts import merge_durable_account_fields as _mdf
+                _mdf(import_payload, None)
+            except Exception:
+                pass
+            import_result = accounts.import_auth_payload(import_payload, merge=True)
+            if import_result.get("ok"):
+                imported_rows = [
+                    x for x in (import_result.get("imported") or []) if isinstance(x, dict)
+                ]
+                imported_ids = [str(x.get("id")) for x in imported_rows if x.get("id")]
+                update(
+                    "imported",
+                    f"SSO saved (device-flow deferred); re-convert later via import-sso [{ADAPTER_BUILD}]",
+                    sso=sso_cookie,
+                    imported_account_ids=imported_ids,
+                    imported_accounts=[
+                        {"id": x.get("id"), "email": x.get("email") or email}
+                        for x in imported_rows
+                        if x.get("id") or x.get("email")
+                    ],
+                    auth_json=import_result,
+                    oauth={"path": "sso_pending", "email": email},
+                    device_flow_deferred=True,
+                )
+                if admission_flag is not None:
+                    _release_reg_admission_once(admission_flag)
+                return
             raise RuntimeError(
                 "SSO obtained but sso_to_auth_json conversion failed "
                 "(device verify/approve/token poll; often xAI device-flow "
                 "rate_limited/slow_down under concurrent registration). "
-                f"adapter_build={ADAPTER_BUILD}; sso_set={bool(sso)}"
+                f"adapter_build={ADAPTER_BUILD}; sso_set={bool(sso)}; "
+                f"sso_only_import_error={import_result.get('error')}"
             )
         _key, entry = sso_import.token_to_auth_entry(token, email=email)
         # Keep the raw SSO cookie with the account so export/re-import works
@@ -5140,6 +5438,43 @@ def _batch_stats(
         if bst == "stopping" and running:
             status = "running"
 
+    # Spawner finished but session tally lagged → still report terminal.
+    if isinstance(batch, dict) and running == 0 and status == "running":
+        try:
+            runner_alive = bool(batch.get("runner_alive"))
+        except Exception:
+            runner_alive = True
+        try:
+            finished_n = int(batch.get("finished") or 0)
+        except Exception:
+            finished_n = 0
+        try:
+            ok_n = int(batch.get("ok_count") or batch.get("imported") or imported or 0)
+        except Exception:
+            ok_n = imported
+        try:
+            fail_n = int(batch.get("fail_count") or batch.get("error") or error or 0)
+        except Exception:
+            fail_n = error
+        if (not runner_alive) and (
+            finished_n >= target or (ok_n + fail_n) >= target or done >= target
+        ):
+            if fail_n and not ok_n:
+                status = "error"
+            elif fail_n:
+                status = "partial"
+            else:
+                status = "done"
+            if finished_n > done:
+                done = finished_n
+            if ok_n > imported:
+                imported = ok_n
+            if fail_n > error:
+                error = fail_n
+        bst = str(batch.get("status") or "").lower()
+        if running == 0 and bst in ("done", "partial", "error", "cancelled", "stopped"):
+            status = bst
+
     return {
         "total": max(total, target),
         "imported": imported,
@@ -5190,15 +5525,42 @@ def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
         sessions.extend(term[: MAX_BATCH_SESSIONS - len(sessions)])
     out = {**_compact_batch(b), **stats, "sessions": sessions}
     # Surface effective status for older UIs that only read `status`.
-    if stats.get("batch_status"):
-        # Don't clobber an explicit cooperative "stopping" marker while workers live.
-        if str(b.get("status") or "").lower() != "stopping" or stats.get("running", 0) == 0:
-            if stats.get("running", 0) == 0 or str(b.get("status") or "").lower() in (
-                "",
-                "running",
-                "starting",
-            ):
-                out["status"] = stats["batch_status"]
+    eff = str(stats.get("batch_status") or "").lower()
+    stored = str(b.get("status") or "").lower()
+    running_n = int(stats.get("running") or 0)
+    if stored == "stopping" and running_n > 0:
+        out["status"] = "stopping"
+        out["batch_status"] = "stopping"
+    elif eff:
+        out["status"] = eff
+        out["batch_status"] = eff
+    elif stored:
+        out["status"] = stored
+        out["batch_status"] = stored
+    # Dead spawner + finished >= count must never stay status=running (UI poll loop).
+    try:
+        finished_n = int(out.get("finished") if out.get("finished") is not None else b.get("finished") or 0)
+        count_n = int(out.get("count") or out.get("total") or b.get("count") or 0)
+        runner_alive = bool(b.get("runner_alive"))
+    except Exception:
+        finished_n, count_n, runner_alive = 0, 0, True
+    if (
+        (not runner_alive)
+        and running_n == 0
+        and count_n > 0
+        and finished_n >= count_n
+        and str(out.get("status") or "").lower() == "running"
+    ):
+        ok_n = int(out.get("ok_count") or out.get("imported") or 0)
+        fail_n = int(out.get("fail_count") or out.get("error") or 0)
+        if fail_n and not ok_n:
+            out["status"] = out["batch_status"] = "error"
+        elif fail_n:
+            out["status"] = out["batch_status"] = "partial"
+        else:
+            out["status"] = out["batch_status"] = "done"
+        out["done"] = max(int(out.get("done") or 0), finished_n)
+        out["runner_alive"] = False
     return out
 
 
