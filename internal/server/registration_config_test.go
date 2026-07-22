@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -250,5 +252,209 @@ func TestSplitProxyLines(t *testing.T) {
 	lines := splitProxyLines("http://a:1\n#c\nhttp://b:2;http://c:3")
 	if len(lines) != 3 {
 		t.Fatalf("lines=%v", lines)
+	}
+}
+
+func TestMailSecretFitsSlot(t *testing.T) {
+	tests := []struct {
+		name string
+		slot string
+		key  string
+		fits bool
+	}{
+		{name: "MoeMail", slot: "moemail_api_key", key: "mk_abc", fits: true},
+		{name: "MoeMail rejects YYDS", slot: "moemail_api_key", key: "AC-yyds"},
+		{name: "MoeMail rejects GPTMail", slot: "moemail_api_key", key: "sk-gpt"},
+		{name: "YYDS", slot: "yyds_api_key", key: "AC-yyds", fits: true},
+		{name: "YYDS rejects MoeMail", slot: "yyds_api_key", key: "mk_abc"},
+		{name: "GPTMail", slot: "gptmail_api_key", key: "sk-gpt", fits: true},
+		{name: "GPTMail rejects YYDS", slot: "gptmail_api_key", key: "AC-yyds"},
+		{name: "GPTMail rejects MoeMail", slot: "gptmail_api_key", key: "mk_abc"},
+		{name: "CFMail", slot: "cfmail_api_key", key: "cf-token", fits: true},
+		{name: "TempMail free", slot: "tempmail_api_key", key: "", fits: true},
+		{name: "TempMail paid", slot: "tempmail_api_key", key: "some-paid-bearer-token", fits: true},
+		{name: "TempMail rejects MoeMail", slot: "tempmail_api_key", key: "mk_moe"},
+		{name: "TempMail rejects YYDS", slot: "tempmail_api_key", key: "AC-yyds"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := mailSecretFitsSlot(tt.slot, tt.key); got != tt.fits {
+				t.Fatalf("mailSecretFitsSlot(%q, %q)=%v want %v", tt.slot, tt.key, got, tt.fits)
+			}
+		})
+	}
+}
+
+func TestSanitizeRegistrationMailSecretsMovesPollutedKeys(t *testing.T) {
+	cfg := map[string]any{
+		"mail_provider":    "moemail",
+		"moemail_api_key":  "AC-c1965a37122be549cc25724a",
+		"yyds_api_key":     "",
+		"gptmail_api_key":  "AC-c1965a37122be549cc25724a",
+		"moemail_domain":   "lolicr.com",
+		"moemail_base_url": "",
+		"domain":           "lolicr.com",
+		"api_key":          "AC-c1965a37122be549cc25724a",
+	}
+	sanitizeRegistrationMailSecrets(cfg)
+	if cfg["moemail_api_key"] != "" {
+		t.Fatalf("polluted moemail key should be cleared, got %v", cfg["moemail_api_key"])
+	}
+	if cfg["yyds_api_key"] != "AC-c1965a37122be549cc25724a" {
+		t.Fatalf("AC- should move to yyds, got %v", cfg["yyds_api_key"])
+	}
+	if cfg["gptmail_api_key"] != "" {
+		t.Fatalf("polluted gptmail key should be cleared, got %v", cfg["gptmail_api_key"])
+	}
+	if cfg["api_key"] != "" {
+		t.Fatalf("moemail active api_key should be empty after sanitize, got %v", cfg["api_key"])
+	}
+}
+
+func TestRegistrationConfigPatchForPersistDropsAdapterRemap(t *testing.T) {
+	req := map[string]any{
+		"mail_provider":    "yyds",
+		"yyds_api_key":     "AC-new-yyds",
+		"moemail_api_key":  "mk_real_moemail",
+		"moemail_base_url": "https://moemail.example.com",
+		"domain":           "",
+	}
+	merged := map[string]any{
+		"mail_provider":    "yyds",
+		"yyds_api_key":     "AC-new-yyds",
+		"moemail_api_key":  "AC-new-yyds",
+		"moemail_base_url": "",
+		"base_url":         "",
+		"api_key":          "AC-new-yyds",
+		"domain":           "",
+	}
+	patch := registrationConfigPatchForPersist(req, merged)
+	if _, ok := patch["moemail_api_key"]; ok {
+		t.Fatalf("patch must not include remapped moemail_api_key, got %v", patch["moemail_api_key"])
+	}
+	if patch["yyds_api_key"] != "AC-new-yyds" {
+		t.Fatalf("yyds key missing, got %v", patch["yyds_api_key"])
+	}
+	if patch["moemail_base_url"] != "https://moemail.example.com" {
+		t.Fatalf("durable moemail_base_url should come from request, got %v", patch["moemail_base_url"])
+	}
+
+	req = map[string]any{"mail_provider": "yyds", "yyds_api_key": "AC-x"}
+	merged = map[string]any{
+		"mail_provider": "yyds", "yyds_api_key": "AC-x",
+		"moemail_api_key": "AC-x", "moemail_base_url": "", "base_url": "",
+	}
+	patch = registrationConfigPatchForPersist(req, merged)
+	if _, ok := patch["moemail_api_key"]; ok {
+		t.Fatal("patch must not include remapped moemail_api_key")
+	}
+	if v, ok := patch["moemail_base_url"]; ok && strings.TrimSpace(fmt.Sprint(v)) == "" {
+		t.Fatal("empty remapped moemail_base_url should be dropped from patch")
+	}
+}
+
+func TestMergeRegistrationStartBodyProviderIsolation(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		body     map[string]any
+		wantKey  string
+		wantURL  string
+	}{
+		{name: "MoeMail", provider: "moemail", body: map[string]any{
+			"moemail_api_key":  "mk_moe",
+			"moemail_base_url": "https://moemail.example.com",
+		}, wantKey: "mk_moe", wantURL: "https://moemail.example.com"},
+		{name: "YYDS", provider: "yyds", body: map[string]any{"yyds_api_key": "AC-yyds"}, wantKey: "AC-yyds"},
+		{name: "GPTMail", provider: "gptmail", body: map[string]any{"gptmail_api_key": "sk-gpt"}, wantKey: "sk-gpt"},
+		{name: "CFMail", provider: "cfmail", body: map[string]any{
+			"cfmail_api_key":  "cf-token",
+			"cfmail_base_url": "https://cfmail.example.com",
+		}, wantKey: "cf-token", wantURL: "https://cfmail.example.com"},
+		{name: "TempMail", provider: "tempmail", body: map[string]any{"tempmail_api_key": "paid-token"}, wantKey: "paid-token"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := map[string]any{
+				"moemail_api_key":  "mk_saved_moe",
+				"moemail_base_url": "https://saved-moe.example.com",
+			}
+			for key, value := range tt.body {
+				body[key] = value
+			}
+			body["mail_provider"] = tt.provider
+			out := mergeRegistrationStartBody(context.Background(), Options{}, body)
+			if out["mail_provider"] != tt.provider {
+				t.Fatalf("mail_provider=%v", out["mail_provider"])
+			}
+			if out["moemail_api_key"] != tt.wantKey || out["api_key"] != tt.wantKey {
+				t.Fatalf("active key not isolated: %#v", out)
+			}
+			if got := stringValue(out["moemail_base_url"]); got != tt.wantURL {
+				t.Fatalf("active base URL=%q want %q", got, tt.wantURL)
+			}
+		})
+	}
+}
+
+func TestNormalizeRegistrationConfigMailAliases(t *testing.T) {
+	tests := map[string]string{
+		"yydsmail":     "yyds",
+		"chatgptmail":  "gptmail",
+		"cloudflare":   "cfmail",
+		"tempmail.lol": "tempmail",
+		"lol":          "tempmail",
+	}
+	for alias, want := range tests {
+		t.Run(alias, func(t *testing.T) {
+			cfg := normalizeRegistrationConfig(map[string]any{"mail_provider": alias})
+			if cfg["mail_provider"] != want {
+				t.Fatalf("mail_provider=%v want %s", cfg["mail_provider"], want)
+			}
+		})
+	}
+}
+
+func TestSanitizeTempmailEmptyKeyOK(t *testing.T) {
+	cfg := map[string]any{
+		"mail_provider":    "tempmail",
+		"tempmail_api_key": "",
+		"tempmail_domain":  "",
+		"moemail_api_key":  "mk_should_not_leak",
+		"api_key":          "mk_should_not_leak",
+	}
+	sanitizeRegistrationMailSecrets(cfg)
+	if cfg["tempmail_api_key"] != "" {
+		t.Fatalf("tempmail key should stay empty, got %v", cfg["tempmail_api_key"])
+	}
+	if cfg["api_key"] != "" {
+		t.Fatalf("tempmail active api_key should be empty free tier, got %v", cfg["api_key"])
+	}
+}
+
+func TestRegistrationConfigPatchForPersistClearsTempmailKey(t *testing.T) {
+	req := map[string]any{
+		"mail_provider":    "tempmail",
+		"tempmail_api_key": "",
+		"tempmail_domain":  "",
+	}
+	merged := map[string]any{
+		"mail_provider":    "tempmail",
+		"tempmail_api_key": "old-paid-key",
+		"tempmail_domain":  "custom.example",
+		"moemail_api_key":  "mk_other",
+		"moemail_domain":   "lolicr.com",
+	}
+	patch := registrationConfigPatchForPersist(req, merged)
+	if v := strings.TrimSpace(fmt.Sprint(patch["tempmail_api_key"])); v != "" && v != "<nil>" {
+		t.Fatalf("expected cleared tempmail key, got %v", patch["tempmail_api_key"])
+	}
+	if v := strings.TrimSpace(fmt.Sprint(patch["tempmail_domain"])); v != "" && v != "<nil>" {
+		t.Fatalf("expected cleared tempmail domain, got %v", patch["tempmail_domain"])
+	}
+	if v, ok := patch["moemail_api_key"]; ok {
+		if s := strings.TrimSpace(fmt.Sprint(v)); s != "" && s != "mk_other" {
+			t.Fatalf("moemail key remapped unexpectedly: %v", v)
+		}
 	}
 }

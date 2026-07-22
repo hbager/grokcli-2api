@@ -35,6 +35,12 @@ type Event struct {
 	Done bool
 }
 
+// SSE scan constants (package-level to avoid per-call []byte("data:") allocs).
+var (
+	dataPrefix = []byte("data:")
+	doneMarker = []byte("[DONE]")
+)
+
 type UpstreamError struct {
 	Status     int
 	Body       string
@@ -190,41 +196,109 @@ func extractConvID(body map[string]any) string {
 			return strings.TrimSpace(value)
 		}
 	}
+	// Claude Code often only has the conversation id inside metadata.user_id /
+	// top-level user (user_…__session_<uuid>). Prefer the session_ token so
+	// x-grok-conv-id stays stable across multi-turn tool loops.
 	if meta, _ := body["metadata"].(map[string]any); meta != nil {
-		for _, key := range []string{"prompt_cache_key", "session_id", "sessionId", "thread_id", "conversation_id", "user_id"} {
+		for _, key := range []string{"prompt_cache_key", "session_id", "sessionId", "thread_id", "conversation_id"} {
 			if value, _ := meta[key].(string); strings.TrimSpace(value) != "" {
 				return strings.TrimSpace(value)
 			}
 		}
+		if sid := claudeCodeSessionFromUser(stringField(meta, "user_id")); sid != "" {
+			return sid
+		}
+	}
+	if sid := claudeCodeSessionFromUser(stringField(body, "user")); sid != "" {
+		return sid
+	}
+	if sid := claudeCodeSessionFromUser(stringField(body, "user_id")); sid != "" {
+		return sid
+	}
+	return ""
+}
+
+// claudeCodeSessionFromUser extracts session_<uuid> from Claude Code user ids.
+// Mirrors anthropic.ExtractClaudeCodeSessionID without importing that package
+// (upstream/grok must stay free of protocol cycles).
+func claudeCodeSessionFromUser(userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return ""
+	}
+	low := strings.ToLower(userID)
+	if strings.HasPrefix(low, "session_") {
+		return userID
+	}
+	// user_xxx_account__session_01234567-89ab-cdef-0123-456789abcdef
+	idx := strings.Index(low, "session_")
+	if idx < 0 {
+		return ""
+	}
+	// Return original-cased slice from the same offset.
+	return strings.TrimSpace(userID[idx:])
+}
+
+func stringField(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	if v, ok := m[key].(string); ok {
+		return strings.TrimSpace(v)
 	}
 	return ""
 }
 
 func ReadSSE(reader io.Reader, emit func(Event) error) error {
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64<<10), 4<<20)
-	var data []string
+	// Dense thinking / multi-tool turns produce large SSE lines (tool args).
+	// 128KiB initial / 8MiB max reduces re-allocation on long payloads.
+	scanner.Buffer(make([]byte, 128<<10), 8<<20)
+
+	// Common case: one "data: {...}" line per event. Avoid strings.Join + Text()
+	// by scanning bytes and copying only the payload we keep until flush.
+	var parts [][]byte
 	flush := func() error {
-		if len(data) == 0 {
+		if len(parts) == 0 {
 			return nil
 		}
-		joined := strings.Join(data, "\n")
-		data = data[:0]
-		if joined == "[DONE]" {
+		var joined []byte
+		if len(parts) == 1 {
+			joined = parts[0]
+		} else {
+			n := 0
+			for _, p := range parts {
+				n += len(p) + 1
+			}
+			joined = make([]byte, 0, n-1)
+			for i, p := range parts {
+				if i > 0 {
+					joined = append(joined, '\n')
+				}
+				joined = append(joined, p...)
+			}
+		}
+		parts = parts[:0]
+		if bytes.Equal(joined, doneMarker) {
 			return emit(Event{Done: true})
 		}
-		return emit(Event{Data: []byte(joined)})
+		return emit(Event{Data: joined})
 	}
+
 	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
+		line := scanner.Bytes()
+		if len(line) == 0 {
 			if err := flush(); err != nil {
 				return err
 			}
 			continue
 		}
-		if strings.HasPrefix(line, "data:") {
-			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		if bytes.HasPrefix(line, dataPrefix) {
+			payload := bytes.TrimSpace(line[len(dataPrefix):])
+			// Copy: scanner.Bytes() is invalidated by the next Scan.
+			cp := make([]byte, len(payload))
+			copy(cp, payload)
+			parts = append(parts, cp)
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -255,7 +329,7 @@ func ReadSSEWithIdle(reader io.Reader, idle time.Duration, emit func(Event) erro
 		err   error
 		done  bool
 	}
-	ch := make(chan result, 8)
+	ch := make(chan result, 32)
 	go func() {
 		err := ReadSSE(reader, func(event Event) error {
 			ch <- result{event: event}

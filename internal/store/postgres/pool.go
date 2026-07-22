@@ -22,7 +22,16 @@ var (
 )
 
 // Slightly longer than previous 400ms: still fresh for kick/cooldown, fewer PG stampedes.
-const candidateCacheTTL = 1200 * time.Millisecond
+const candidateCacheTTL = 800 * time.Millisecond
+
+// InvalidatePoolCandidateCache drops the hot-path candidate window so the next
+// pick re-reads PG (cooldowns / model blocks from empty-output land immediately).
+func InvalidatePoolCandidateCache() {
+	candidateCacheMu.Lock()
+	candidateCacheAt = time.Time{}
+	candidateCacheData = nil
+	candidateCacheMu.Unlock()
+}
 
 // GetPoolCandidate loads one account as a pick candidate (sticky TTFT / prompt-cache path).
 func (c *Connector) GetPoolCandidate(ctx context.Context, accountID string) (*pool.Candidate, error) {
@@ -99,7 +108,7 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 			     OR COALESCE(a.payload->>'token', '') <> ''
 			  )
 			ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.fail_count, 0) ASC, COALESCE(ap.request_count, 0) ASC, a.id ASC
-			LIMIT 32`)
+			LIMIT 48`)
 		if err != nil {
 			return nil, err
 		}
@@ -184,47 +193,50 @@ func (c *Connector) ReportPoolSuccess(ctx context.Context, accountID string, pre
 				success_count = account_pool.success_count + 1,
 				last_used_at = now(),
 				extra = CASE
-					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN
+					WHEN COALESCE(account_pool.pool_status, '') = 'cooldown' THEN
 						jsonb_set(COALESCE(account_pool.extra, '{}'::jsonb), '{consecutive_fails}', '0'::jsonb, true)
 					ELSE
 						(COALESCE(account_pool.extra, '{}'::jsonb) - 'status_stack' - 'cooldown_count')
 						|| jsonb_build_object('consecutive_fails', 0)
 				END,
 				cooldown_count = CASE
-					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN account_pool.cooldown_count
+					WHEN COALESCE(account_pool.pool_status, '') = 'cooldown' THEN account_pool.cooldown_count
 					ELSE 0
 				END,
 				cooldown_reason = CASE
-					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN account_pool.cooldown_reason
+					WHEN COALESCE(account_pool.pool_status, '') = 'cooldown' THEN account_pool.cooldown_reason
 					ELSE NULL
 				END,
 				cooldown_code = CASE
-					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN account_pool.cooldown_code
+					WHEN COALESCE(account_pool.pool_status, '') = 'cooldown' THEN account_pool.cooldown_code
 					ELSE NULL
 				END,
 				cooldown_model = CASE
-					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN account_pool.cooldown_model
+					WHEN COALESCE(account_pool.pool_status, '') = 'cooldown' THEN account_pool.cooldown_model
 					ELSE NULL
 				END,
 				cooldown_tokens_actual = CASE
-					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN account_pool.cooldown_tokens_actual
+					WHEN COALESCE(account_pool.pool_status, '') = 'cooldown' THEN account_pool.cooldown_tokens_actual
 					ELSE NULL
 				END,
 				cooldown_tokens_limit = CASE
-					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN account_pool.cooldown_tokens_limit
+					WHEN COALESCE(account_pool.pool_status, '') = 'cooldown' THEN account_pool.cooldown_tokens_limit
 					ELSE NULL
 				END,
 				last_error = CASE
-					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN account_pool.last_error
+					WHEN COALESCE(account_pool.pool_status, '') = 'cooldown' THEN account_pool.last_error
 					ELSE NULL
 				END,
 				pool_status = CASE
 					WHEN account_pool.enabled = false OR account_pool.disabled_for_quota = true THEN 'disabled'
-					WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN 'cooldown'
+					WHEN COALESCE(account_pool.pool_status, '') = 'cooldown' THEN 'cooldown'
 					WHEN COALESCE(account_pool.blocked_models, '{}'::jsonb) <> '{}'::jsonb THEN 'model_blocked'
 					ELSE 'normal'
 				END,
 				updated_at = now()`, accountID)
+		if err == nil {
+			c.InvalidatePoolSummaryCache()
+		}
 		return err
 	}
 	_, err := c.Pool.Exec(ctx, `
@@ -250,6 +262,9 @@ func (c *Connector) ReportPoolSuccess(ctx context.Context, accountID string, pre
 			extra = (COALESCE(account_pool.extra, '{}'::jsonb) - 'status_stack' - 'cooldown_count')
 				|| jsonb_build_object('consecutive_fails', 0),
 			updated_at = now()`, accountID)
+	if err == nil {
+		c.InvalidatePoolSummaryCache()
+	}
 	return err
 }
 
@@ -298,7 +313,12 @@ func (c *Connector) ReportPoolFailure(ctx context.Context, failure PoolFailure) 
 			blocked_models, extra, updated_at
 		) VALUES (
 			$1, 1, 1, now(), $2,
-			$3, CASE WHEN $3::timestamptz IS NULL THEN 'normal' ELSE 'cooldown' END,
+			$3,
+			CASE
+				WHEN $9::jsonb <> '{}'::jsonb THEN 'model_blocked'
+				WHEN $3::timestamptz IS NULL THEN 'normal'
+				ELSE 'cooldown'
+			END,
 			CASE WHEN $3::timestamptz IS NULL THEN 0 ELSE 1 END, $4,
 			$5, $6, $7, $8,
 			$9::jsonb, jsonb_build_object('last_status_code', $10::int, 'cooldown_detail', $11::jsonb, 'consecutive_fails', 1), now()
@@ -310,14 +330,21 @@ func (c *Connector) ReportPoolFailure(ctx context.Context, failure PoolFailure) 
 			last_error = COALESCE($2, account_pool.last_error),
 			cooldown_until = COALESCE($3, account_pool.cooldown_until),
 			pool_status = CASE
+				WHEN account_pool.enabled = false OR account_pool.disabled_for_quota = true THEN 'disabled'
+				WHEN NOT $12::bool AND (COALESCE(account_pool.blocked_models, '{}'::jsonb) || $9::jsonb) <> '{}'::jsonb THEN 'model_blocked'
 				WHEN COALESCE($3, account_pool.cooldown_until) IS NOT NULL
 					AND COALESCE($3, account_pool.cooldown_until) > now() THEN 'cooldown'
-				WHEN account_pool.enabled = false OR account_pool.disabled_for_quota = true THEN 'disabled'
+				WHEN COALESCE(account_pool.pool_status, '') = 'cooldown'
+					AND (account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now()) THEN 'cooldown'
+				WHEN $3::timestamptz IS NOT NULL THEN 'cooldown'
 				WHEN $12::bool THEN 'normal'
-				WHEN COALESCE(account_pool.blocked_models, '{}'::jsonb) || $9::jsonb <> '{}'::jsonb THEN 'model_blocked'
 				ELSE 'normal'
 			END,
-			cooldown_count = account_pool.cooldown_count + CASE WHEN $3::timestamptz IS NULL THEN 0 ELSE 1 END,
+			cooldown_count = CASE
+				WHEN $3::timestamptz IS NOT NULL THEN account_pool.cooldown_count + 1
+				WHEN COALESCE(account_pool.pool_status, '') = 'cooldown' THEN GREATEST(account_pool.cooldown_count, 1)
+				ELSE account_pool.cooldown_count
+			END,
 			cooldown_reason = COALESCE($4, account_pool.cooldown_reason),
 			cooldown_code = COALESCE($5, account_pool.cooldown_code),
 			cooldown_model = COALESCE($6, account_pool.cooldown_model),
@@ -336,6 +363,7 @@ func (c *Connector) ReportPoolFailure(ctx context.Context, failure PoolFailure) 
 			updated_at = now()`, failure.AccountID, nilIfEmpty(failure.Error), failure.CooldownUntil, nilIfEmpty(failure.CooldownReason), nilIfEmpty(failure.CooldownCode), nilIfEmpty(failure.CooldownModel), failure.CooldownTokensActual, failure.CooldownTokensLimit, blockedBytes, failure.StatusCode, detailBytes, clearBlocks)
 	if err == nil {
 		c.InvalidateCandidateCache()
+		c.InvalidatePoolSummaryCache()
 	}
 	return err
 }
@@ -371,7 +399,6 @@ func (c *Connector) BlockPoolModel(ctx context.Context, accountID, model string,
 			blocked_models = COALESCE(account_pool.blocked_models, '{}'::jsonb) || $2::jsonb,
 			pool_status = CASE
 				WHEN account_pool.enabled = false OR account_pool.disabled_for_quota = true THEN 'disabled'
-				WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN 'cooldown'
 				ELSE 'model_blocked'
 			END,
 			updated_at = now()`, accountID, blocked)
@@ -513,6 +540,7 @@ func (c *Connector) ClearAccountCooldown(ctx context.Context, accountID string) 
 	if err != nil {
 		return nil, err
 	}
+	c.InvalidatePoolSummaryCache()
 	return c.GetAccountPoolView(ctx, accountID)
 }
 

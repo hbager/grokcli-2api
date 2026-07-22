@@ -99,6 +99,11 @@ services:
       GROK2API_REGISTRATION_SERVICE_URL: "${GROK2API_REGISTRATION_SERVICE_URL:-http://127.0.0.1:18070}"
       GROK2API_REGISTRATION_TOKEN: "${GROK2API_REGISTRATION_TOKEN:-}"
       PYTHONPATH: "/app:/app/grok-build-auth"
+      # In-container hot-update (docker.sock + /compose mount; no host watcher)
+      GROK2API_HOT_UPDATE_MODE: "${GROK2API_HOT_UPDATE_MODE:-docker}"
+      GROK2API_COMPOSE_DIR: "${GROK2API_COMPOSE_DIR:-/compose}"
+      GROK2API_DOCKER_SERVICE: "${GROK2API_DOCKER_SERVICE:-grokcli-2api}"
+      GROK2API_GHCR_IMAGE: "${GROK2API_GHCR_IMAGE:-ghcr.io/hm2899/grokcli-2api}"
     healthcheck:
       # $$ keeps substitution inside the container so override ports (e.g. 40081) work
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${GROK2API_PORT:-40081}/health >/dev/null"]
@@ -109,6 +114,10 @@ services:
     volumes:
       - ./data:/app/data
       - ./turnstile-solver/logs:/app/turnstile-solver/logs
+      # In-container hot-update: docker CLI talks to host docker daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Compose project for force-recreate (override file written under /compose).
+      - ./:/compose
     depends_on:
       redis:
         condition: service_healthy

@@ -55,6 +55,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # App tools + browser runtime libs for inline Turnstile Solver (Camoufox/Firefox)
+# Static docker CLI for in-container hot-update (needs docker.sock mount at runtime).
+ARG DOCKER_CLI_VERSION=27.5.1
+ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -88,6 +91,18 @@ RUN apt-get update \
         xvfb \
     && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo Asia/Shanghai > /etc/timezone \
+    && arch="${TARGETARCH:-$(dpkg --print-architecture)}" \
+    && case "$arch" in \
+         amd64|x86_64) darch=x86_64 ;; \
+         arm64|aarch64) darch=aarch64 ;; \
+         *) darch=x86_64 ;; \
+       esac \
+    && curl -fsSL "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_CLI_VERSION}.tgz" \
+         | tar -xz -C /tmp \
+    && mv /tmp/docker/docker /usr/local/bin/docker \
+    && chmod +x /usr/local/bin/docker \
+    && rm -rf /tmp/docker \
+    && docker --version \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
@@ -113,6 +128,8 @@ RUN chmod +x /app/entrypoint.sh /app/bin/grok2api /app/bin/grok2api-migrate \
     && test -f /app/turnstile-solver/api_solver.py \
     && test -f /app/scripts/registration_service.py \
     && test -f /app/scripts/sso_to_auth_json.py \
+    && test -f /app/scripts/g2a-hot-update-incontainer.sh \
+    && chmod +x /app/scripts/g2a-hot-update-incontainer.sh \
     && test -x /app/bin/grok2api \
     && test -x /app/bin/grok2api-migrate \
     && python -c "from grok2api.upstream import grok_build_adapter; from grok2api.admin import sso_import; import scripts.registration_service as regsvc; print('build-check', grok_build_adapter.ADAPTER_BUILD, 'sso-import-ok', 'reg-sidecar-ok')"

@@ -121,7 +121,8 @@ start_registration_sidecar() {
   echo "[entrypoint] starting Python registration/SSO sidecar on ${reg_host}:${reg_port}"
   (
     cd /app
-    exec python scripts/registration_service.py
+    export PYTHONDONTWRITEBYTECODE=1
+    exec python3 -B scripts/registration_service.py
   ) > /app/turnstile-solver/logs/registration_sidecar.log 2>&1 &
   reg_pid=$!
   echo "${reg_pid}" > /app/turnstile-solver/logs/registration_sidecar.pid

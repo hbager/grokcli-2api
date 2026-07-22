@@ -274,11 +274,13 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 	}
 
 	type outcome struct {
-		id        string
-		ok        bool
-		deleted   bool
-		permanent bool
-		errText   string
+		id              string
+		ok              bool
+		deleted         bool
+		permanent       bool
+		errText         string
+		expiresAt       any
+		hasRefreshToken bool
 	}
 	outCh := make(chan outcome, len(candidates))
 	jobs := make(chan postgres.AccountRefreshRow, workers*2)
@@ -339,7 +341,11 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 			// Success path: clear cooldown + stamp last_renew_status=ok in DB.
 			_, _ = s.Store.ClearAccountCooldown(ctx, newID)
 			_ = s.Store.SaveRenewStatus(ctx, newID, true, "ok", "", "token_maintainer")
-			outCh <- outcome{id: newID, ok: true}
+			outCh <- outcome{
+				id: newID, ok: true,
+				expiresAt:       entry["expires_at"],
+				hasRefreshToken: stringFrom(entry, "refresh_token") != "",
+			}
 		}
 	}
 
@@ -360,15 +366,28 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 
 	refreshed, failed, deleted := 0, 0, 0
 	failedSample := []map[string]any{}
+	results := make([]map[string]any, 0, len(candidates))
 	for o := range outCh {
+		row := map[string]any{"id": o.id, "account_id": o.id, "ok": o.ok}
+		if o.expiresAt != nil {
+			row["expires_at"] = o.expiresAt
+		}
+		if o.hasRefreshToken {
+			row["has_refresh_token"] = true
+		}
 		if o.ok {
 			refreshed++
+			results = append(results, row)
 			continue
 		}
 		failed++
+		row["error"] = o.errText
+		row["permanent"] = o.permanent
+		row["deleted"] = o.deleted
 		if o.deleted {
 			deleted++
 		}
+		results = append(results, row)
 		if len(failedSample) < 5 {
 			failedSample = append(failedSample, map[string]any{
 				"id": o.id, "error": o.errText, "permanent": o.permanent,
@@ -391,6 +410,12 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 		"workers":       workers,
 		"batch":         batch,
 	}
+	// Per-row results for admin UI (selected renew + overview toast).
+	result["results"] = results
+	result["refreshed"] = refreshed
+	result["attempted"] = len(candidates)
+	result["failed"] = failed
+	result["skipped"] = 0
 	result["accounts_total"] = len(rows)
 	slog.Info("token maintainer cycle",
 		"attempted", len(candidates), "refreshed", refreshed, "failed", failed,
@@ -451,6 +476,234 @@ func (s *Service) RunOnce(ctx context.Context, force bool) map[string]any {
 			okPtr := okVal
 			_, _ = s.Store.WriteTask(ctx, "renew", status, summary, taskID, &okPtr, detail, ref, att, true)
 		}
+	}
+	return result
+}
+
+// RunForIDs refreshes selected account IDs (admin selected renew / 续期选中).
+// Always returns results[] so the frontend can clear busy rows and patch pool
+// status immediately. Token upsert / renew status still write to PostgreSQL.
+func (s *Service) RunForIDs(ctx context.Context, ids []string, force bool) map[string]any {
+	startedAt := time.Now()
+	result := map[string]any{
+		"ok": true, "force": force, "implementation": "go",
+		"at": startedAt.Unix(), "selected": true,
+	}
+	if s == nil || s.Store == nil {
+		result["ok"] = false
+		result["error"] = "store unavailable"
+		result["results"] = []any{}
+		return result
+	}
+	seen := map[string]struct{}{}
+	clean := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		clean = append(clean, id)
+		if len(clean) >= 500 {
+			break
+		}
+	}
+	if len(clean) == 0 {
+		result["results"] = []any{}
+		result["refreshed"] = 0
+		result["attempted"] = 0
+		result["failed"] = 0
+		result["skipped"] = 0
+		result["refresh"] = map[string]any{"attempted": 0, "refreshed": 0, "failed": 0, "skipped": 0}
+		return result
+	}
+
+	type rowOut struct {
+		id              string
+		ok              bool
+		skipped         bool
+		deleted         bool
+		permanent       bool
+		errText         string
+		expiresAt       any
+		hasRefreshToken bool
+	}
+	workers := s.Workers
+	if workers <= 0 {
+		workers = 8
+	}
+	if workers > len(clean) {
+		workers = len(clean)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	skew := s.Skew
+	if skew <= 0 {
+		skew = 2 * time.Minute
+	}
+	outCh := make(chan rowOut, len(clean))
+	jobs := make(chan string, workers*2)
+	var wg sync.WaitGroup
+	oidcClient := s.OIDC
+	if oidcClient == nil {
+		oidcClient = &oidc.Client{}
+	}
+	workerFn := func() {
+		defer wg.Done()
+		for id := range jobs {
+			row, err := s.Store.GetAccountRefreshRow(ctx, id)
+			if err != nil || row == nil {
+				outCh <- rowOut{id: id, ok: false, errText: "account not found"}
+				continue
+			}
+			payload := row.Payload
+			if payload == nil {
+				outCh <- rowOut{id: id, ok: false, errText: "account payload unavailable"}
+				continue
+			}
+			rt := stringFrom(payload, "refresh_token")
+			if rt == "" {
+				outCh <- rowOut{id: id, ok: true, skipped: true, errText: "no refresh_token"}
+				continue
+			}
+			if truthy(payload["refresh_invalid"]) {
+				outCh <- rowOut{id: id, ok: false, permanent: true, errText: "refresh_token marked invalid"}
+				continue
+			}
+			if !force {
+				exp := accounts.ParseExpiresAt(payload["expires_at"], stringFrom(payload, "key"))
+				if exp != nil && float64(time.Now().Unix())+skew.Seconds() < *exp {
+					outCh <- rowOut{
+						id: id, ok: true, skipped: true,
+						expiresAt: payload["expires_at"], hasRefreshToken: true,
+						errText: "not near expiry",
+					}
+					continue
+				}
+			}
+			tokenData, err := oidcClient.RefreshAccessToken(ctx, payload)
+			if err != nil {
+				permanent := false
+				errText := err.Error()
+				var re *oidc.RefreshError
+				if asRefresh(err, &re) {
+					permanent = re.Permanent
+					errText = re.Error()
+				}
+				status := "fail"
+				if permanent {
+					status = "invalid"
+					_ = s.Store.MarkRefreshInvalid(ctx, id, errText)
+				}
+				_ = s.Store.SaveRenewStatus(ctx, id, false, status, errText, "manual_renew")
+				deleted := false
+				if permanent && accounts.GetSSOValue(payload) == "" {
+					if ok, _ := s.Store.DeleteAccount(ctx, id); ok {
+						deleted = true
+					}
+				}
+				outCh <- rowOut{id: id, ok: false, deleted: deleted, permanent: permanent, errText: errText}
+				continue
+			}
+			newID, entry, err := oidc.EntryFromTokenResponse(tokenData, payload)
+			if err != nil {
+				_ = s.Store.SaveRenewStatus(ctx, id, false, "parse_fail", err.Error(), "manual_renew")
+				outCh <- rowOut{id: id, ok: false, errText: err.Error()}
+				continue
+			}
+			if newID == "" {
+				newID = id
+			}
+			if newID != id {
+				_ = s.Store.UpsertAccount(ctx, newID, entry)
+				_, _ = s.Store.DeleteAccount(ctx, id)
+			} else {
+				_ = s.Store.UpsertAccount(ctx, id, entry)
+			}
+			_, _ = s.Store.ClearAccountCooldown(ctx, newID)
+			_ = s.Store.SaveRenewStatus(ctx, newID, true, "ok", "", "manual_renew")
+			outCh <- rowOut{
+				id: newID, ok: true,
+				expiresAt:       entry["expires_at"],
+				hasRefreshToken: stringFrom(entry, "refresh_token") != "",
+			}
+		}
+	}
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go workerFn()
+	}
+	for _, id := range clean {
+		jobs <- id
+	}
+	close(jobs)
+	wg.Wait()
+	close(outCh)
+
+	refreshed, failed, skipped, deleted := 0, 0, 0, 0
+	results := make([]map[string]any, 0, len(clean))
+	for o := range outCh {
+		row := map[string]any{"id": o.id, "account_id": o.id, "ok": o.ok, "skipped": o.skipped}
+		if o.expiresAt != nil {
+			row["expires_at"] = o.expiresAt
+		}
+		if o.hasRefreshToken {
+			row["has_refresh_token"] = true
+		}
+		if o.ok && !o.skipped {
+			refreshed++
+		} else if o.ok && o.skipped {
+			skipped++
+			if o.errText != "" {
+				row["message"] = o.errText
+			}
+		} else {
+			failed++
+			row["error"] = o.errText
+		}
+		if o.deleted {
+			deleted++
+			row["deleted"] = true
+		}
+		if o.permanent {
+			row["permanent"] = true
+		}
+		results = append(results, row)
+	}
+	result["results"] = results
+	result["refreshed"] = refreshed
+	result["attempted"] = len(clean)
+	result["failed"] = failed
+	result["skipped"] = skipped
+	result["refresh"] = map[string]any{
+		"attempted": len(clean), "refreshed": refreshed, "failed": failed,
+		"skipped": skipped, "deleted": deleted, "workers": workers,
+	}
+	result["elapsed_ms"] = time.Since(startedAt).Milliseconds()
+	if s.Store != nil {
+		status := "done"
+		okVal := true
+		if failed > 0 && refreshed > 0 {
+			status = "partial"
+		} else if failed > 0 && refreshed == 0 {
+			status = "error"
+			okVal = false
+		}
+		summary := "选中续期：成功 " + itoaMaint(refreshed) + "/" + itoaMaint(len(clean))
+		if failed > 0 {
+			summary += " · 失败 " + itoaMaint(failed)
+		}
+		if skipped > 0 {
+			summary += " · 跳过 " + itoaMaint(skipped)
+		}
+		detail := map[string]any{"refresh": result["refresh"], "force": force, "selected": len(clean)}
+		taskID := "renew:selected:" + time.Now().UTC().Format("20060102T150405")
+		okPtr := okVal
+		_, _ = s.Store.WriteTask(ctx, "renew", status, summary, taskID, &okPtr, detail, refreshed, len(clean), true)
 	}
 	return result
 }

@@ -141,6 +141,77 @@ def availability(request: Request) -> dict[str, Any]:
     return adapter.registration_available()
 
 
+@app.post(f"{API_PREFIX}/mail/domains")
+async def list_mail_domains(request: Request) -> dict[str, Any]:
+    """List selectable domains for YYDS / GPTMail / CF Temp Email / TempMail.lol / MoeMail."""
+    _require_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        from grok2api.upstream import moemail as mail
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"moemail module unavailable: {exc}") from exc
+
+    prov = mail.normalize_mail_provider(
+        body.get("mail_provider") or body.get("provider"),
+        base_url=str(body.get("base_url") or body.get("moemail_base_url") or body.get("cfmail_base_url") or ""),
+    )
+    key = str(
+        body.get("api_key")
+        or body.get("moemail_api_key")
+        or body.get("yyds_api_key")
+        or body.get("gptmail_api_key")
+        or body.get("cfmail_api_key")
+        or body.get("tempmail_api_key")
+        or ""
+    ).strip()
+    base = str(
+        body.get("base_url")
+        or body.get("moemail_base_url")
+        or body.get("cfmail_base_url")
+        or ""
+    ).strip()
+    domains: list[str] = []
+    note = ""
+    base_out = base
+    try:
+        if prov == "yyds":
+            domains = mail.yyds_list_domains(api_key=key or None, base_url=base or None)
+            note = "YYDS GET /v1/domains"
+            base_out = mail.normalize_yyds_base_url(base or None)
+        elif prov == "gptmail":
+            domains = mail.gptmail_list_domains(api_key=key or None, base_url=base or None)
+            note = "GPTMail GET /api/domains/public"
+            base_out = mail.normalize_gptmail_base_url(base or None)
+        elif prov == "cfmail":
+            domains = mail.cfmail_list_domains(api_key=key or None, base_url=base or None)
+            note = "CF Temp Email GET /open_api/settings"
+            base_out = (base or mail.CFMAIL_DEFAULT_BASE_URL).rstrip("/")
+        elif prov == "tempmail":
+            domains = mail.tempmail_list_domains(api_key=key or None, base_url=base or None)
+            note = "TempMail.lol free: random domain (no catalog)"
+            base_out = mail.normalize_tempmail_base_url(base or None)
+        else:
+            # MoeMail has no universal public catalog; return configured domain list.
+            domains = mail.parse_domain_list(str(body.get("domain") or body.get("moemail_domain") or ""))
+            note = "MoeMail: no public catalog; showing configured domains only"
+            base_out = base
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "mail_provider": prov,
+        "base_url": base_out,
+        "domains": domains,
+        "count": len(domains),
+        "note": note,
+    }
+
+
 @app.post(f"{API_PREFIX}/jobs")
 async def start_job(
     request: Request,
@@ -157,6 +228,8 @@ async def start_job(
     # Idempotency key is accepted for contract compatibility; adapter currently
     # relies on its own session/batch ids.
     _ = idempotency_key
+    # Accept full body keys then resolve active mail credentials into the
+    # historical moemail_api_key / moemail_base_url fields the adapter reads.
     kwargs = {
         k: body.get(k)
         for k in (
@@ -177,9 +250,118 @@ async def start_job(
             "concurrency",
             "stagger_ms",
             "probe_delay_sec",
+            "yyds_api_key",
+            "gptmail_api_key",
+            "cfmail_api_key",
+            "tempmail_api_key",
+            "yyds_domain",
+            "gptmail_domain",
+            "cfmail_domain",
+            "tempmail_domain",
+            "moemail_domain",
+            "cfmail_base_url",
+            "api_key",
+            "base_url",
         )
         if k in body
     }
+    try:
+        from grok2api.upstream.moemail import normalize_mail_provider as _nmp
+
+        prov = _nmp(
+            kwargs.get("mail_provider"),
+            base_url=str(kwargs.get("moemail_base_url") or kwargs.get("base_url") or ""),
+        )
+    except Exception:
+        prov = str(kwargs.get("mail_provider") or "moemail").strip().lower() or "moemail"
+    kwargs["mail_provider"] = prov
+    # Active domain from provider-specific slot.
+    dom = str(kwargs.get("domain") or "").strip()
+    if prov == "yyds":
+        dom = str(kwargs.get("yyds_domain") or dom).strip()
+        key = str(kwargs.get("yyds_api_key") or kwargs.get("api_key") or "").strip()
+        # Prefer dedicated slot; only fall back to moemail_api_key if it looks like YYDS.
+        if not key:
+            mk = str(kwargs.get("moemail_api_key") or "").strip()
+            if mk.startswith("AC-"):
+                key = mk
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = ""  # fixed host
+        kwargs["domain"] = dom
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="YYDS API Key missing. Save AC-… key in 协议注册配置 (YYDS panel).",
+            )
+    elif prov == "gptmail":
+        dom = str(kwargs.get("gptmail_domain") or dom).strip()
+        key = str(kwargs.get("gptmail_api_key") or kwargs.get("api_key") or "").strip()
+        # Empty key is OK only if a real sk-… is later provided; reject other shapes.
+        if key.startswith("mk_") or key.startswith("AC-"):
+            key = ""
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = ""
+        kwargs["domain"] = dom
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="GPTMail API Key missing. Save sk-… from https://mail.chatgpt.org.uk/zh/api/",
+            )
+    elif prov == "cfmail":
+        dom = str(kwargs.get("cfmail_domain") or dom).strip()
+        key = str(kwargs.get("cfmail_api_key") or kwargs.get("api_key") or kwargs.get("moemail_api_key") or "").strip()
+        base = str(kwargs.get("cfmail_base_url") or kwargs.get("base_url") or kwargs.get("moemail_base_url") or "").strip()
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = base
+        kwargs["domain"] = dom
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="CF Temp Email admin password/key missing.",
+            )
+        if not base:
+            raise HTTPException(
+                status_code=400,
+                detail="CF Temp Email Base URL missing.",
+            )
+    elif prov == "tempmail":
+        # Free tier: no API key required. Optional Plus/Ultra Bearer key.
+        dom = str(kwargs.get("tempmail_domain") or dom).strip()
+        key = str(kwargs.get("tempmail_api_key") or kwargs.get("api_key") or "").strip()
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = ""
+        kwargs["domain"] = dom
+    else:
+        key = str(kwargs.get("moemail_api_key") or kwargs.get("api_key") or "").strip()
+        base = str(kwargs.get("moemail_base_url") or kwargs.get("base_url") or "").strip()
+        dom = str(kwargs.get("moemail_domain") or dom).strip()
+        # Reject cross-provider pollution (YYDS AC-* / GPTMail sk-* in MoeMail slot).
+        if key.startswith("AC-") or key.lower().startswith("sk-"):
+            key = ""
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = base
+        kwargs["domain"] = dom
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "MoeMail API Key missing or invalid (got YYDS/GPTMail-shaped key). "
+                    "Re-save MoeMail Key (mk_…) in 协议注册配置 — switching providers "
+                    "must not overwrite the MoeMail slot."
+                ),
+            )
+        if not base:
+            raise HTTPException(
+                status_code=400,
+                detail="MoeMail Base URL missing. Re-save MoeMail Base URL in 协议注册配置.",
+            )
+    # Drop non-adapter kwargs
+    for drop in (
+        "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
+        "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "moemail_domain",
+        "cfmail_base_url", "api_key", "base_url",
+    ):
+        kwargs.pop(drop, None)
     result = adapter.start_registration(**kwargs)
     if not isinstance(result, dict):
         raise HTTPException(status_code=500, detail="invalid registration response")
@@ -402,7 +584,7 @@ async def sso_import_start(request: Request) -> dict[str, Any]:
         from grok2api.config import SSO_IMPORT_WORKERS
     except Exception:
         SSO_IMPORT_WORKERS = 8
-    workers = min(int(max_workers), int(SSO_IMPORT_WORKERS), max(1, len(sso_items)), 6)
+    workers = min(int(max_workers), int(SSO_IMPORT_WORKERS), max(1, len(sso_items)), 12)
     if delay and delay >= 2:
         workers = min(workers, 2)
 

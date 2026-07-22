@@ -39,12 +39,16 @@ YYDS_DEFAULT_DOMAIN = ""  # must be chosen from GET /v1/domains or admin config
 
 # Official GPTMail host (docs: https://mail.chatgpt.org.uk/zh/api/).
 GPTMAIL_DEFAULT_BASE_URL = "https://mail.chatgpt.org.uk"
-# Docs mention public test key ``gpt-test`` (daily quota; may be exhausted).
-GPTMAIL_PUBLIC_TEST_KEY = "gpt-test"
+# Docs: public test key is an sk-… key shown on https://mail.chatgpt.org.uk/zh/api/
+# (legacy placeholder gpt-test is no longer accepted by the API).
+GPTMAIL_PUBLIC_TEST_KEY = ""
 
 # Cloudflare Temp Email (https://github.com/dreamhunter2333/cloudflare_temp_email)
 # Self-hosted Workers URL; demo host only for docs/default placeholder.
 CFMAIL_DEFAULT_BASE_URL = "https://temp-email-api.awsl.uk"
+
+# TempMail.lol (https://tempmail.lol/zh/api) — free tier needs no API key.
+TEMPMAIL_LOL_DEFAULT_BASE_URL = "https://api.tempmail.lol"
 
 
 def _headers(api_key: str | None = None) -> dict[str, str]:
@@ -55,7 +59,7 @@ def _headers(api_key: str | None = None) -> dict[str, str]:
 
 
 def normalize_mail_provider(provider: str | None, *, base_url: str | None = None) -> str:
-    """Return ``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail``.
+    """Return ``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail`` | ``tempmail``.
 
     Infer from base_url when provider is empty.
     """
@@ -84,6 +88,17 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         "awsl",
     }:
         return "cfmail"
+    if p in {
+        "tempmail",
+        "tempmail.lol",
+        "tempmaillol",
+        "tempmail_lol",
+        "lol",
+        "tmlol",
+    }:
+        return "tempmail"
+    if p in {"tempmail", "tempmail.lol", "tempmaillol", "tempmail_lol", "lol", "tmlol"}:
+        return "tempmail"
     if p in {"moemail", "moe", "moe-mail"}:
         return "moemail"
     base = (base_url or "").strip().lower()
@@ -110,48 +125,170 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         )
     ):
         return "cfmail"
+    if any(x in base for x in ("tempmail.lol", "api.tempmail.lol")):
+        return "tempmail"
     return "moemail"
 
 
 def normalize_yyds_base_url(base_url: str | None = None) -> str:
-    """Normalize user input (docs URL / trailing /v1) to API origin."""
+    """Normalize user input (docs URL / trailing /v1) to maliapi origin.
+
+    Always prefer the official YYDS API host. Never fall through to a MoeMail
+    default (``moemail.example.com``) when callers pass ``base_url or MOEMAIL_BASE_URL``.
+    Docs: https://vip.215.im/docs  API: https://maliapi.215.im/v1
+    """
     raw = (base_url or "").strip()
     if not raw:
         return YYDS_DEFAULT_BASE_URL
-    # Common mistakes: paste docs portal or bare path.
     lower = raw.lower()
-    if "vip.215.im" in lower and "maliapi" not in lower:
-        return YYDS_DEFAULT_BASE_URL
+    # Docs portal, bare 215.im, or accidental MoeMail defaults → official API.
+    if any(
+        x in lower
+        for x in (
+            "vip.215.im",
+            "maliapi.215.im",
+            "215.im",
+            "moemail.example.com",
+            "moemail.521884.xyz",
+            "example.com",
+        )
+    ):
+        # Only keep custom origin if it's already maliapi.
+        if "maliapi.215.im" in lower:
+            return YYDS_DEFAULT_BASE_URL
+        if "vip.215.im" in lower or "215.im" in lower:
+            return YYDS_DEFAULT_BASE_URL
+        if "moemail" in lower or "example.com" in lower:
+            return YYDS_DEFAULT_BASE_URL
     parsed = urlparse(raw if "://" in raw else f"https://{raw}")
     origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
     if not parsed.netloc:
         return YYDS_DEFAULT_BASE_URL
-    # Strip accidental /v1 /docs suffixes from path-only pastes handled above.
+    # Unknown custom host (self-proxy) — allow; otherwise pin official.
+    if "215.im" in (parsed.netloc or "").lower():
+        return YYDS_DEFAULT_BASE_URL
     return origin or YYDS_DEFAULT_BASE_URL
 
 
 def normalize_gptmail_base_url(base_url: str | None = None) -> str:
-    """Normalize docs / language path pastes to GPTMail origin."""
+    """Normalize docs / language path pastes to GPTMail origin.
+
+    Docs: https://mail.chatgpt.org.uk/zh/api/
+    Always pin to https://mail.chatgpt.org.uk — never fall through to MoeMail defaults.
+    """
     raw = (base_url or "").strip()
     if not raw:
         return GPTMAIL_DEFAULT_BASE_URL
     lower = raw.lower()
-    if "chatgpt.org.uk" in lower or "gptmail" in lower:
-        # Always pin to official origin (docs may be /zh/api, /api, etc.).
+    if any(
+        x in lower
+        for x in (
+            "chatgpt.org.uk",
+            "gptmail",
+            "moemail.example.com",
+            "moemail.521884.xyz",
+            "maliapi.215.im",
+            "vip.215.im",
+            "example.com",
+        )
+    ):
         return GPTMAIL_DEFAULT_BASE_URL
     parsed = urlparse(raw if "://" in raw else f"https://{raw}")
     origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
+    if not parsed.netloc:
+        return GPTMAIL_DEFAULT_BASE_URL
     return origin or GPTMAIL_DEFAULT_BASE_URL
 
 
-def normalize_cfmail_base_url(base_url: str | None = None) -> str:
-    """Normalize Cloudflare Temp Email Workers / Pages URL to API origin.
 
-    Accepts worker host, docs host, or accidental ``/api`` / ``/admin`` suffixes.
-    Users should deploy their own Workers URL; demo host is only a fallback.
+def parse_domain_list(text: str | None) -> list[str]:
+    """Split multi-domain config into unique hostnames.
+
+    Accepts newlines / commas / semicolons / spaces. Strips ``@`` and leading dots.
+    """
+    if text is None:
+        return []
+    raw = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    parts: list[str] = []
+    for chunk in raw.replace(";", "\n").replace(",", "\n").split("\n"):
+        for token in chunk.split():
+            d = token.strip().lstrip("@").strip().strip(".").lower()
+            if not d or d.startswith("#"):
+                continue
+            # basic host sanity: no spaces, has a dot or is short label
+            if "://" in d:
+                # allow pasting https://x.com → x.com
+                try:
+                    from urllib.parse import urlparse
+
+                    host = urlparse(d if "://" in d else "https://" + d).hostname or ""
+                    d = host.strip(".").lower()
+                except Exception:
+                    continue
+            if not d or "/" in d or " " in d:
+                continue
+            if d not in parts:
+                parts.append(d)
+    return parts
+
+
+def pick_domain_from_list(
+    text: str | None,
+    *,
+    index: int | None = None,
+    strategy: str = "round_robin",
+) -> str:
+    """Pick one domain from a multi-domain config string.
+
+    - empty list → ""
+    - single → that domain
+    - multi + index → round-robin by index (batch registration)
+    - multi + no index → random
+    """
+    domains = parse_domain_list(text)
+    if not domains:
+        return ""
+    if len(domains) == 1:
+        return domains[0]
+    strat = (strategy or "round_robin").strip().lower()
+    if index is not None:
+        try:
+            i = int(index)
+        except (TypeError, ValueError):
+            i = 0
+        if i < 0:
+            i = 0
+        return domains[i % len(domains)]
+    if strat in {"random", "rand"}:
+        return random.choice(domains)
+    # default round_robin without index: random is fine for single-shot
+    return random.choice(domains)
+
+
+
+def normalize_cfmail_base_url(base_url: str | None = None) -> str:
+    """Normalize Cloudflare Temp Email Workers URL to API origin.
+
+    Accepts worker host or accidental ``/api`` / ``/admin`` / docs suffixes.
+    Never falls through to MoeMail defaults. Demo host is only a last-resort
+    fallback when empty. Deploy your own worker for production.
+    Repo: https://github.com/dreamhunter2333/cloudflare_temp_email
     """
     raw = (base_url or "").strip()
     if not raw:
+        return CFMAIL_DEFAULT_BASE_URL
+    lower = raw.lower()
+    # Reject accidental MoeMail / YYDS pastes.
+    if any(
+        x in lower
+        for x in (
+            "moemail.example.com",
+            "moemail.521884.xyz",
+            "maliapi.215.im",
+            "vip.215.im",
+            "chatgpt.org.uk",
+        )
+    ):
         return CFMAIL_DEFAULT_BASE_URL
     parsed = urlparse(raw if "://" in raw else f"https://{raw}")
     origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
@@ -165,25 +302,28 @@ def _cfmail_headers(
     api_key: str | None = None,
     site_password: str | None = None,
     content_type: bool = False,
+    as_admin: bool | None = None,
 ) -> dict[str, str]:
-    """Build CF Temp Email headers.
+    """Build CF Temp Email headers (dreamhunter2333/cloudflare_temp_email).
 
-    - Address JWT (from create / login): ``Authorization: Bearer <jwt>``
-    - Admin password (create via admin API): ``x-admin-auth``
-    - Optional private-site password: ``x-custom-auth``
+    - Address JWT: ``Authorization: Bearer <jwt>`` (inbox JWT from create)
+    - Admin password: ``x-admin-auth`` (ADMIN_PASSWORDS) for ``/admin/*``
+    - Site password: ``x-custom-auth`` (PASSWORDS) for private-site ``/open_api/*``
     """
     headers: dict[str, str] = {}
     key = (api_key or "").strip()
+    site = (site_password or "").strip()
     if key:
-        # Admin create uses x-admin-auth; mailbox read uses Bearer address JWT.
-        # We accept either: when key looks like a JWT, send Bearer; otherwise
-        # treat as admin password.
         parts = key.split(".")
-        if len(parts) == 3 and all(parts):
+        is_jwt = len(parts) == 3 and all(parts) and not key.startswith("http")
+        if is_jwt and as_admin is not True:
             headers["Authorization"] = f"Bearer {key}"
         else:
+            # Admin password for /admin/new_address etc.
             headers["x-admin-auth"] = key
-    site = (site_password or "").strip()
+            # Many private deploys use the same string for site PASSWORDS.
+            if not site:
+                headers["x-custom-auth"] = key
     if site:
         headers["x-custom-auth"] = site
     if content_type:
@@ -337,7 +477,7 @@ def moemail_create_mailbox(
         chosen = min(timed, key=lambda p: abs(p - chosen))
     payload: dict[str, Any] = {
         "expiryTime": chosen,
-        "domain": domain or MOEMAIL_DOMAIN,
+        "domain": (pick_domain_from_list(domain) if domain else "") or domain or MOEMAIL_DOMAIN,
     }
     if name:
         payload["name"] = name
@@ -469,13 +609,16 @@ def yyds_create_mailbox(
     key = (api_key or MOEMAIL_API_KEY or "").strip()
     if not key:
         raise ValueError(
-            "YYDS Mail API key missing. Set GROK2API_MOEMAIL_API_KEY / api_key "
-            "(X-API-Key, usually starts with AC-)."
+            "YYDS Mail API key missing. Save AC-… key in 协议注册 → YYDS panel "
+            "(X-API-Key). Docs: https://vip.215.im/docs"
         )
-    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_yyds_base_url(base_url or YYDS_DEFAULT_BASE_URL)
     # Never fall back to MOEMAIL_DOMAIN (MoeMail default / example.com). Empty
     # means auto: randomly pick a healthy public domain from GET /v1/domains.
-    dom = (domain or "").strip().lstrip("@").strip(".")
+    # Multi-domain config (newlines/commas) → pick one (random when no index).
+    dom = pick_domain_from_list(domain) if domain else ""
+    if not dom:
+        dom = (domain or "").strip().lstrip("@").strip(".")
     if not dom:
         dom = yyds_pick_domain(api_key=key, base_url=base) or ""
     if not dom:
@@ -526,7 +669,7 @@ def yyds_list_domains(
 ) -> list[str]:
     """List usable domains from YYDS catalog (``GET /v1/domains``)."""
     key = (api_key or MOEMAIL_API_KEY or "").strip()
-    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_yyds_base_url(base_url or YYDS_DEFAULT_BASE_URL)
     try:
         with httpx.Client(timeout=20.0) as client:
             resp = client.get(f"{base}/v1/domains", headers=_headers(key) if key else {})
@@ -554,10 +697,14 @@ def yyds_list_domains(
             continue
         if public_only and item.get("isPublic") is False:
             continue
-        if ready_only and (
-            item.get("receivingReady") is False or item.get("isMxValid") is False
-        ):
-            continue
+        # Docs catalog uses isMxValid / isVerified; receivingReady is optional.
+        if ready_only:
+            if item.get("isMxValid") is False:
+                continue
+            if item.get("isVerified") is False:
+                continue
+            if item.get("receivingReady") is False:
+                continue
         seen.add(name)
         if item.get("wildcardMxValid") is True or item.get("wildcard_mx_valid") is True:
             preferred.append(name)
@@ -597,13 +744,11 @@ def yyds_fetch_messages(
     if not email_id and not address:
         return []
     key = (api_key or MOEMAIL_API_KEY or "").strip()
-    base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_yyds_base_url(base_url or YYDS_DEFAULT_BASE_URL)
     headers = _headers(key) if key else {}
     if token and not key:
         headers = {"Authorization": f"Bearer {token}"}
-    elif token and key:
-        # Prefer API key; keep bearer as extra only when key missing.
-        pass
+    # When both present, X-API-Key is enough per docs; token reserved for temp-only flows.
 
     with httpx.Client(timeout=30.0) as client:
         # Prefer canonical inbox path when id is known; fall back to address query.
@@ -699,6 +844,84 @@ def yyds_fetch_messages(
         return out
 
 
+
+def yyds_wait_next_message(
+    *,
+    address: str,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    token: str | None = None,
+    wait: int = 15,
+    email_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Poll ``GET /v1/messages/next`` (OTP-friendly, marks seen, extracts verificationCode).
+
+    Docs: https://vip.215.im/docs — wait 0–30s long-poll; 204 when empty.
+    """
+    addr = (address or "").strip()
+    if not addr:
+        return None
+    key = (api_key or MOEMAIL_API_KEY or "").strip()
+    base = normalize_yyds_base_url(base_url or YYDS_DEFAULT_BASE_URL)
+    headers: dict[str, str] = {}
+    if key:
+        headers = _headers(key)
+    elif token:
+        headers = {"Authorization": f"Bearer {token}"}
+    else:
+        return None
+    wait_s = max(0, min(int(wait or 0), 30))
+    params: dict[str, Any] = {"address": addr, "wait": wait_s}
+    try:
+        with httpx.Client(timeout=float(wait_s) + 20.0) as client:
+            resp = client.get(f"{base}/v1/messages/next", headers=headers, params=params)
+            if resp.status_code == 204 or not resp.content:
+                return None
+            if resp.status_code >= 400:
+                # Fallback: list + detail once.
+                return None
+            data = resp.json()
+    except Exception:
+        return None
+    body = data.get("data") if isinstance(data, dict) and "data" in data else data
+    if not isinstance(body, dict):
+        return None
+    msg = body.get("message") if isinstance(body.get("message"), dict) else body
+    if not isinstance(msg, dict):
+        return None
+    # Flatten for extractors.
+    from_obj = msg.get("from")
+    if isinstance(from_obj, dict):
+        msg.setdefault("from_address", from_obj.get("address") or "")
+        msg.setdefault("from", from_obj.get("address") or from_obj.get("name") or "")
+    text_blob = "\n".join(
+        str(msg.get(k) or "")
+        for k in (
+            "subject",
+            "content",
+            "text",
+            "textBody",
+            "html",
+            "htmlBody",
+            "body",
+            "from_address",
+            "from",
+            "verificationCode",
+        )
+    )
+    msg["extracted"] = _extract_codes_and_links(text_blob)
+    vc = msg.get("verificationCode")
+    if vc and isinstance(msg.get("extracted"), dict):
+        codes = list(msg["extracted"].get("codes") or [])
+        s = str(vc).strip()
+        if s and s not in codes:
+            codes.insert(0, s)
+            msg["extracted"]["codes"] = codes
+    msg.setdefault("inboxAddress", body.get("inboxAddress") or addr)
+    return msg
+
+
+
 def gptmail_create_mailbox(
     *,
     name: str | None = None,
@@ -710,127 +933,113 @@ def gptmail_create_mailbox(
     proxy_username: str | None = None,
     proxy_password: str | None = None,
 ) -> dict[str, Any]:
-    """Create a temporary inbox on GPTMail (https://mail.chatgpt.org.uk/zh/api/)."""
-    key = (api_key or MOEMAIL_API_KEY or "").strip() or GPTMAIL_PUBLIC_TEST_KEY
-    base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
-    # Never fall back to MOEMAIL_DOMAIN (MoeMail default). Empty => GPTMail
-    # random generate / public domain pick.
-    dom = (domain or "").strip().lstrip("@").strip(".")
+    """Create a temporary inbox on GPTMail.
+
+    Docs: https://mail.chatgpt.org.uk/zh/api/
+    Auth: ``X-API-Key: sk-…`` (public test key is shown on the docs page; copy it
+    into 协议注册 → GPTMail). Legacy ``gpt-test`` is no longer valid.
+
+    Endpoints:
+      GET/POST /api/generate-email  — random or {prefix, domain}
+      GET /api/emails?email=…       — list mails
+      GET /api/email/{id}           — mail detail
+    """
+    key = (api_key or MOEMAIL_API_KEY or "").strip() or (GPTMAIL_PUBLIC_TEST_KEY or "").strip()
+    if not key or key in {"gpt-test", "PUBLIC_API_KEY", "public"}:
+        raise ValueError(
+            "GPTMail API Key missing. Open https://mail.chatgpt.org.uk/zh/api/ "
+            "copy the public sk-… test key (or your own key from shop.chatgpt.org.uk) "
+            "into 协议注册 → GPTMail API Key."
+        )
+    if key.startswith("mk_") or key.startswith("AC-"):
+        raise ValueError(
+            "GPTMail API Key looks like MoeMail/YYDS. Use an sk-… key from "
+            "https://mail.chatgpt.org.uk/zh/api/"
+        )
+    base = normalize_gptmail_base_url(base_url or GPTMAIL_DEFAULT_BASE_URL)
+    # Multi-domain config → pick one; empty domain → let server choose via generate,
+    # or pick from /api/domains/public for local compose fallback.
+    dom = pick_domain_from_list(domain) if domain else ""
+    if not dom:
+        dom = (domain or "").strip().lstrip("@").strip(".")
     pre = (name or "").strip().lower() or None
+    if pre:
+        pre = re.sub(r"[^a-z0-9._+-]", "", pre) or None
 
-    # Prefer server-side generate so we get a real active domain when none given.
-    # Docs: GET /api/generate-email random; POST with {prefix, domain}.
-    with httpx.Client(timeout=30.0) as client:
-        headers = {**_headers(key), "Content-Type": "application/json"}
-        if pre or dom:
-            payload: dict[str, Any] = {}
-            if pre:
-                payload["prefix"] = pre
-            if dom:
-                payload["domain"] = dom
-            resp = client.post(
-                f"{base}/api/generate-email",
-                json=payload,
-                headers=headers,
-            )
-        else:
-            resp = client.get(f"{base}/api/generate-email", headers=headers)
+    headers = {**_headers(key), "Content-Type": "application/json", "Accept": "application/json"}
 
+    def _parse_email_payload(resp: "httpx.Response") -> str:
         if resp.status_code >= 400:
-            # Auth / quota failures must surface — composed addresses still need
-            # a valid key to poll /api/emails.
-            err_l = (resp.text or "").lower()
-            if resp.status_code in (401, 403) or (
-                "api key" in err_l
-                or "api_key" in err_l
-                or "无效" in (resp.text or "")
-                and "key" in err_l
-            ):
-                raise RuntimeError(
-                    f"GPTMail create failed {resp.status_code}: {resp.text[:500]}"
-                )
-            # Retry without domain, then compose prefix@public-domain.
-            # Docs allow skipping generate when a public domain is known.
-            if pre and dom:
-                resp2 = client.post(
+            raise RuntimeError(
+                f"GPTMail create failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else {}
+        if isinstance(data, dict) and data.get("success") is False:
+            raise RuntimeError(
+                f"GPTMail create failed: {data.get('error') or data}"
+            )
+        body = data.get("data") if isinstance(data, dict) and "data" in data else data
+        if not isinstance(body, dict):
+            raise RuntimeError(f"Unexpected GPTMail create response: {data}")
+        address = body.get("email") or body.get("address")
+        if not address or "@" not in str(address):
+            raise RuntimeError(f"Unexpected GPTMail create response: {data}")
+        return str(address).strip()
+
+    with httpx.Client(timeout=30.0) as client:
+        address = ""
+        raw: dict[str, Any] = {}
+        try:
+            if pre or dom:
+                payload: dict[str, Any] = {}
+                if pre:
+                    payload["prefix"] = pre
+                if dom:
+                    payload["domain"] = dom
+                resp = client.post(
                     f"{base}/api/generate-email",
-                    json={"prefix": pre},
+                    json=payload,
                     headers=headers,
                 )
-                if resp2.status_code < 400:
-                    resp = resp2
-                elif resp2.status_code in (401, 403):
-                    raise RuntimeError(
-                        f"GPTMail create failed {resp2.status_code}: {resp2.text[:500]}"
-                    )
-                else:
-                    picked = gptmail_pick_domain(api_key=key, base_url=base) or dom
-                    if pre and picked:
-                        address = f"{pre}@{picked}"
-                        return {
-                            "id": address,
-                            "email": address,
-                            "token": "",
-                            "provider": "gptmail",
-                            "raw": {
-                                "composed": True,
-                                "error": resp.text[:300],
-                                "domain": picked,
-                            },
-                            "expiry_ms": 86_400_000
-                            if expiry_ms is None
-                            else int(expiry_ms),
-                        }
-            elif pre and resp.status_code not in (401, 403):
-                picked = dom or gptmail_pick_domain(api_key=key, base_url=base)
-                if picked:
-                    address = f"{pre}@{picked}"
-                    return {
-                        "id": address,
-                        "email": address,
-                        "token": "",
-                        "provider": "gptmail",
-                        "raw": {
-                            "composed": True,
-                            "error": resp.text[:300],
-                            "domain": picked,
-                        },
-                        "expiry_ms": 86_400_000
-                        if expiry_ms is None
-                        else int(expiry_ms),
-                    }
-            if resp.status_code >= 400:
-                raise RuntimeError(
-                    f"GPTMail create failed {resp.status_code}: {resp.text[:500]}"
-                )
+            else:
+                resp = client.get(f"{base}/api/generate-email", headers=headers)
+            address = _parse_email_payload(resp)
+            try:
+                raw = resp.json() if resp.content else {}
+            except Exception:
+                raw = {}
+        except Exception as first_err:
+            # Docs: if you already know a live public domain, compose prefix@domain
+            # locally and only use /api/emails (saves one generate call).
+            picked = dom or gptmail_pick_domain(api_key=key, base_url=base) or ""
+            if pre and picked:
+                address = f"{pre}@{picked}"
+                raw = {
+                    "composed": True,
+                    "domain": picked,
+                    "generate_error": str(first_err)[:300],
+                }
+            else:
+                raise
 
-        data = resp.json() if resp.content else {}
-
-    body = data.get("data") if isinstance(data, dict) and "data" in data else data
-    if not isinstance(body, dict):
-        raise RuntimeError(f"Unexpected GPTMail create response: {data}")
-    address = body.get("email") or body.get("address")
-    if not address or "@" not in str(address):
-        raise RuntimeError(f"Unexpected GPTMail create response: {data}")
-    address = str(address).strip()
-    # GPTMail uses the email address itself as the mailbox key for list/clear.
     return {
         "id": address,
         "email": address,
         "token": "",
         "provider": "gptmail",
-        "raw": data,
+        "raw": raw,
         "expiry_ms": 86_400_000 if expiry_ms is None else int(expiry_ms),
     }
 
 
-def gptmail_pick_domain(
+
+def gptmail_list_domains(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
-) -> str | None:
-    """Pick an active public domain from GPTMail catalog."""
-    base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
+) -> list[str]:
+    """List active public domains from GPTMail catalog (``GET /api/domains/public``)."""
+    base = normalize_gptmail_base_url(base_url or GPTMAIL_DEFAULT_BASE_URL)
     key = (api_key or MOEMAIL_API_KEY or "").strip()
     try:
         with httpx.Client(timeout=20.0) as client:
@@ -840,14 +1049,16 @@ def gptmail_pick_domain(
                 headers=_headers(key) if key else {},
             )
             if resp.status_code >= 400:
-                return None
+                return []
             data = resp.json()
     except Exception:
-        return None
+        return []
     body = data.get("data") if isinstance(data, dict) and "data" in data else data
     items = body.get("domains") if isinstance(body, dict) else body
     if not isinstance(items, list):
-        return None
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -856,8 +1067,24 @@ def gptmail_pick_domain(
             continue
         if item.get("is_active") in (0, False, "0", "false"):
             continue
-        return name.strip().lstrip("@").strip(".")
-    return None
+        name = name.strip().lstrip("@").strip(".")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def gptmail_pick_domain(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> str | None:
+    """Pick an active public domain from GPTMail catalog."""
+    domains = gptmail_list_domains(api_key=api_key, base_url=base_url)
+    if not domains:
+        return None
+    return random.choice(domains)
 
 
 def gptmail_fetch_messages(
@@ -881,9 +1108,14 @@ def gptmail_fetch_messages(
             addr = address.strip()
         else:
             return []
-    key = (api_key or MOEMAIL_API_KEY or "").strip() or GPTMAIL_PUBLIC_TEST_KEY
-    base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
-    headers = _headers(key)
+    key = (api_key or MOEMAIL_API_KEY or "").strip() or (GPTMAIL_PUBLIC_TEST_KEY or "").strip()
+    if not key or key in {"gpt-test", "PUBLIC_API_KEY"}:
+        raise RuntimeError(
+            "GPTMail API Key missing for inbox poll. Set sk-… in 协议注册 → GPTMail "
+            "(https://mail.chatgpt.org.uk/zh/api/)."
+        )
+    base = normalize_gptmail_base_url(base_url or GPTMAIL_DEFAULT_BASE_URL)
+    headers = {**_headers(key), "Accept": "application/json"}
 
     with httpx.Client(timeout=30.0) as client:
         resp = client.get(
@@ -893,7 +1125,8 @@ def gptmail_fetch_messages(
         )
         if resp.status_code >= 400:
             raise RuntimeError(
-                f"GPTMail list failed {resp.status_code}: {resp.text[:500]}"
+                f"GPTMail list failed {resp.status_code} for {addr}: {resp.text[:500]}. "
+                "Check X-API-Key (sk-…) and email query param."
             )
         data = resp.json() if resp.content else {}
         body = data.get("data") if isinstance(data, dict) and "data" in data else data
@@ -960,22 +1193,25 @@ def cfmail_list_domains(
     site_password: str | None = None,
 ) -> list[str]:
     """List domains from CF Temp Email public settings (``GET /open_api/settings``)."""
-    base = normalize_cfmail_base_url(base_url or MOEMAIL_BASE_URL)
-    headers = _cfmail_headers(api_key=api_key, site_password=site_password)
+    base = normalize_cfmail_base_url(base_url or CFMAIL_DEFAULT_BASE_URL)
+    # Prefer site password / admin password as x-custom-auth for private sites.
+    headers = _cfmail_headers(
+        api_key=None,
+        site_password=site_password or api_key,
+        content_type=False,
+    )
     try:
         with httpx.Client(timeout=20.0) as client:
             resp = client.get(f"{base}/open_api/settings", headers=headers)
             if resp.status_code >= 400:
-                # Older deploys may expose domains only on authenticated settings.
-                resp2 = client.get(f"{base}/api/settings", headers=headers)
-                if resp2.status_code >= 400:
-                    return []
-                data = resp2.json() if resp2.content else {}
-            else:
-                data = resp.json() if resp.content else {}
+                return []
+            data = resp.json() if resp.content else {}
     except Exception:
         return []
-    body = data.get("data") if isinstance(data, dict) and "data" in data else data
+    # open_api/settings returns a flat object (not {data: ...}).
+    body = data if isinstance(data, dict) else {}
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        body = {**data, **data["data"]}
     if not isinstance(body, dict):
         return []
     out: list[str] = []
@@ -1107,53 +1343,89 @@ def cfmail_create_mailbox(
     Docs: https://github.com/dreamhunter2333/cloudflare_temp_email
     """
     key = (api_key or MOEMAIL_API_KEY or "").strip()
-    base = normalize_cfmail_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_cfmail_base_url(base_url or CFMAIL_DEFAULT_BASE_URL)
+    if not key:
+        raise ValueError(
+            "Cloudflare Temp Email admin password missing. Set 协议注册 → CF "
+            "Admin 密码 (x-admin-auth / ADMIN_PASSWORDS). "
+            "Repo: https://github.com/dreamhunter2333/cloudflare_temp_email"
+        )
     # Never bleed MoeMail default domain into CF.
-    dom = (domain or "").strip().lstrip("@").strip(".")
+    dom = pick_domain_from_list(domain) if domain else ""
+    if not dom:
+        dom = (domain or "").strip().lstrip("@").strip(".")
     if not dom:
         dom = cfmail_pick_domain(
             api_key=key, base_url=base, site_password=site_password
         ) or ""
     if not dom:
         raise ValueError(
-            "Cloudflare Temp Email domain missing. Set domain in registration "
-            "config, or ensure /open_api/settings returns domains."
+            "Cloudflare Temp Email domain missing. Fill CF 域名 in 协议注册, "
+            "or ensure GET /open_api/settings returns domains "
+            f"(base={base})."
         )
     local = (name or "").strip().lower()
     if not local:
         local = secrets_token_hex_local()
+    # Strip chars CF rejects (worker uses address name regex).
+    local = re.sub(r"[^a-z0-9._+-]", "", local) or secrets_token_hex_local()
 
-    payload: dict[str, Any] = {
+    # Admin create: name required; enablePrefix optional (worker PREFIX).
+    # Public create may need Turnstile — automation must use admin password.
+    payload_admin: dict[str, Any] = {
         "name": local,
         "domain": dom,
-        # Admin API field; public API ignores unknown keys.
         "enablePrefix": False,
+        "enableRandomSubdomain": False,
+    }
+    payload_public: dict[str, Any] = {
+        "name": local,
+        "domain": dom,
+        "enableRandomSubdomain": False,
     }
     headers = _cfmail_headers(
-        api_key=key, site_password=site_password, content_type=True
+        api_key=key, site_password=site_password, content_type=True, as_admin=True
     )
-    # Prefer admin create (no captcha) when we have a non-JWT key.
-    use_admin = bool(key) and "Authorization" not in headers
+    use_admin = "x-admin-auth" in headers
 
+    last_err = ""
     with httpx.Client(timeout=30.0) as client:
+        resp = None
         if use_admin:
             resp = client.post(
-                f"{base}/admin/new_address", json=payload, headers=headers
+                f"{base}/admin/new_address", json=payload_admin, headers=headers
             )
             if resp.status_code >= 400:
-                # Fall through to public create for older/non-admin deploys.
+                last_err = f"admin/new_address {resp.status_code}: {resp.text[:300]}"
+                # Some deploys use site password only — try public path too.
+                pub_headers = _cfmail_headers(
+                    api_key=None,
+                    site_password=site_password or key,
+                    content_type=True,
+                )
                 resp = client.post(
-                    f"{base}/api/new_address", json=payload, headers=headers
+                    f"{base}/api/new_address",
+                    json=payload_public,
+                    headers=pub_headers,
                 )
         else:
             resp = client.post(
-                f"{base}/api/new_address", json=payload, headers=headers
+                f"{base}/api/new_address", json=payload_public, headers=headers
             )
-        if resp.status_code >= 400:
+        if resp is None or resp.status_code >= 400:
+            detail = (resp.text[:500] if resp is not None else last_err)
             raise RuntimeError(
-                f"CF Temp Email create failed {resp.status_code}: {resp.text[:500]}"
+                f"CF Temp Email create failed ({base}): {detail or last_err}. "
+                "Use Workers API origin (not Pages UI), ADMIN_PASSWORDS in "
+                "x-admin-auth, and a domain from /open_api/settings."
             )
-        data = resp.json() if resp.content else {}
+        # Response may be JSON object or plain text error already handled.
+        try:
+            data = resp.json() if resp.content else {}
+        except Exception as e:
+            raise RuntimeError(
+                f"CF Temp Email create returned non-JSON: {resp.text[:300]}"
+            ) from e
 
     body = data.get("data") if isinstance(data, dict) and "data" in data else data
     if not isinstance(body, dict):
@@ -1238,10 +1510,17 @@ def cfmail_fetch_messages(
     ``token`` (address JWT) is required for inbox access. ``api_key`` may also
     be the JWT when the admin key is not needed.
     """
-    jwt = (token or api_key or MOEMAIL_API_KEY or "").strip()
+    # Inbox access requires the address JWT returned at create time.
+    jwt = (token or "").strip()
+    if not jwt:
+        # Only fall back to api_key if it is a JWT (3 segments), never admin password.
+        cand = (api_key or MOEMAIL_API_KEY or "").strip()
+        parts = cand.split(".")
+        if len(parts) == 3 and all(parts):
+            jwt = cand
     if not jwt:
         return []
-    base = normalize_cfmail_base_url(base_url or MOEMAIL_BASE_URL)
+    base = normalize_cfmail_base_url(base_url or CFMAIL_DEFAULT_BASE_URL)
     headers = _cfmail_headers(api_key=jwt, site_password=site_password)
 
     with httpx.Client(timeout=30.0) as client:
@@ -1336,6 +1615,189 @@ def cfmail_fetch_messages(
         return out
 
 
+
+def normalize_tempmail_base_url(base_url: str | None = None) -> str:
+    """TempMail.lol API origin (https://tempmail.lol/zh/api)."""
+    raw = (base_url or "").strip()
+    if not raw:
+        return TEMPMAIL_LOL_DEFAULT_BASE_URL
+    lower = raw.lower()
+    if "tempmail.lol" in lower or "api.tempmail" in lower:
+        return TEMPMAIL_LOL_DEFAULT_BASE_URL
+    # reject other providers
+    if any(
+        x in lower
+        for x in (
+            "moemail",
+            "maliapi",
+            "chatgpt.org.uk",
+            "workers.dev",
+            "example.com",
+        )
+    ):
+        return TEMPMAIL_LOL_DEFAULT_BASE_URL
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
+    if not parsed.netloc:
+        return TEMPMAIL_LOL_DEFAULT_BASE_URL
+    return origin or TEMPMAIL_LOL_DEFAULT_BASE_URL
+
+
+def tempmail_create_mailbox(
+    *,
+    name: str | None = None,
+    domain: str | None = None,
+    expiry_ms: int | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+) -> dict[str, Any]:
+    """Create a free TempMail.lol inbox (no API key required).
+
+    Docs: https://tempmail.lol/zh/api
+    - POST https://api.tempmail.lol/v2/inbox/create
+    - Optional JSON: prefix, domain (custom/paid), community
+    - Free tier: omit Authorization; Plus/Ultra: Authorization: Bearer <api_key>
+    """
+    base = normalize_tempmail_base_url(base_url)
+    key = (api_key or "").strip()
+    pre = (name or "").strip().lower() or None
+    if pre:
+        pre = re.sub(r"[^a-z0-9._+-]", "", pre) or None
+    dom = pick_domain_from_list(domain) if domain else ""
+    if not dom:
+        dom = (domain or "").strip().lstrip("@").strip(".") or None
+
+    payload: dict[str, Any] = {}
+    if pre:
+        payload["prefix"] = pre
+    if dom:
+        # Custom domains typically need Plus/Ultra; free will 400 Invalid domain.
+        payload["domain"] = dom
+
+    headers: dict[str, str] = {"Accept": "application/json", "Content-Type": "application/json"}
+    if key:
+        # Paid tiers (Plus / Ultra)
+        headers["Authorization"] = f"Bearer {key}"
+
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(f"{base}/v2/inbox/create", json=payload or {}, headers=headers)
+        if resp.status_code >= 400 and dom and "Invalid domain" in (resp.text or ""):
+            # Free tier: drop custom domain and retry random.
+            payload.pop("domain", None)
+            resp = client.post(f"{base}/v2/inbox/create", json=payload or {}, headers=headers)
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"TempMail.lol create failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else {}
+
+    address = data.get("address") or data.get("email")
+    token = data.get("token") or ""
+    if not address or "@" not in str(address):
+        raise RuntimeError(f"Unexpected TempMail.lol create response: {data}")
+    if not token:
+        raise RuntimeError(
+            f"TempMail.lol create returned no token (needed for /v2/inbox): {data}"
+        )
+    return {
+        "id": str(address).strip(),  # list is token-keyed; id kept as address
+        "email": str(address).strip(),
+        "token": str(token),
+        "provider": "tempmail",
+        "raw": data,
+        "expiry_ms": 86_400_000 if expiry_ms is None else int(expiry_ms),
+    }
+
+
+def tempmail_fetch_messages(
+    email_id: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    include_details: bool = True,
+    address: str | None = None,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """List messages for a TempMail.lol inbox via ``GET /v2/inbox?token=…``.
+
+    Free tier: only the inbox token from create is required (no API key).
+    Response: ``{emails:[{from,to,subject,body,html,date}], expired:bool}``.
+    """
+    tok = (token or "").strip()
+    if not tok:
+        # Mis-wired callers sometimes put token in email_id; don't treat address as token.
+        return []
+    base = normalize_tempmail_base_url(base_url)
+    headers: dict[str, str] = {"Accept": "application/json"}
+    key = (api_key or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.get(
+            f"{base}/v2/inbox",
+            headers=headers,
+            params={"token": tok},
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"TempMail.lol inbox failed {resp.status_code}: {resp.text[:500]}"
+            )
+        data = resp.json() if resp.content else {}
+
+    if isinstance(data, dict) and data.get("expired") is True:
+        return []
+    messages = []
+    if isinstance(data, dict):
+        messages = data.get("emails") or data.get("messages") or data.get("items") or []
+    elif isinstance(data, list):
+        messages = data
+    if not isinstance(messages, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    for raw in messages[:30]:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        # Normalize for shared extractors / wait_for_code.
+        if item.get("body") and not item.get("text"):
+            item["text"] = item.get("body")
+        if item.get("body") and not item.get("content"):
+            item["content"] = item.get("body")
+        if item.get("from") and not item.get("from_address"):
+            item["from_address"] = item.get("from")
+        text_blob = "\n".join(
+            str(item.get(k) or "")
+            for k in ("subject", "body", "text", "content", "html", "from", "from_address")
+        )
+        item["extracted"] = _extract_codes_and_links(text_blob)
+        # Stable id for detail-less list
+        if not item.get("id"):
+            item["id"] = str(
+                item.get("date")
+                or hash(text_blob) & 0xFFFFFFFF
+            )
+        out.append(item)
+    return out
+
+
+def tempmail_list_domains(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> list[str]:
+    """Free TempMail.lol assigns random domains; no public catalog API.
+
+    Optional domain/prefix is only for paid custom domains. Return empty so UI
+    shows auto-assign.
+    """
+    return []
+
+
 def create_mailbox(
     *,
     provider: str | None = None,
@@ -1348,7 +1810,7 @@ def create_mailbox(
     proxy_username: str | None = None,
     proxy_password: str | None = None,
 ) -> dict[str, Any]:
-    """Provider-aware mailbox create (``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail``)."""
+    """Provider-aware mailbox create (``moemail`` | ``yyds`` | ``gptmail`` | ``cfmail`` | ``tempmail``)."""
     prov = normalize_mail_provider(provider, base_url=base_url)
     if prov == "yyds":
         return yyds_create_mailbox(
@@ -1374,6 +1836,17 @@ def create_mailbox(
         )
     if prov == "cfmail":
         return cfmail_create_mailbox(
+            name=name,
+            domain=domain,
+            expiry_ms=expiry_ms,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        )
+    if prov == "tempmail":
+        return tempmail_create_mailbox(
             name=name,
             domain=domain,
             expiry_ms=expiry_ms,
@@ -1430,6 +1903,15 @@ def fetch_messages(
         )
     if prov == "cfmail":
         return cfmail_fetch_messages(
+            email_id,
+            api_key=api_key,
+            base_url=base_url,
+            include_details=include_details,
+            address=address,
+            token=token,
+        )
+    if prov == "tempmail":
+        return tempmail_fetch_messages(
             email_id,
             api_key=api_key,
             base_url=base_url,

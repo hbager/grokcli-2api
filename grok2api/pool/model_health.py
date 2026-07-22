@@ -566,6 +566,9 @@ def probe_model_for_creds(
         """Mutate pool only when scanned and error class matches a policy."""
         if not auto_disable or not creds.auth_key:
             return
+        # Fresh registrations: record last_probe only — never cool/disable.
+        if str(source or "").lower() in {"register", "import", "registration", "sso_import"}:
+            return
         try:
             import grok2api.pool.account_pool as account_pool
         except Exception:

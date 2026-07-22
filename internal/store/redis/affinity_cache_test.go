@@ -158,3 +158,34 @@ func TestAffinityScheduleWriteCoalesces(t *testing.T) {
 		t.Fatalf("too many writes without coalesce: %d", len(calls))
 	}
 }
+
+
+func TestAffinityCacheDeleteDropsPending(t *testing.T) {
+	affinityCacheMu.Lock()
+	affinityCache = map[string]affinityCacheEntry{}
+	affinityCacheMu.Unlock()
+	affinityPendingMu.Lock()
+	affinityPending = map[string]affinityPendingWrite{}
+	affinityFlushing = map[string]bool{}
+	affinityPendingMu.Unlock()
+
+	// Seed pending write without starting flusher by setting pending while flushing=true
+	affinityPendingMu.Lock()
+	affinityFlushing["fp-drop"] = true
+	affinityPending["fp-drop"] = affinityPendingWrite{accountID: "acc-x", ttl: time.Hour}
+	affinityPendingMu.Unlock()
+
+	affinityCacheSet("fp-drop", "acc-x")
+	affinityCacheDelete("fp-drop")
+
+	if _, ok := affinityCacheGet("fp-drop"); ok {
+		t.Fatal("local cache should be cleared")
+	}
+	affinityPendingMu.Lock()
+	_, still := affinityPending["fp-drop"]
+	affinityFlushing["fp-drop"] = false
+	affinityPendingMu.Unlock()
+	if still {
+		t.Fatal("pending write should be dropped on delete")
+	}
+}

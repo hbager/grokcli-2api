@@ -199,7 +199,7 @@ TOKEN_REFRESH_WORKERS = _env_int("GROK2API_TOKEN_REFRESH_WORKERS", 4, maximum=32
 MODEL_PROBE_WORKERS = _env_int("GROK2API_MODEL_PROBE_WORKERS", 4, maximum=32)
 QUOTA_WORKERS = _env_int("GROK2API_QUOTA_WORKERS", 6, maximum=32)
 # SSO cookie → token is network-bound device flow; 8–16 works well on hybrid stacks.
-SSO_IMPORT_WORKERS = _env_int("GROK2API_SSO_IMPORT_WORKERS", 6, maximum=12)
+SSO_IMPORT_WORKERS = _env_int("GROK2API_SSO_IMPORT_WORKERS", 8, maximum=16)
 # Startup stagger: first background cycle waits longer with large pools
 TOKEN_MAINTAIN_STARTUP_DELAY = _env_float(
     "GROK2API_TOKEN_MAINTAIN_STARTUP_DELAY", 20.0, minimum=5.0

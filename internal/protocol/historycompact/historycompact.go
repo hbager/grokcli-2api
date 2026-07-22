@@ -1,7 +1,13 @@
 // Package historycompact ports the Python soft-tier tool-loop history shrinker.
 //
-// Default is OFF (IQ-first). Enable with GROK2API_HISTORY_COMPACT=1, or set
-// GROK2API_HISTORY_COMPACT_AUTO_CHARS to auto-force on huge bodies.
+// Defaults are IQ-first (OFF). Enable via:
+//   - env GROK2API_HISTORY_COMPACT=1
+//   - admin setting history_compact_enabled (hot-reloaded via Configure)
+//   - auto threshold GROK2API_HISTORY_COMPACT_AUTO_CHARS / history_compact_auto_chars
+//
+// Codex multi-turn tool loops: when auto_chars is unset (0), Apply still auto-forces
+// soft compact once messages JSON exceeds CodexDefaultAutoChars (~200k), so long
+// sessions do not blow upstream context while prefix-stable rewrites keep cache hits.
 package historycompact
 
 import (
@@ -11,10 +17,16 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const placeholderPrefix = "[compacted tool result"
+
+// CodexDefaultAutoChars is used when no global auto threshold is configured
+// and the request looks like Codex / OpenAI-native agent. ~200k JSON chars of
+// messages is a practical soft trigger well below grok-4.5's 500k context.
+const CodexDefaultAutoChars = 200_000
 
 type Options struct {
 	Enabled            bool
@@ -27,13 +39,137 @@ type Options struct {
 	MaxMessagesChars   int
 }
 
+// runtime holds durable admin settings (and optional env overlay).
+// Env is the floor/fallback; Configure() from app_settings takes precedence when set.
+type runtimeConfig struct {
+	enabledSet       bool
+	enabled          bool
+	autoCharsSet     bool
+	autoChars        int
+	keepRoundsSet    bool
+	keepToolRounds   int
+	maxToolResultSet bool
+	maxToolResult    int
+}
+
+// ConfigureOpts is the admin/hot-reload payload for compact knobs.
+type ConfigureOpts struct {
+	Enabled            *bool
+	AutoChars          *int
+	KeepToolRounds     *int
+	MaxToolResultChars *int
+}
+
+var (
+	runtimeMu sync.RWMutex
+	runtime   runtimeConfig
+)
+
+// Configure applies durable admin settings hot without restart.
+// Pass enabled/autoChars pointers as nil to leave that field untouched.
+// Note: autoChars=0 means "no global auto threshold" — Codex clients still get
+// CodexDefaultAutoChars via EffectiveAutoChars (see Apply).
+func Configure(enabled *bool, autoChars *int) {
+	ConfigureFull(ConfigureOpts{Enabled: enabled, AutoChars: autoChars})
+}
+
+// ConfigureFull applies the full compact knob set from admin settings.
+func ConfigureFull(opts ConfigureOpts) {
+	runtimeMu.Lock()
+	defer runtimeMu.Unlock()
+	if opts.Enabled != nil {
+		runtime.enabledSet = true
+		runtime.enabled = *opts.Enabled
+	}
+	if opts.AutoChars != nil {
+		v := *opts.AutoChars
+		if v < 0 {
+			v = 0
+		}
+		if v > 5_000_000 {
+			v = 5_000_000
+		}
+		// 0 is valid (no global auto). Non-zero below 4000 is clamped to 4000 for safety.
+		if v > 0 && v < 4000 {
+			v = 4000
+		}
+		runtime.autoCharsSet = true
+		runtime.autoChars = v
+	}
+	if opts.KeepToolRounds != nil {
+		v := *opts.KeepToolRounds
+		if v < 1 {
+			v = 1
+		}
+		if v > 64 {
+			v = 64
+		}
+		runtime.keepRoundsSet = true
+		runtime.keepToolRounds = v
+	}
+	if opts.MaxToolResultChars != nil {
+		v := *opts.MaxToolResultChars
+		if v < 0 {
+			v = 0
+		}
+		if v > 0 && v < 512 {
+			v = 512
+		}
+		if v > 2_000_000 {
+			v = 2_000_000
+		}
+		runtime.maxToolResultSet = true
+		runtime.maxToolResult = v
+	}
+}
+
+// Reset clears durable overrides so only process env applies (tests / process recycle).
+func Reset() {
+	runtimeMu.Lock()
+	runtime = runtimeConfig{}
+	runtimeMu.Unlock()
+}
+
+// Snapshot returns the effective compact knobs (for admin/debug headers).
+func Snapshot() map[string]any {
+	return map[string]any{
+		"enabled":                  DefaultOptions().Enabled,
+		"auto_chars":               AutoChars(),
+		"codex_default_auto_chars": CodexDefaultAutoChars,
+		"from_settings_enabled": func() bool {
+			runtimeMu.RLock()
+			defer runtimeMu.RUnlock()
+			return runtime.enabledSet
+		}(),
+		"from_settings_auto_chars": func() bool {
+			runtimeMu.RLock()
+			defer runtimeMu.RUnlock()
+			return runtime.autoCharsSet
+		}(),
+	}
+}
+
 func DefaultOptions() Options {
+	enabled := envBool("GROK2API_HISTORY_COMPACT", false)
+	keep := envInt("GROK2API_HISTORY_KEEP_TOOL_ROUNDS", 32, 1, 64)
+	maxTR := envInt("GROK2API_HISTORY_MAX_TOOL_RESULT_CHARS", 48000, 512, 2_000_000)
+	runtimeMu.RLock()
+	if runtime.enabledSet {
+		enabled = runtime.enabled
+	}
+	if runtime.keepRoundsSet {
+		keep = runtime.keepToolRounds
+	}
+	if runtime.maxToolResultSet && runtime.maxToolResult > 0 {
+		maxTR = runtime.maxToolResult
+	}
+	runtimeMu.RUnlock()
 	return Options{
-		Enabled:            envBool("GROK2API_HISTORY_COMPACT", false),
+		Enabled:            enabled,
 		PrefixStable:       envBool("GROK2API_HISTORY_PREFIX_STABLE", true),
-		KeepToolRounds:     envInt("GROK2API_HISTORY_KEEP_TOOL_ROUNDS", 32, 1, 64),
+		KeepToolRounds:     keep,
 		MidToolRounds:      envInt("GROK2API_HISTORY_MID_TOOL_ROUNDS", 24, 0, 128),
-		MaxToolResultChars: envInt("GROK2API_HISTORY_MAX_TOOL_RESULT_CHARS", 48000, 512, 2_000_000),
+		MaxToolResultChars: maxTR,
 		MidToolResultChars: envInt("GROK2API_HISTORY_MID_TOOL_RESULT_CHARS", 16000, 512, 2_000_000),
 		OldToolResultChars: envInt("GROK2API_HISTORY_OLD_TOOL_RESULT_CHARS", 8000, 256, 2_000_000),
 		MaxMessagesChars:   envInt("GROK2API_HISTORY_MAX_MESSAGES_CHARS", 1_200_000, 8_000, 5_000_000),
@@ -41,58 +177,108 @@ func DefaultOptions() Options {
 }
 
 func AutoChars() int {
+	runtimeMu.RLock()
+	if runtime.autoCharsSet {
+		v := runtime.autoChars
+		runtimeMu.RUnlock()
+		return v
+	}
+	runtimeMu.RUnlock()
 	return envInt("GROK2API_HISTORY_COMPACT_AUTO_CHARS", 0, 0, 5_000_000)
 }
 
+// EffectiveAutoChars returns the global auto threshold, or Codex default when
+// unset and the client is Codex/OpenAI-native (so long tool loops still compact).
+func EffectiveAutoChars(userAgent string) int {
+	return EffectiveAutoCharsFor(userAgent, nil, nil)
+}
+
+// EffectiveAutoCharsFor is like EffectiveAutoChars but can detect Codex without UA
+// via tools schema / metadata (proxies often strip User-Agent).
+func EffectiveAutoCharsFor(userAgent string, tools any, raw map[string]any) int {
+	if th := AutoChars(); th > 0 {
+		return th
+	}
+	if LooksLikeCodexRequest(userAgent, tools, raw) {
+		return CodexDefaultAutoChars
+	}
+	return 0
+}
+
 func ShouldAutoCompact(body map[string]any) bool {
-	threshold := AutoChars()
+	return ShouldAutoCompactUA(body, "")
+}
+
+func ShouldAutoCompactUA(body map[string]any, userAgent string) bool {
+	threshold := EffectiveAutoChars(userAgent)
 	if threshold <= 0 || body == nil {
 		return false
 	}
-	messages, ok := body["messages"].([]any)
-	if !ok || len(messages) == 0 {
-		// also accept []map[string]any
-		if typed, ok := body["messages"].([]map[string]any); ok && len(typed) > 0 {
-			messages = make([]any, len(typed))
-			for i, item := range typed {
-				messages[i] = item
-			}
-		} else {
-			return false
-		}
+	messages := normalizeMessages(body["messages"])
+	if len(messages) == 0 {
+		return false
 	}
 	return messagesCharSize(messages) >= threshold
 }
 
 // Apply mutates body["messages"] when compact is enabled or auto-forced.
 // Stats are stored under body["_history_compact"].
-func Apply(body map[string]any) map[string]any {
+// Optional userAgent enables Codex default auto-threshold when global auto_chars=0.
+// When body carries tools/metadata, Codex is also detected without UA (proxy strip).
+func Apply(body map[string]any, userAgent ...string) map[string]any {
 	if body == nil {
 		return map[string]any{"enabled": false, "applied": false}
 	}
+	ua := ""
+	if len(userAgent) > 0 {
+		ua = userAgent[0]
+	}
 	opts := DefaultOptions()
-	// Fast path: default OFF and no auto threshold → skip clone + full JSON size scan.
-	// This is critical for Codex multi-turn TTFT with large tool transcripts.
-	if !opts.Enabled && AutoChars() <= 0 {
-		stats := map[string]any{"enabled": false, "applied": false}
+	autoTh := EffectiveAutoCharsFor(ua, body["tools"], body)
+	// Fast path: disabled and no auto threshold for this client → skip work.
+	if !opts.Enabled && autoTh <= 0 {
+		stats := map[string]any{"enabled": false, "applied": false, "auto_chars": 0}
 		body["_history_compact"] = stats
 		return stats
 	}
-	force := ShouldAutoCompact(body)
-	if force {
-		opts.Enabled = true
+	force := false
+	if autoTh > 0 {
+		messages := normalizeMessages(body["messages"])
+		if len(messages) > 0 && messagesCharSize(messages) >= autoTh {
+			force = true
+			opts.Enabled = true
+		}
 	}
-	// Still disabled after auto check: avoid heavy clone/marshal.
 	if !opts.Enabled {
-		stats := map[string]any{"enabled": false, "applied": false}
+		stats := map[string]any{"enabled": false, "applied": false, "auto_chars": autoTh}
 		body["_history_compact"] = stats
 		return stats
 	}
 	messages := normalizeMessages(body["messages"])
+	// Codex long sessions: slightly tighter mid/old tool caps so 200k trigger
+	// actually reduces payload (soft-tier with 32 recent rounds can stay huge).
+	if LooksLikeCodexRequest(ua, body["tools"], body) {
+		if opts.MidToolResultChars > 8000 {
+			opts.MidToolResultChars = 8000
+		}
+		if opts.OldToolResultChars > 4000 {
+			opts.OldToolResultChars = 4000
+		}
+		// Cap absolute message budget for Codex to leave room for tools/system.
+		if opts.MaxMessagesChars > 900_000 {
+			opts.MaxMessagesChars = 900_000
+		}
+	}
 	compacted, stats := CompactMessages(messages, opts)
 	body["messages"] = compacted
-	if force && truthy(stats["applied"]) {
+	stats["auto_chars"] = autoTh
+	if force {
 		stats["auto"] = true
+		if AutoChars() <= 0 && autoTh == CodexDefaultAutoChars {
+			stats["auto_source"] = "codex_default"
+		} else {
+			stats["auto_source"] = "threshold"
+		}
 	}
 	body["_history_compact"] = stats
 	return stats
@@ -216,8 +402,9 @@ func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 					}
 					newText := truncateText(text, tier.cap, "tool_result/"+tier.reason)
 					if newText != text {
-						msg["content"] = newText
-						stats["truncated_tool_msgs"] = asInt(stats["truncated_tool_msgs"]) + 1
+						if applyTextCompactIfSafe(msg, newText) {
+							stats["truncated_tool_msgs"] = asInt(stats["truncated_tool_msgs"]) + 1
+						}
 					}
 				}
 				after = messagesCharSize(out)
@@ -245,9 +432,10 @@ func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 				}
 				newText := placeholder(text, "size budget")
 				if newText != text {
-					msg["content"] = newText
-					stats["compacted_tool_msgs"] = asInt(stats["compacted_tool_msgs"]) + 1
-					after = messagesCharSize(out)
+					if applyTextCompactIfSafe(msg, newText) {
+						stats["compacted_tool_msgs"] = asInt(stats["compacted_tool_msgs"]) + 1
+						after = messagesCharSize(out)
+					}
 				}
 			}
 		}
@@ -272,8 +460,9 @@ func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 				}
 				newText := truncateText(text, hard, "tool_result")
 				if newText != text {
-					msg["content"] = newText
-					stats["truncated_tool_msgs"] = asInt(stats["truncated_tool_msgs"]) + 1
+					if applyTextCompactIfSafe(msg, newText) {
+						stats["truncated_tool_msgs"] = asInt(stats["truncated_tool_msgs"]) + 1
+					}
 				}
 			}
 			after = messagesCharSize(out)
@@ -311,8 +500,9 @@ func CompactMessages(messages []any, opts Options) ([]any, map[string]any) {
 			}
 			newText := truncateText(text, limit, role)
 			if newText != text {
-				msg["content"] = newText
-				after = messagesCharSize(out)
+				if applyTextCompactIfSafe(msg, newText) {
+					after = messagesCharSize(out)
+				}
 			}
 		}
 	}
@@ -422,7 +612,47 @@ func shrinkToolMessage(msg map[string]any, maxChars int, forcePlaceholder, prefi
 	if next == original {
 		return false
 	}
-	msg["content"] = next
+	if !applyTextCompactIfSafe(msg, next) {
+		return false
+	}
+	return true
+}
+
+// isMultimodalContent reports whether content is a parts array with image/media
+// blocks that must not be flattened to plain text (preserves vision inputs).
+func isMultimodalContent(content any) bool {
+	parts, ok := content.([]any)
+	if !ok || len(parts) == 0 {
+		return false
+	}
+	for _, block := range parts {
+		item, ok := block.(map[string]any)
+		if !ok {
+			continue
+		}
+		btype := strings.ToLower(stringValue(item["type"]))
+		switch btype {
+		case "image_url", "image", "input_image", "input_file", "file", "audio", "input_audio", "video":
+			return true
+		}
+		if item["image_url"] != nil || item["source"] != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// applyTextCompactIfSafe rewrites message content only when it is plain text.
+// Multimodal (image) messages keep their part arrays so vision inputs survive
+// history compaction.
+func applyTextCompactIfSafe(msg map[string]any, newText string) bool {
+	if msg == nil {
+		return false
+	}
+	if isMultimodalContent(msg["content"]) {
+		return false
+	}
+	msg["content"] = newText
 	return true
 }
 
@@ -442,6 +672,9 @@ func contentToText(content any) string {
 				btype := strings.ToLower(stringValue(item["type"]))
 				if btype == "text" || btype == "input_text" || btype == "output_text" {
 					parts = append(parts, stringValue(item["text"]))
+				} else if btype == "image_url" || btype == "image" || btype == "input_image" {
+					// Size accounting only — keep structure via applyTextCompactIfSafe.
+					parts = append(parts, "[image]")
 				} else if btype == "tool_result" {
 					parts = append(parts, contentToText(item["content"]))
 				} else {
@@ -656,13 +889,173 @@ func IsCodexClient(userAgent string) bool {
 		return false
 	}
 	for _, marker := range []string{
-		"codex", "codex-cli", "codex-tui", "gpt-agent",
+		"codex", "codex-cli", "codex-tui", "gpt-agent", "openai-codex",
 	} {
 		if strings.Contains(ua, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+// LooksLikeCodexRequest detects Codex even when reverse proxies strip User-Agent.
+// Signals: UA, tools schema (exec_command/cmd, apply_patch/input), metadata.session.
+func LooksLikeCodexRequest(userAgent string, tools any, raw map[string]any) bool {
+	if IsCodexClient(userAgent) || IsOpenAINativeClient(userAgent) {
+		return true
+	}
+	// Explicit metadata hints from agents / gateways.
+	if raw != nil {
+		if meta, ok := raw["metadata"].(map[string]any); ok && meta != nil {
+			for _, key := range []string{"client", "agent", "source", "app", "sdk"} {
+				v := strings.ToLower(strings.TrimSpace(fmtString(meta[key])))
+				if strings.Contains(v, "codex") || strings.Contains(v, "gpt-agent") {
+					return true
+				}
+			}
+		}
+		for _, key := range []string{"prompt_cache_key", "previous_response_id"} {
+			// previous_response_id alone is weak; only count with tools signal below
+			_ = key
+		}
+	}
+	// Tools schema: Codex local tools use exec_command{cmd} / apply_patch{input}.
+	if toolsLookLikeCodex(tools) {
+		return true
+	}
+	return false
+}
+
+func toolsLookLikeCodex(tools any) bool {
+	list := toolsAsSlice(tools)
+	if len(list) == 0 {
+		return false
+	}
+	shellCmd := 0
+	applyPatch := 0
+	for _, item := range list {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := toolNameOf(tool)
+		nk := strings.ToLower(strings.ReplaceAll(name, "-", "_"))
+		props := toolProps(tool)
+		if nk == "exec_command" || nk == "shell" || nk == "local_shell" || nk == "run_command" ||
+			strings.HasSuffix(nk, "exec_command") || strings.HasSuffix(nk, "shell") {
+			if _, hasCmd := props["cmd"]; hasCmd {
+				shellCmd++
+			}
+			// required: ["cmd"] without command also counts
+			if req, ok := toolRequired(tool); ok {
+				for _, r := range req {
+					if r == "cmd" {
+						shellCmd++
+					}
+				}
+			}
+		}
+		if strings.Contains(nk, "apply_patch") || nk == "apply_patch" || nk == "applypatch" {
+			if _, hasIn := props["input"]; hasIn {
+				applyPatch++
+			}
+		}
+	}
+	return shellCmd > 0 || applyPatch > 0
+}
+
+func toolsAsSlice(tools any) []any {
+	switch v := tools.(type) {
+	case []any:
+		return v
+	case []map[string]any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = item
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func toolNameOf(tool map[string]any) string {
+	if n, ok := tool["name"].(string); ok && strings.TrimSpace(n) != "" {
+		return n
+	}
+	if fn, ok := tool["function"].(map[string]any); ok {
+		if n, ok := fn["name"].(string); ok {
+			return n
+		}
+	}
+	return ""
+}
+
+func toolProps(tool map[string]any) map[string]any {
+	params := tool["parameters"]
+	if params == nil {
+		params = tool["input_schema"]
+	}
+	if params == nil {
+		if fn, ok := tool["function"].(map[string]any); ok {
+			params = fn["parameters"]
+			if params == nil {
+				params = fn["input_schema"]
+			}
+		}
+	}
+	pm, _ := params.(map[string]any)
+	if pm == nil {
+		return map[string]any{}
+	}
+	props, _ := pm["properties"].(map[string]any)
+	if props == nil {
+		return map[string]any{}
+	}
+	return props
+}
+
+func toolRequired(tool map[string]any) ([]string, bool) {
+	params := tool["parameters"]
+	if params == nil {
+		params = tool["input_schema"]
+	}
+	if params == nil {
+		if fn, ok := tool["function"].(map[string]any); ok {
+			params = fn["parameters"]
+		}
+	}
+	pm, _ := params.(map[string]any)
+	if pm == nil {
+		return nil, false
+	}
+	raw, ok := pm["required"]
+	if !ok {
+		return nil, false
+	}
+	switch v := raw.(type) {
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out, true
+	case []string:
+		return v, true
+	default:
+		return nil, false
+	}
+}
+
+func fmtString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	default:
+		return ""
+	}
 }
 
 // OutboundToolPolicy is the resolved per-request tool emission policy.

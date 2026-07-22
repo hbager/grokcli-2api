@@ -95,20 +95,50 @@ curl -fsS http://127.0.0.1:40081/health
 
 ---
 
-## 场景 B：已是 hybrid，仅升级应用版本
+## 场景 B：已是 hybrid，仅升级应用版本（含 1.x → 2.0.3）
 
-1. 备份 PostgreSQL
-2. 拉取新镜像 / 源码并重建容器
-3. 启动时 `grok2api/store/pg.py` 会 **幂等执行 schema ALTER**（无需再跑 JSON 迁移）
-4. 检查 `/health` 与管理台
+适用于：已在用 PostgreSQL + Redis，从 **1.9.x / 2.0.0 / 2.0.1** 升到 **2.0.3**。
+
+### 1. 备份
 
 ```bash
+docker exec grokcli-2api-postgres pg_dump -U grok2api -d grok2api \
+  > ~/grok2api-backup-$(date +%F-%H%M%S).sql
+```
+
+### 2. 拉新镜像 / 重建
+
+```bash
+# GHCR（镜像名必须全小写）
+docker pull ghcr.io/hm2899/grokcli-2api:2.0.3
+# compose 中 image 改为 :2.0.3 或 :latest 后：
+docker compose up -d
+
+# 或本地构建
 docker compose pull   # 若用 GHCR
 # 或
 docker compose build
 docker compose up -d
 curl -fsS http://127.0.0.1:40081/health
 ```
+
+Docker 入口会自动跑 `grok2api-migrate up`（≥2.0.1）。Go 进程本身只校验 schema、不改表结构。
+
+### 3. 验证
+
+- 管理台账号 / API Key 数量与升级前一致
+- **Ctrl+F5** 硬刷管理台（加载新 `core.*.js`）
+- 额度：曾成功查询的账号应从 DB `last_quota` 回填类型与用量
+- 新注册账号测活成功后应保持 **轮询中**（不进冷却池）
+
+### 4. 1.x → 2.x 说明
+
+| 变化 | 说明 |
+|------|------|
+| 主进程 | 默认 **Go**；Python 仅 loopback sidecar（注册 / SSO / 过盾） |
+| Schema | Docker 入口自动 migrate |
+| 额度 | 2.0.3 起类型/用量持久化；历史 error 壳不当有效额度 |
+| 排序 | 默认按加入时间；刷新/测活不打乱顺序 |
 
 ---
 

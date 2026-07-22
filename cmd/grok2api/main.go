@@ -17,6 +17,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/maintainer"
 	"github.com/hm2899/grokcli-2api/internal/modelhealth"
 	"github.com/hm2899/grokcli-2api/internal/models"
+	"github.com/hm2899/grokcli-2api/internal/protocol/historycompact"
 	"github.com/hm2899/grokcli-2api/internal/quota"
 	appruntime "github.com/hm2899/grokcli-2api/internal/runtime"
 	"github.com/hm2899/grokcli-2api/internal/server"
@@ -80,15 +81,34 @@ func main() {
 
 	// Live config snapshots let admin settings writes hot-reload without races.
 	runtimeCfg := config.NewRuntimeConfig(cfg)
+	var bootSettings map[string]any
 	if store != nil {
 		if settings, err := store.PublicSettings(context.Background()); err == nil {
+			bootSettings = settings
 			runtimeCfg.ApplyStoreSettings(settings)
+			opts := historycompact.ConfigureOpts{}
+			if v, ok := settings["history_compact_enabled"].(bool); ok {
+				opts.Enabled = &v
+			}
+			if v, ok := intSetting(settings["history_compact_auto_chars"]); ok {
+				opts.AutoChars = &v
+			}
+			if v, ok := intSetting(settings["history_keep_tool_rounds"]); ok {
+				opts.KeepToolRounds = &v
+			}
+			if v, ok := intSetting(settings["history_max_tool_result_chars"]); ok {
+				opts.MaxToolResultChars = &v
+			}
+			historycompact.ConfigureFull(opts)
 			loaded := runtimeCfg.Load()
+			snap := historycompact.Snapshot()
 			slog.Info("loaded durable settings into runtime config",
 				"default_model", loaded.DefaultModel,
 				"sse_keepalive", loaded.SSEKeepalive.String(),
 				"outbound_max_tools", loaded.OutboundMaxTools,
 				"outbound_proxy_enabled", loaded.OutboundProxyConfigured && loaded.OutboundProxyEnabled,
+				"history_compact_enabled", snap["enabled"],
+				"history_compact_auto_chars", snap["auto_chars"],
 			)
 		} else {
 			slog.Warn("failed to load durable settings at boot", "error", err)
@@ -104,8 +124,22 @@ func main() {
 		oidcTransport.Proxy = proxySelector.Proxy
 		oidcClient := &oidc.Client{HTTP: &http.Client{Timeout: 30 * time.Second, Transport: oidcTransport}}
 		maintSvc = maintainer.New(store, redisClient, oidcClient)
-		healthSvc = modelhealth.New(store, redisClient, cfg.UpstreamBase, []string{cfg.DefaultModel})
+		healthSvc = modelhealth.New(store, redisClient, cfg.UpstreamBase, []string{runtimeCfg.Load().DefaultModel})
 		healthSvc.SetProxy(proxySelector.Proxy)
+		if bootSettings != nil {
+			var intervalSec float64
+			switch v := bootSettings["model_health_interval_sec"].(type) {
+			case float64:
+				intervalSec = v
+			case int:
+				intervalSec = float64(v)
+			case int64:
+				intervalSec = float64(v)
+			}
+			batch, _ := intSetting(bootSettings["model_health_probe_batch"])
+			workers, _ := intSetting(bootSettings["model_health_probe_workers"])
+			healthSvc.Configure(intervalSec, batch, workers)
+		}
 		if leader != nil {
 			maintSvc.IsLeader = leader.IsLeader
 			healthSvc.IsLeader = leader.IsLeader
@@ -216,5 +250,18 @@ func main() {
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("server stopped", "error", err)
 		os.Exit(1)
+	}
+}
+
+func intSetting(value any) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	default:
+		return 0, false
 	}
 }

@@ -267,4 +267,9 @@ func affinityCacheDelete(fingerprint string) {
 	affinityCacheMu.Lock()
 	delete(affinityCache, fingerprint)
 	affinityCacheMu.Unlock()
+	// Drop any coalesced pending Redis write so a stale rebind cannot resurrect
+	// a just-cleared pin after sticky failover.
+	affinityPendingMu.Lock()
+	delete(affinityPending, fingerprint)
+	affinityPendingMu.Unlock()
 }

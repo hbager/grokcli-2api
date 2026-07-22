@@ -28,6 +28,8 @@ var required = map[string][]string{
 	"shell":         {"command"},
 	"localshell":    {"command"},
 	"local_shell":   {"command"},
+	// Hermes agent terminal tool (OpenAI-style "command", not Codex "cmd").
+	"terminal":      {"command"},
 	"exec":          {"command"},
 	"execcommand":   {"command"},
 	"exec_command":  {"command"},
@@ -515,6 +517,8 @@ func isShellToolKey(key string) bool {
 	}
 	switch key {
 	case "bash", "shell", "localshell", "exec", "run", "sh", "zsh", "powershell",
+		// Hermes agent (Nous Research): tool name "terminal", schema param "command".
+		"terminal",
 		"execcommand", "runcommand", "shellcommand", "localshellcommand":
 		return true
 	default:
@@ -528,7 +532,8 @@ func isShellToolKey(key string) bool {
 			}
 		}
 		if strings.HasPrefix(key, "shell") || strings.HasPrefix(key, "exec") ||
-			strings.HasPrefix(key, "bash") || strings.HasPrefix(key, "run") {
+			strings.HasPrefix(key, "bash") || strings.HasPrefix(key, "run") ||
+			strings.HasPrefix(key, "terminal") {
 			return true
 		}
 		return false
@@ -540,6 +545,21 @@ func IsShellTool(name string) bool { return isShellTool(name) }
 
 // NameKey returns the normalized alnum-only tool name key used for alias maps.
 func NameKey(name string) string { return nameKey(name) }
+
+// DefaultShellArgKey returns the client-facing shell parameter name when the
+// request did not advertise a schema (or the tool was missing from ShellArgKeyMap).
+//
+// Codex local tools validate "cmd". Hermes agent (Nous Research) uses tool
+// name "terminal" with required parameter "command" — projecting to cmd makes
+// Hermes drop the payload (args.get("command") is empty).
+func DefaultShellArgKey(name string) string {
+	switch nameKey(name) {
+	case "terminal":
+		return "command"
+	default:
+		return "cmd"
+	}
+}
 
 func isApplyPatchTool(name string) bool {
 	key := nameKey(name)
@@ -1671,7 +1691,11 @@ func EffectiveJSON(raw string, toolName string) string {
 
 // CoerceCompleteJSON is a force-finish helper: EffectiveJSON + last-chance
 // required-field fills so intermittent partial tool args still emit rather
-// than vanishing mid-turn (Claude/Codex "tool call disappeared").
+// than vanishing mid-turn (Claude/Codex "Tool use interrupted" / tool disappeared).
+//
+// At stream end we MUST be aggressive: dropping a half tool after the client
+// already saw content_block_start / function_call in_progress is worse than
+// emitting a best-effort complete payload (empty new_string / recovered cmd).
 func CoerceCompleteJSON(raw string, toolName string) string {
 	// Force-finish path: recover JSON first, then invent missing new_string only here.
 	text := strings.TrimSpace(NormalizeJSON(raw, toolName))
@@ -1692,6 +1716,30 @@ func CoerceCompleteJSON(raw string, toolName string) string {
 			text = EffectiveJSON(raw, toolName)
 		}
 	}
+	// Second pass: if still invalid JSON, try repair on both raw and text.
+	if text == "" || !looksCompleteJSONValue(text) {
+		for _, candidate := range []string{text, raw, EffectiveJSON(raw, toolName)} {
+			if candidate == "" {
+				continue
+			}
+			if looksCompleteJSONValue(candidate) {
+				if norm := strings.TrimSpace(NormalizeJSON(candidate, toolName)); norm != "" {
+					text = norm
+					break
+				}
+				text = strings.TrimSpace(candidate)
+				break
+			}
+			if repaired := repairTruncatedJSONObject(candidate); repaired != "" {
+				if norm := strings.TrimSpace(NormalizeJSON(repaired, toolName)); norm != "" {
+					text = norm
+				} else {
+					text = repaired
+				}
+				break
+			}
+		}
+	}
 	// Force-finish: fill default new_string for delete-match Update/Edit.
 	if obj := parseObjectLoose(text); obj != nil && isEditTool(toolName) {
 		obj = fillEditNewStringDefault(NormalizeObjectForTool(obj, toolName), toolName)
@@ -1710,6 +1758,7 @@ func CoerceCompleteJSON(raw string, toolName string) string {
 		if CompleteJSON(repaired, toolName) {
 			return repaired
 		}
+		text = repaired
 	}
 	// Shell: if we have any non-empty command-like field after normalize, force shape.
 	if isShellTool(toolName) {
@@ -1722,10 +1771,24 @@ func CoerceCompleteJSON(raw string, toolName string) string {
 						delete(obj, "cmd")
 					}
 				}
+				// Flatten argv → string for Codex.
+				if cmd := normalizeShellCommand(obj["command"]); cmd != nil {
+					obj["command"] = cmd
+				}
 				if encoded, err := compactJSON(obj); err == nil && CompleteJSON(encoded, toolName) {
 					return encoded
 				}
+				// Soft salvage: keep any non-empty string command even if CompleteJSON picky.
+				if s, ok := obj["command"].(string); ok && strings.TrimSpace(s) != "" {
+					if encoded, err := compactJSON(map[string]any{"command": strings.TrimSpace(s)}); err == nil {
+						return encoded
+					}
+				}
 			}
+		}
+		// Extremely partial: try to extract "cmd"/"command":"..." from raw text.
+		if salvaged := salvageShellCommandJSON(raw); salvaged != "" {
+			return salvaged
 		}
 	}
 	// apply_patch: promote patch/diff aliases and force-finish when input present.
@@ -1738,16 +1801,209 @@ func CoerceCompleteJSON(raw string, toolName string) string {
 				}
 			}
 		}
+		if salvaged := salvageApplyPatchJSON(raw); salvaged != "" {
+			return salvaged
+		}
+	}
+	// Read/Grep/Write: salvage partial objects that only have the primary key.
+	if salvaged := salvageRequiredFieldJSON(raw, toolName); salvaged != "" {
+		return salvaged
+	}
+	// Edit: if we at least have file_path+old_string, force empty new_string.
+	if isEditTool(toolName) {
+		if obj := parseObjectLoose(text); obj != nil {
+			obj = fillEditNewStringDefault(NormalizeObjectForTool(obj, toolName), toolName)
+			if encoded, err := compactJSON(obj); err == nil && CompleteJSON(encoded, toolName) {
+				return encoded
+			}
+		}
 	}
 	return text
 }
 
-// CompleteJSONStrict reports completeness on the literal text only — no
-// truncation repair / trailing-junk recovery. Used by Merge and live stream
-// assemblers so an unterminated fragment like {"file_path":"/a.g is NOT
-// mistaken for a complete payload (EffectiveJSON would "repair" it into a
-// valid object and the still-arriving remainder would be discarded — the
-// classic intermittent Claude Code / Codex tool-arg loss).
+// salvageShellCommandJSON pulls a cmd/command string out of a broken JSON fragment.
+func salvageShellCommandJSON(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	// Prefer complete fragment first.
+	if frag := firstCompleteJSONFragment(s); frag != "" {
+		if obj := parseObjectLoose(frag); obj != nil {
+			obj = applyShellDefaults(obj, "shell")
+			if cmd := normalizeShellCommand(obj["command"]); cmd != nil {
+				if encoded, err := compactJSON(map[string]any{"command": cmd}); err == nil {
+					return encoded
+				}
+			}
+			if shellCommandNonEmpty(obj["cmd"]) {
+				if encoded, err := compactJSON(map[string]any{"command": obj["cmd"]}); err == nil {
+					return encoded
+				}
+			}
+		}
+	}
+	// Extract "cmd"|"command" : "..." from partial JSON.
+	for _, key := range []string{`"cmd"`, `"command"`, `"shell_command"`, `"cmdline"`} {
+		i := strings.Index(s, key)
+		if i < 0 {
+			continue
+		}
+		rest := s[i+len(key):]
+		rest = strings.TrimLeft(rest, " \t\r\n:")
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		if rest == "" || rest[0] != '"' {
+			continue
+		}
+		if val, ok := extractJSONString(rest); ok && strings.TrimSpace(val) != "" {
+			if encoded, err := compactJSON(map[string]any{"command": strings.TrimSpace(val)}); err == nil {
+				return encoded
+			}
+		}
+	}
+	return ""
+}
+
+func salvageApplyPatchJSON(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if frag := firstCompleteJSONFragment(s); frag != "" {
+		if obj := parseObjectLoose(frag); obj != nil {
+			obj = applyShellDefaults(obj, "apply_patch")
+			if v, ok := obj["input"]; ok && !empty(v) {
+				if encoded, err := compactJSON(map[string]any{"input": v}); err == nil {
+					return encoded
+				}
+			}
+		}
+	}
+	for _, key := range []string{`"input"`, `"patch"`, `"diff"`, `"patch_text"`} {
+		i := strings.Index(s, key)
+		if i < 0 {
+			continue
+		}
+		rest := strings.TrimLeft(s[i+len(key):], " \t\r\n:")
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		if rest == "" || rest[0] != '"' {
+			continue
+		}
+		if val, ok := extractJSONString(rest); ok && strings.TrimSpace(val) != "" {
+			if encoded, err := compactJSON(map[string]any{"input": val}); err == nil {
+				return encoded
+			}
+		}
+	}
+	return ""
+}
+
+// salvageRequiredFieldJSON recovers minimal {required: value} objects for Read/Grep/etc.
+func salvageRequiredFieldJSON(raw, toolName string) string {
+	keys := requiredKeys(toolName)
+	if len(keys) == 0 {
+		return ""
+	}
+	// Prefer full object salvage first.
+	if frag := firstCompleteJSONFragment(raw); frag != "" {
+		if obj := parseObjectLoose(frag); obj != nil {
+			obj = NormalizeObjectForTool(obj, toolName)
+			if isEditTool(toolName) {
+				obj = fillEditNewStringDefault(obj, toolName)
+			}
+			if encoded, err := compactJSON(obj); err == nil && CompleteJSON(encoded, toolName) {
+				return encoded
+			}
+		}
+	}
+	if repaired := repairTruncatedJSONObject(raw); repaired != "" {
+		if norm := strings.TrimSpace(NormalizeJSON(repaired, toolName)); CompleteJSON(norm, toolName) {
+			return norm
+		}
+	}
+	// Single-field tools (Read/Grep/WebFetch): extract primary key.
+	primary := keys[0]
+	searchKeys := []string{`"` + primary + `"`}
+	switch primary {
+	case "file_path":
+		searchKeys = append(searchKeys, `"path"`, `"file"`, `"target_file"`, `"filepath"`)
+	case "pattern":
+		searchKeys = append(searchKeys, `"regex"`, `"glob"`, `"query"`)
+	case "query":
+		searchKeys = append(searchKeys, `"q"`, `"search"`, `"search_query"`)
+	case "url":
+		searchKeys = append(searchKeys, `"uri"`, `"href"`)
+	case "content":
+		searchKeys = append(searchKeys, `"contents"`, `"file_content"`, `"text"`)
+	}
+	s := strings.TrimSpace(raw)
+	for _, key := range searchKeys {
+		i := strings.Index(s, key)
+		if i < 0 {
+			continue
+		}
+		rest := strings.TrimLeft(s[i+len(key):], " \t\r\n:")
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		if rest == "" || rest[0] != '"' {
+			continue
+		}
+		val, ok := extractJSONString(rest)
+		if !ok {
+			continue
+		}
+		val = strings.TrimSpace(val)
+		if val == "" {
+			continue
+		}
+		obj := map[string]any{primary: val}
+		if isEditTool(toolName) {
+			obj = fillEditNewStringDefault(NormalizeObjectForTool(obj, toolName), toolName)
+		}
+		if encoded, err := compactJSON(obj); err == nil && CompleteJSON(encoded, toolName) {
+			return encoded
+		}
+		// Read only needs file_path.
+		if primary == "file_path" && len(keys) == 1 {
+			if encoded, err := compactJSON(map[string]any{"file_path": val}); err == nil {
+				return encoded
+			}
+		}
+	}
+	return ""
+}
+
+// extractJSONString parses a JSON string starting at rest[0]=='"'.
+func extractJSONString(rest string) (string, bool) {
+	if rest == "" || rest[0] != '"' {
+		return "", false
+	}
+	var out strings.Builder
+	esc := false
+	for j := 1; j < len(rest); j++ {
+		ch := rest[j]
+		if esc {
+			out.WriteByte(ch)
+			esc = false
+			continue
+		}
+		if ch == '\\' {
+			esc = true
+			out.WriteByte(ch)
+			continue
+		}
+		if ch == '"' {
+			val := out.String()
+			var unq string
+			if json.Unmarshal([]byte(`"`+val+`"`), &unq) == nil {
+				return unq, true
+			}
+			return val, true
+		}
+		out.WriteByte(ch)
+	}
+	return "", false
+}
+
 func CompleteJSONStrict(raw, toolName string) bool {
 	text := strings.TrimSpace(NormalizeJSON(raw, toolName))
 	if text == "" || (text[0] != '{' && text[0] != '[') {
@@ -1991,8 +2247,10 @@ func repairTruncatedJSONObject(src string) string {
 			closeN++
 		}
 	}
-	if inStr || open <= closeN || open-closeN > 4 {
-		// Too broken or already balanced-but-invalid.
+	// Allow deeper truncation (long nested args). Only give up when braces
+	// are already balanced but still invalid, or massively unbalanced (>12).
+	if open <= closeN || open-closeN > 12 {
+		// Already balanced-but-invalid, or hopelessly truncated.
 		if !inStr {
 			return ""
 		}
@@ -2343,7 +2601,8 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	}
 	if preferredKey == "" {
 		// Codex validates shell tools against local schema field "cmd".
-		preferredKey = "cmd"
+		// Hermes "terminal" (and any other command-style shell) uses DefaultShellArgKey.
+		preferredKey = DefaultShellArgKey(toolName)
 	}
 	text := strings.TrimSpace(argsJSON)
 	if text == "" {

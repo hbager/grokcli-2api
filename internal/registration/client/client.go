@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const APIVersion = "v1"
@@ -128,7 +130,19 @@ func (c *Client) doAbsolute(ctx context.Context, method, absPath string, body an
 	}
 	httpClient := c.HTTP
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		// Fail-fast fallback only — server package injects a shared Transport.
+		// Keep under browser REG_POLL_TIMEOUT_MS (~900ms).
+		httpClient = &http.Client{
+			Timeout: 750 * time.Millisecond,
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 250 * time.Millisecond}).DialContext,
+				MaxIdleConns:          128,
+				MaxIdleConnsPerHost:   64,
+				IdleConnTimeout:       90 * time.Second,
+				ResponseHeaderTimeout: 600 * time.Millisecond,
+				ForceAttemptHTTP2:     true,
+			},
+		}
 	}
 	response, err := httpClient.Do(request)
 	if err != nil {

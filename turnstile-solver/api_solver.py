@@ -66,7 +66,13 @@ class TurnstileAPIServer:
         self.debug = debug
         self.browser_type = browser_type
         self.headless = headless
-        self.thread_count = max(1, int(thread or 1))
+        # Hard cap browser pool size — Camoufox is hundreds of MB each.
+        try:
+            hard_cap = int(os.getenv("TURNSTILE_THREAD_MAX", "4") or 4)
+        except (TypeError, ValueError):
+            hard_cap = 3
+        hard_cap = max(1, min(8, hard_cap))
+        self.thread_count = max(1, min(hard_cap, int(thread or 1)))
         self.proxy_support = proxy_support
         self.browser_pool = asyncio.Queue()
         self.use_random_config = use_random_config
@@ -969,24 +975,49 @@ class TurnstileAPIServer:
         return context_options
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
-        """Solve the Turnstile challenge."""
-        proxy = None
-        context = None
-        page = None
+        """Solve the Turnstile challenge.
+
+        Single-task multi-round: on timeout / empty token, close context and
+        re-open a fresh page on the same browser before declaring CAPTCHA_FAIL.
+        This recovers most CF intermittent holds without burning a new createTask.
+        """
         start_time = time.time()
         index = None
         browser = None
         browser_config = None
         acquired = False
 
+        try:
+            rounds = int(os.getenv("TURNSTILE_SOLVE_ROUNDS", "2") or 2)
+        except (TypeError, ValueError):
+            rounds = 2
+        rounds = max(1, min(4, rounds))
+        try:
+            poll_attempts = int(os.getenv("TURNSTILE_POLL_ATTEMPTS", "40") or 40)
+        except (TypeError, ValueError):
+            poll_attempts = 36
+        poll_attempts = max(20, min(60, poll_attempts))
+
         # Mark in-flight before warm-up so the idle reaper cannot reclaim mid-acquire.
         # Always pair with the outer finally decrement — never leave this sticky.
         self._in_flight += 1
+        last_error = "timeout"
         try:
             try:
                 await self._ensure_pool()
                 self._last_used = time.time()
-                index, browser, browser_config = await self.browser_pool.get()
+                # Multi-thread: wait up to 90s for a free browser; re-warm if pool
+                # was reclaimed mid-wait (idle reaper race under load).
+                try:
+                    index, browser, browser_config = await asyncio.wait_for(
+                        self.browser_pool.get(), timeout=90.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Browser pool get timeout (90s) — rebuilding pool")
+                    await self._ensure_pool()
+                    index, browser, browser_config = await asyncio.wait_for(
+                        self.browser_pool.get(), timeout=60.0
+                    )
                 acquired = True
                 self._last_used = time.time()
             except Exception as e:
@@ -1006,20 +1037,17 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.warning(f"Browser {index}: Cannot check browser state: {str(e)}")
 
+            proxy = None
             if self.proxy_support:
                 proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-
                 try:
                     with open(proxy_file_path) as proxy_file:
                         proxies = [line.strip() for line in proxy_file if line.strip()]
-
                     proxy = random.choice(proxies) if proxies else None
-
                     if self.debug and proxy:
                         logger.debug(f"Browser {index}: Selected proxy: {proxy}")
                     elif self.debug and not proxy:
                         logger.debug(f"Browser {index}: No proxies available")
-
                 except FileNotFoundError:
                     logger.warning(f"Proxy file not found: {proxy_file_path}")
                     proxy = None
@@ -1027,40 +1055,39 @@ class TurnstileAPIServer:
                     logger.error(f"Error reading proxy file: {str(e)}")
                     proxy = None
 
-                if proxy and self.debug:
-                    logger.debug(f"Browser {index}: Creating context with proxy enabled")
-                elif self.debug:
-                    logger.debug(f"Browser {index}: Creating context without proxy")
-
-                context_options = self._build_context_options(browser_config or {}, proxy if self.proxy_support else None)
+            for round_i in range(1, rounds + 1):
+                context = None
+                page = None
                 try:
-                    context = await browser.new_context(**context_options)
-                except Exception as ctx_err:
-                    # Fallback for Camoufox protocol mismatches / stricter option sets.
                     if self.debug:
-                        logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
-                    context = await browser.new_context(no_viewport=True)
-            else:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Creating context without proxy")
-                context_options = self._build_context_options(browser_config or {}, None)
-                try:
-                    context = await browser.new_context(**context_options)
-                except Exception as ctx_err:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
-                    context = await browser.new_context(no_viewport=True)
+                        logger.debug(
+                            f"Browser {index}: Turnstile solve round {round_i}/{rounds} "
+                            f"url={url} sitekey={sitekey[:12]}..."
+                        )
 
-            page = await context.new_page()
+                    context_options = self._build_context_options(
+                        browser_config or {}, proxy if self.proxy_support else None
+                    )
+                    try:
+                        context = await browser.new_context(**context_options)
+                    except Exception as ctx_err:
+                        # Fallback for Camoufox protocol mismatches / stricter option sets.
+                        if self.debug:
+                            logger.warning(
+                                f"Browser {index}: new_context failed ({ctx_err}); "
+                                f"retry minimal options"
+                            )
+                        context = await browser.new_context(no_viewport=True)
 
-            try:
-                await page.set_viewport_size({"width": 500, "height": 100})
-            except Exception:
-                pass
+                    page = await context.new_page()
+                    try:
+                        await page.set_viewport_size({"width": 500, "height": 100})
+                    except Exception:
+                        pass
 
-            await self._antishadow_inject(page)
-            await self._block_rendering(page)
-            await page.add_init_script("""
+                    await self._antishadow_inject(page)
+                    await self._block_rendering(page)
+                    await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined,
         });
@@ -1072,137 +1099,240 @@ class TurnstileAPIServer:
         };
         """)
 
-            try:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
-                    logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
-                    logger.debug(f"Browser {index}: Loading real website directly: {url}")
-
-                await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                await self._unblock_rendering(page)
-                try:
-                    await self._dismiss_cookie_banners(page, index)
-                except Exception as e:
                     if self.debug:
-                        logger.debug(f"Browser {index}: cookie dismiss after goto failed: {e}")
+                        logger.debug(
+                            f"Browser {index}: Starting Turnstile solve for URL: {url} "
+                            f"with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}"
+                        )
 
-                if self.debug:
-                    logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
-
-                await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
-                await asyncio.sleep(1)
-                try:
-                    await self._dismiss_cookie_banners(page, index)
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
-
-                locator = page.locator('input[name="cf-turnstile-response"]')
-                max_attempts = 30
-                click_count = 0
-                max_clicks = 10
-
-                for attempt in range(max_attempts):
+                    await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                    await self._unblock_rendering(page)
                     try:
-                        try:
-                            count = await locator.count()
-                        except Exception as e:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Locator count failed on attempt {attempt + 1}: {str(e)}")
-                            count = 0
+                        await self._dismiss_cookie_banners(page, index)
+                    except Exception as e:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: cookie dismiss after goto failed: {e}")
 
-                        if count == 0:
-                            if self.debug and attempt % 5 == 0:
-                                logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
-                        elif count == 1:
+                    await self._inject_captcha_directly(
+                        page, sitekey, action or '', cdata or '', index
+                    )
+                    await asyncio.sleep(1.0 + (0.4 * (round_i - 1)))
+                    try:
+                        await self._dismiss_cookie_banners(page, index)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.5 + (0.5 * (round_i - 1)))
+
+                    locator = page.locator('input[name="cf-turnstile-response"]')
+                    click_count = 0
+                    max_clicks = 12
+                    # Mid-round re-inject once if token field never appears.
+                    reinjected = False
+
+                    for attempt in range(poll_attempts):
+                        try:
                             try:
-                                token = await locator.input_value(timeout=500)
-                                if token:
-                                    elapsed_time = round(time.time() - start_time, 3)
-                                    logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                    await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
-                                    return
+                                count = await locator.count()
                             except Exception as e:
                                 if self.debug:
-                                    logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
-                        else:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Found {count} token elements, checking all")
-                            for i in range(count):
+                                    logger.debug(
+                                        f"Browser {index}: Locator count failed on "
+                                        f"attempt {attempt + 1}: {str(e)}"
+                                    )
+                                count = 0
+
+                            if count == 0:
+                                if (
+                                    not reinjected
+                                    and attempt >= 8
+                                    and round_i < rounds
+                                ):
+                                    # Soft re-inject before full context restart.
+                                    try:
+                                        await self._inject_captcha_directly(
+                                            page,
+                                            sitekey,
+                                            action or '',
+                                            cdata or '',
+                                            index,
+                                        )
+                                        reinjected = True
+                                        if self.debug:
+                                            logger.debug(
+                                                f"Browser {index}: re-injected Turnstile widget"
+                                            )
+                                    except Exception as reinj_err:
+                                        if self.debug:
+                                            logger.debug(
+                                                f"Browser {index}: re-inject failed: {reinj_err}"
+                                            )
+                                elif self.debug and attempt % 5 == 0:
+                                    logger.debug(
+                                        f"Browser {index}: No token elements found on "
+                                        f"attempt {attempt + 1}"
+                                    )
+                            elif count == 1:
                                 try:
-                                    element_token = await locator.nth(i).input_value(timeout=500)
-                                    if element_token:
+                                    token = await locator.input_value(timeout=500)
+                                    if token:
                                         elapsed_time = round(time.time() - start_time, 3)
-                                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                        await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
+                                        logger.success(
+                                            f"Browser {index}: Successfully solved captcha - "
+                                            f"{COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} "
+                                            f"in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} "
+                                            f"Seconds (round {round_i})"
+                                        )
+                                        await save_result(
+                                            task_id,
+                                            "turnstile",
+                                            {
+                                                "value": token,
+                                                "elapsed_time": elapsed_time,
+                                                "round": round_i,
+                                            },
+                                        )
                                         return
                                 except Exception as e:
                                     if self.debug:
-                                        logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
-                                    continue
+                                        logger.debug(
+                                            f"Browser {index}: Single token element check "
+                                            f"failed: {str(e)}"
+                                        )
+                            else:
+                                if self.debug:
+                                    logger.debug(
+                                        f"Browser {index}: Found {count} token elements, checking all"
+                                    )
+                                for i in range(count):
+                                    try:
+                                        element_token = await locator.nth(i).input_value(
+                                            timeout=500
+                                        )
+                                        if element_token:
+                                            elapsed_time = round(
+                                                time.time() - start_time, 3
+                                            )
+                                            logger.success(
+                                                f"Browser {index}: Successfully solved captcha - "
+                                                f"{COLORS.get('MAGENTA')}{element_token[:10]}"
+                                                f"{COLORS.get('RESET')} in "
+                                                f"{COLORS.get('GREEN')}{elapsed_time}"
+                                                f"{COLORS.get('RESET')} Seconds (round {round_i})"
+                                            )
+                                            await save_result(
+                                                task_id,
+                                                "turnstile",
+                                                {
+                                                    "value": element_token,
+                                                    "elapsed_time": elapsed_time,
+                                                    "round": round_i,
+                                                },
+                                            )
+                                            return
+                                    except Exception as e:
+                                        if self.debug:
+                                            logger.debug(
+                                                f"Browser {index}: Token element {i} "
+                                                f"check failed: {str(e)}"
+                                            )
+                                        continue
 
-                        if attempt > 2 and attempt % 3 == 0 and click_count < max_clicks:
-                            try:
-                                await self._dismiss_cookie_banners(page, index)
-                            except Exception:
-                                pass
-                            click_success = await self._try_click_strategies(page, index)
-                            click_count += 1
-                            if click_success and self.debug:
-                                logger.debug(f"Browser {index}: Click successful (click #{click_count}/{max_clicks})")
-                            elif not click_success and self.debug:
-                                logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
+                            if attempt > 1 and attempt % 2 == 0 and click_count < max_clicks:
+                                try:
+                                    await self._dismiss_cookie_banners(page, index)
+                                except Exception:
+                                    pass
+                                click_success = await self._try_click_strategies(page, index)
+                                click_count += 1
+                                if click_success and self.debug:
+                                    logger.debug(
+                                        f"Browser {index}: Click successful "
+                                        f"(click #{click_count}/{max_clicks})"
+                                    )
+                                elif not click_success and self.debug:
+                                    logger.debug(
+                                        f"Browser {index}: All click strategies failed on "
+                                        f"attempt {attempt + 1} (click #{click_count}/{max_clicks})"
+                                    )
 
-                        wait_time = min(0.5 + (attempt * 0.05), 2.0)
-                        await asyncio.sleep(wait_time)
+                            wait_time = min(0.45 + (attempt * 0.04), 1.8)
+                            await asyncio.sleep(wait_time)
 
-                        if self.debug and attempt % 5 == 0:
-                            logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - Waiting for token (clicks: {click_count}/{max_clicks})")
-
-                    except Exception as e:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Attempt {attempt + 1} error: {str(e)}")
-                        continue
-
-                elapsed_time = round(time.time() - start_time, 3)
-                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": "timeout"})
-                if self.debug:
-                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-            except Exception as e:
-                elapsed_time = round(time.time() - start_time, 3)
-                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})
-                logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
-            finally:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Closing browser context and cleaning up")
-
-                if context is not None:
-                    try:
-                        await context.close()
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Context closed successfully")
-                    except Exception as e:
-                        if self.debug:
-                            logger.warning(f"Browser {index}: Error closing context: {str(e)}")
-
-                try:
-                    if acquired and browser is not None and index is not None:
-                        connected = True
-                        try:
-                            if hasattr(browser, 'is_connected'):
-                                connected = bool(browser.is_connected())
-                        except Exception:
-                            connected = True
-                        if connected:
-                            await self.browser_pool.put((index, browser, browser_config))
+                            if self.debug and attempt % 5 == 0:
+                                logger.debug(
+                                    f"Browser {index}: Attempt {attempt + 1}/{poll_attempts} "
+                                    f"round {round_i}/{rounds} - Waiting for token "
+                                    f"(clicks: {click_count}/{max_clicks})"
+                                )
+                        except Exception as e:
                             if self.debug:
-                                logger.debug(f"Browser {index}: Browser returned to pool")
-                        elif self.debug:
-                            logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
-                except Exception as e:
+                                logger.debug(
+                                    f"Browser {index}: Attempt {attempt + 1} error: {str(e)}"
+                                )
+                            continue
+
+                    last_error = f"timeout_round_{round_i}"
                     if self.debug:
-                        logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
+                        logger.warning(
+                            f"Browser {index}: Turnstile round {round_i}/{rounds} timed out"
+                        )
+                except Exception as e:
+                    last_error = str(e)[:240]
+                    logger.error(
+                        f"Browser {index}: Error solving Turnstile round {round_i}: {e}"
+                    )
+                finally:
+                    if context is not None:
+                        try:
+                            await context.close()
+                        except Exception as e:
+                            if self.debug:
+                                logger.warning(
+                                    f"Browser {index}: Error closing context: {str(e)}"
+                                )
+                    # Small cool-down before next context to avoid CF session sticky fail.
+                    if round_i < rounds:
+                        await asyncio.sleep(0.6 + random.random() * 0.8)
+
+            elapsed_time = round(time.time() - start_time, 3)
+            await save_result(
+                task_id,
+                "turnstile",
+                {
+                    "value": "CAPTCHA_FAIL",
+                    "elapsed_time": elapsed_time,
+                    "error": last_error,
+                    "rounds": rounds,
+                },
+            )
+            if self.debug:
+                logger.error(
+                    f"Browser {index}: Error solving Turnstile in "
+                    f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds "
+                    f"after {rounds} round(s): {last_error}"
+                )
         finally:
+            try:
+                if acquired and browser is not None and index is not None:
+                    connected = True
+                    try:
+                        if hasattr(browser, 'is_connected'):
+                            connected = bool(browser.is_connected())
+                    except Exception:
+                        connected = True
+                    if connected:
+                        await self.browser_pool.put((index, browser, browser_config))
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Browser returned to pool")
+                    elif self.debug:
+                        logger.warning(
+                            f"Browser {index}: Browser disconnected, not returning to pool"
+                        )
+            except Exception as e:
+                if self.debug:
+                    logger.warning(
+                        f"Browser {index}: Error returning browser to pool: {str(e)}"
+                    )
             # Always release in-flight even on early return / unexpected exception.
             if self._in_flight > 0:
                 self._in_flight -= 1

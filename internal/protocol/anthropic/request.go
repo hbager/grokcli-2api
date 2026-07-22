@@ -46,9 +46,11 @@ func BuildOpenAIChatBody(raw map[string]any, model string) (map[string]any, erro
 	if pck := ExtractPromptCacheKey(raw); pck != "" {
 		body["prompt_cache_key"] = pck
 	}
-	// Claude Code: thinking / thinking.budget_tokens / thinking.type
-	// Codex/OpenAI: reasoning_effort | reasoning.effort | auto/default/standard/extra-high
-	if effort := reasoning.FromRequest(raw); effort != "" {
+	// Claude Code: output_config.effort | thinking / budget_tokens / thinking.type
+	//   labels: low|medium|high|xhigh|max (+ ultracode UI → xhigh-class)
+	// Codex/OpenAI: reasoning_effort | reasoning.effort | Low/Base/High/Ultra/Proactive (+ auto/default/standard/extra-high)
+	// Upstream Grok only accepts low|medium|high — fold via FromRequestUpstream.
+	if effort := reasoning.FromRequestUpstream(raw); effort != "" {
 		body["reasoning_effort"] = effort
 	} else if effort := ThinkingToReasoningEffort(raw["thinking"]); effort != "" {
 		body["reasoning_effort"] = effort
@@ -565,10 +567,9 @@ func ToolChoiceToOpenAI(choice any) any {
 }
 
 // ThinkingToReasoningEffort maps Anthropic thinking / Claude Code effort labels
-// (and Codex aliases auto/default/standard/extra-high) onto Grok
-// low|medium|high|xhigh.
+// (low|medium|high|xhigh|max|ultracode + Codex aliases) onto Grok low|medium|high.
 func ThinkingToReasoningEffort(thinking any) string {
-	return reasoning.Normalize(thinking)
+	return reasoning.ToUpstream(reasoning.NormalizeClient(thinking))
 }
 
 func copyIfPresent(dst, src map[string]any, key string) {

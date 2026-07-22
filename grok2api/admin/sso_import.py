@@ -353,11 +353,13 @@ def _run_sso_import_job(
         from grok2api.config import SSO_IMPORT_WORKERS
     except Exception:
         SSO_IMPORT_WORKERS = 8
-    workers = min(int(max_workers), int(SSO_IMPORT_WORKERS), max(1, total), 6)
-    # Device-code conversion is rate-limited by xAI; keep convert concurrency low.
-    # delay only staggers starts; further cap when deliberate delay is set.
+    # Device-code conversion is rate-limited by xAI; default hard-cap was 6 which
+    # made bulk SSO (hundreds) crawl. Cap at 12; still throttle when delay>=2.
+    workers = min(int(max_workers), int(SSO_IMPORT_WORKERS), max(1, total), 12)
     if delay and delay >= 2:
-        workers = min(workers, 2)
+        workers = min(workers, 3)
+    elif delay and delay >= 1:
+        workers = min(workers, 6)
 
     _sso_job_patch(
         job_id,

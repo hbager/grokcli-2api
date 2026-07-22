@@ -14,6 +14,11 @@ type pickBackend interface {
 	ReleaseInflight(context.Context, string) error
 }
 
+type pickPenaltyBackend interface {
+	GetSoftUsedAgeSec(context.Context, string, time.Time) (float64, error)
+	GetSoftUsedAgeSecMany(context.Context, []string, time.Time) map[string]float64
+}
+
 const (
 	pickObserverStripes   = 32
 	pickObserverQueueSize = 64
@@ -35,6 +40,9 @@ type PickObserver struct {
 }
 
 func NewPickObserver(client *Client) PickObserver {
+	if client == nil {
+		return PickObserver{}
+	}
 	return newPickObserver(client)
 }
 
@@ -57,26 +65,53 @@ func (o PickObserver) LoadPenalty(ctx context.Context, accountID string) int64 {
 	if o.backend == nil {
 		return 0
 	}
-	inflight, err := o.backend.GetInflight(ctx, accountID)
-	if err != nil {
-		return 0
+	var penalty int64
+	if inflight, err := o.backend.GetInflight(ctx, accountID); err == nil && inflight > 0 {
+		penalty += inflightPenalty(inflight)
 	}
-	return inflight * 1000
+	if penaltyBackend, ok := o.backend.(pickPenaltyBackend); ok {
+		if age, err := penaltyBackend.GetSoftUsedAgeSec(ctx, accountID, time.Now()); err == nil {
+			penalty += softUsedPenalty(age)
+		}
+	}
+	return penalty
 }
 
-// LoadPenalties batches inflight lookups for a candidate window (hot path).
+// LoadPenalties batches inflight and soft-used lookups for a candidate window (hot path).
 func (o PickObserver) LoadPenalties(ctx context.Context, accountIDs []string) map[string]int64 {
 	out := map[string]int64{}
 	if o.backend == nil || len(accountIDs) == 0 {
 		return out
 	}
 	inflight := o.backend.GetInflightMany(ctx, accountIDs)
-	for id, n := range inflight {
-		if n > 0 {
-			out[id] = n * 1000
+	softUsed := map[string]float64{}
+	if penaltyBackend, ok := o.backend.(pickPenaltyBackend); ok {
+		softUsed = penaltyBackend.GetSoftUsedAgeSecMany(ctx, accountIDs, time.Now())
+	}
+	for _, id := range accountIDs {
+		penalty := inflightPenalty(inflight[id])
+		if age, ok := softUsed[id]; ok {
+			penalty += softUsedPenalty(age)
+		}
+		if penalty > 0 {
+			out[id] = penalty
 		}
 	}
 	return out
+}
+
+func inflightPenalty(inflight int64) int64 {
+	if inflight <= 0 {
+		return 0
+	}
+	return inflight * (inflight + 1) / 2 * 1000
+}
+
+func softUsedPenalty(ageSec float64) int64 {
+	if !(ageSec >= 0 && ageSec < 30) {
+		return 0
+	}
+	return int64((30 - ageSec) * (800.0 / 30.0))
 }
 
 func (o PickObserver) MarkPick(_ context.Context, accountID string) {

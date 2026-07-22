@@ -238,6 +238,11 @@ class YesCaptchaSolver:
 
         Returns:
             The Turnstile token string (valid for ~120s)
+
+        Reliability:
+            ERROR_CAPTCHA_UNSOLVABLE / empty-token / timeouts are retriable.
+            Local endpoints already multi-round inside the solver process; remote
+            YesCaptcha still benefits from a second createTask pass with backoff.
         """
         website_url = (website_url or "").strip()
         website_key = (website_key or "").strip()
@@ -261,42 +266,96 @@ class YesCaptchaSolver:
             if fallback_non_premium and not local:
                 task_types.append("TurnstileTaskProxylessM1")
 
-        errors: list[str] = []
-        for idx, task_type in enumerate(task_types):
-            task = {
-                "type": task_type,
-                "websiteURL": website_url,
-                "websiteKey": website_key,
-            }
+        try:
+            outer_rounds = int(
+                os.environ.get("GROK2API_TURNSTILE_OUTER_ROUNDS", "2") or 2
+            )
+        except (TypeError, ValueError):
+            outer_rounds = 2
+        # Local already multi-rounds inside Camoufox; prefer single outer pass
+        # under multi-thread load (inner TURNSTILE_SOLVE_ROUNDS covers CF flakiness).
+        if local:
             try:
-                self._progress(
-                    f"solve_turnstile try {idx + 1}/{len(task_types)} "
-                    f"type={task_type} url={website_url} key={website_key[:12]}..."
-                )
-                task_id = self._create_task(task)
-                result = self._get_result(task_id)
-                solution = result.get("solution") or {}
-                token = (
-                    solution.get("token")
-                    or solution.get("gRecaptchaResponse")
-                    or solution.get("cf_clearance")
-                )
-                if not token:
-                    raise RuntimeError(f"YesCaptcha returned no token: {result}")
-                return str(token)
-            except Exception as e:  # noqa: BLE001
-                msg = f"{task_type}: {e}"
-                errors.append(msg)
-                self._progress(f"failed: {msg}")
-                # short pause before alternate task type
-                if idx + 1 < len(task_types):
-                    time.sleep(1.0)
-                    continue
-                break
+                local_outer = int(os.environ.get("GROK2API_TURNSTILE_LOCAL_OUTER", "1") or 1)
+            except (TypeError, ValueError):
+                local_outer = 1
+            outer_rounds = min(outer_rounds, max(1, min(2, local_outer)))
+        outer_rounds = max(1, min(4, outer_rounds))
+
+        errors: list[str] = []
+
+        def _is_retriable(err: Exception | str) -> bool:
+            msg = str(err or "").lower()
+            needles = (
+                "error_captcha_unsolvable",
+                "could not solve",
+                "unsolvable",
+                "timeout",
+                "timed out",
+                "no token",
+                "empty",
+                "busy",
+                "queue",
+                "502",
+                "503",
+                "504",
+                "connection",
+                "temporarily",
+            )
+            return any(n in msg for n in needles)
+
+        for outer in range(1, outer_rounds + 1):
+            for idx, task_type in enumerate(task_types):
+                task = {
+                    "type": task_type,
+                    "websiteURL": website_url,
+                    "websiteKey": website_key,
+                }
+                try:
+                    self._progress(
+                        f"solve_turnstile outer={outer}/{outer_rounds} "
+                        f"try {idx + 1}/{len(task_types)} "
+                        f"type={task_type} url={website_url} key={website_key[:12]}..."
+                    )
+                    task_id = self._create_task(task)
+                    result = self._get_result(task_id)
+                    solution = result.get("solution") or {}
+                    token = (
+                        solution.get("token")
+                        or solution.get("gRecaptchaResponse")
+                        or solution.get("cf_clearance")
+                    )
+                    if not token:
+                        raise RuntimeError(f"YesCaptcha returned no token: {result}")
+                    return str(token)
+                except Exception as e:  # noqa: BLE001
+                    msg = f"outer{outer}/{task_type}: {e}"
+                    errors.append(msg)
+                    self._progress(f"failed: {msg}")
+                    retriable = _is_retriable(e)
+                    # short pause before alternate task type / outer round
+                    more_types = idx + 1 < len(task_types)
+                    more_outer = outer < outer_rounds
+                    if more_types or (retriable and more_outer):
+                        # Back off a bit harder on unsolvable to let CF cool down.
+                        base = 1.2 if retriable else 0.6
+                        time.sleep(base + 0.4 * outer)
+                        if more_types:
+                            continue
+                        # exhausted types this outer → next outer if retriable
+                        break
+                    # Non-retriable terminal (e.g. bad key / unsupported task)
+                    raise RuntimeError(
+                        "YesCaptcha Turnstile solve failed after fallbacks: "
+                        + " | ".join(errors[:6])
+                    ) from e
+            else:
+                # for-task_types completed without break — no more work this outer
+                pass
 
         raise RuntimeError(
             "YesCaptcha Turnstile solve failed after fallbacks: "
-            + " | ".join(errors[:4])
+            + " | ".join(errors[:6])
         )
 
     def solve_cloudflare_challenge(

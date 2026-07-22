@@ -3,12 +3,25 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
+
+// usageDayTZ is the business calendar for "today" / daily usage rollups.
+// Admin UI and 日切 are Shanghai time (UTC+8), not UTC midnight.
+const usageDayTZ = "Asia/Shanghai"
+
+// SQL fragments for Shanghai calendar days (timestamptz-safe).
+// start of "today" in Asia/Shanghai as timestamptz:
+//
+//	(date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai')
+const sqlTodayStartSH = `(date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai')`
+const sqlDayExprSH = `date_trunc('day', created_at AT TIME ZONE 'Asia/Shanghai')`
+const sqlCurrentDateSH = `(now() AT TIME ZONE 'Asia/Shanghai')::date`
 
 type usageTotals struct {
 	Requests         int64 `json:"requests"`
@@ -17,6 +30,9 @@ type usageTotals struct {
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
+	// CacheReadTokens is set when the aggregate comes from usage_events.
+	// Cached prompt tokens are subtracted from billed display totals.
+	CacheReadTokens int64 `json:"cache_read_tokens"`
 }
 
 type UsageRecord struct {
@@ -45,15 +61,36 @@ type UsageRecord struct {
 	Detail              map[string]any
 }
 
+// billedTokens = total - cache_read (never negative).
+// Upstream prompt_tokens usually already includes cached_tokens; subtracting
+// cache_read yields newly-charged tokens for admin billing views.
+func billedTokens(u usageTotals) int64 {
+	b := u.TotalTokens - u.CacheReadTokens
+	if b < 0 {
+		return 0
+	}
+	return b
+}
+
 func (u usageTotals) mapWithRate() map[string]any {
+	billed := billedTokens(u)
+	promptBilled := u.PromptTokens - u.CacheReadTokens
+	if promptBilled < 0 {
+		promptBilled = 0
+	}
 	return map[string]any{
 		"requests":          u.Requests,
 		"success":           u.Success,
 		"fail":              u.Fail,
 		"prompt_tokens":     u.PromptTokens,
 		"completion_tokens": u.CompletionTokens,
-		"total_tokens":      u.TotalTokens,
-		"success_rate":      successRate(u.Success, u.Requests),
+		// total_tokens is the billed figure (raw total minus cache hits).
+		"total_tokens":         billed,
+		"total_tokens_raw":     u.TotalTokens,
+		"cache_read_tokens":    u.CacheReadTokens,
+		"billed_tokens":        billed,
+		"prompt_tokens_billed": promptBilled,
+		"success_rate":         successRate(u.Success, u.Requests),
 	}
 }
 
@@ -210,7 +247,7 @@ func upsertUsageDaily(ctx context.Context, tx pgx.Tx, rec UsageRecord) error {
 				day, dim, dim_id, requests, success, fail,
 				prompt_tokens, completion_tokens, total_tokens, updated_at
 			) VALUES (
-				CURRENT_DATE, $1, $2, $3, $4, $5, $6, $7, $8, now()
+				(now() AT TIME ZONE 'Asia/Shanghai')::date, $1, $2, $3, $4, $5, $6, $7, $8, now()
 			)
 			ON CONFLICT (day, dim, dim_id) DO UPDATE SET
 				requests = usage_daily.requests + EXCLUDED.requests,
@@ -415,33 +452,59 @@ func (c *Connector) UsageSummary(ctx context.Context, days int) (map[string]any,
 		"series":       series["items"],
 		"source":       "postgres",
 		"store_source": "postgres",
-		"light":        map[string]any{"today_requests": today.Requests, "today_tokens": today.TotalTokens, "total_tokens": life.TotalTokens},
+		"light": map[string]any{
+			"today_requests":   today.Requests,
+			"today_tokens":     billedTokens(today),
+			"total_tokens":     billedTokens(life),
+			"today_tokens_raw": today.TotalTokens,
+			"total_tokens_raw": life.TotalTokens,
+			"today_cache_read": today.CacheReadTokens,
+			"total_cache_read": life.CacheReadTokens,
+		},
 	}, nil
 }
 
 func (c *Connector) UsageSeries(ctx context.Context, days int) (map[string]any, error) {
 	days = clamp(days, 1, 90, 7)
 	rows, err := c.Pool.Query(ctx, `
-		SELECT day, requests, success, fail, prompt_tokens, completion_tokens, total_tokens
-		FROM usage_daily
-		WHERE dim = 'global' AND dim_id = '' AND day >= CURRENT_DATE - (($1::int - 1) * INTERVAL '1 day')
-		ORDER BY day ASC`, days)
+		SELECT date_trunc('day', created_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
+		       COUNT(*)::bigint,
+		       COUNT(*) FILTER (WHERE ok IS TRUE)::bigint,
+		       COUNT(*) FILTER (WHERE ok IS NOT TRUE)::bigint,
+		       COALESCE(SUM(prompt_tokens) FILTER (WHERE ok IS TRUE), 0),
+		       COALESCE(SUM(completion_tokens) FILTER (WHERE ok IS TRUE), 0),
+		       COALESCE(SUM(total_tokens) FILTER (WHERE ok IS TRUE), 0),
+		       COALESCE(SUM(cache_read_tokens) FILTER (WHERE ok IS TRUE), 0)
+		FROM usage_events
+		WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai') - (($1::int - 1) * INTERVAL '1 day')
+		GROUP BY 1
+		ORDER BY 1 ASC`, days)
 	if err != nil {
-		return nil, err
+		rows, err = c.Pool.Query(ctx, `
+			SELECT day, requests, success, fail, prompt_tokens, completion_tokens, total_tokens, 0::bigint
+			FROM usage_daily
+			WHERE dim = 'global' AND dim_id = '' AND day >= (now() AT TIME ZONE 'Asia/Shanghai')::date - (($1::int - 1) * INTERVAL '1 day')
+			ORDER BY day ASC`, days)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
 		var day time.Time
 		var totals usageTotals
-		if err := rows.Scan(&day, &totals.Requests, &totals.Success, &totals.Fail, &totals.PromptTokens, &totals.CompletionTokens, &totals.TotalTokens); err != nil {
+		if err := rows.Scan(&day, &totals.Requests, &totals.Success, &totals.Fail, &totals.PromptTokens, &totals.CompletionTokens, &totals.TotalTokens, &totals.CacheReadTokens); err != nil {
 			return nil, err
 		}
-		item := totals.mapWithRate()
-		item["day"] = day.Format("2006-01-02")
-		items = append(items, item)
+		row := totals.mapWithRate()
+		row["day"] = day.Format("2006-01-02")
+		items = append(items, row)
 	}
-	return map[string]any{"ok": true, "days": days, "items": items, "source": "postgres", "store_source": "postgres", "series": items}, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true, "days": days, "items": items, "source": "postgres"}, nil
 }
 
 func (c *Connector) UsageBreakdown(ctx context.Context, dim string, days, limit int) (map[string]any, error) {
@@ -454,17 +517,46 @@ func (c *Connector) UsageBreakdown(ctx context.Context, dim string, days, limit 
 	}
 	days = clamp(days, 1, 90, 7)
 	limit = clamp(limit, 1, 200, 50)
-	rows, err := c.Pool.Query(ctx, `
-		SELECT dim_id,
-		       COALESCE(SUM(requests), 0), COALESCE(SUM(success), 0), COALESCE(SUM(fail), 0),
-		       COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0)
-		FROM usage_daily
-		WHERE dim = $1 AND day >= CURRENT_DATE - (($2::int - 1) * INTERVAL '1 day')
-		GROUP BY dim_id
-		ORDER BY COALESCE(SUM(total_tokens), 0) DESC, COALESCE(SUM(requests), 0) DESC, dim_id ASC
-		LIMIT $3`, dim, days, limit)
+	col := "model"
+	switch dim {
+	case "key":
+		col = "api_key_id"
+	case "account":
+		col = "account_id"
+	}
+	// whitelist column name — never interpolate user input beyond switch above
+	q := `
+		SELECT COALESCE(` + col + `, '') AS dim_id,
+		       COUNT(*)::bigint,
+		       COUNT(*) FILTER (WHERE ok IS TRUE)::bigint,
+		       COUNT(*) FILTER (WHERE ok IS NOT TRUE)::bigint,
+		       COALESCE(SUM(prompt_tokens) FILTER (WHERE ok IS TRUE), 0),
+		       COALESCE(SUM(completion_tokens) FILTER (WHERE ok IS TRUE), 0),
+		       COALESCE(SUM(total_tokens) FILTER (WHERE ok IS TRUE), 0),
+		       COALESCE(SUM(cache_read_tokens) FILTER (WHERE ok IS TRUE), 0)
+		FROM usage_events
+		WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai') - (($1::int - 1) * INTERVAL '1 day')
+		  AND COALESCE(` + col + `, '') <> ''
+		GROUP BY 1
+		ORDER BY (COALESCE(SUM(total_tokens) FILTER (WHERE ok IS TRUE), 0)
+		        - COALESCE(SUM(cache_read_tokens) FILTER (WHERE ok IS TRUE), 0)) DESC,
+		         COUNT(*) DESC, 1 ASC
+		LIMIT $2`
+	rows, err := c.Pool.Query(ctx, q, days, limit)
 	if err != nil {
-		return nil, err
+		rows, err = c.Pool.Query(ctx, `
+			SELECT dim_id,
+			       COALESCE(SUM(requests), 0), COALESCE(SUM(success), 0), COALESCE(SUM(fail), 0),
+			       COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0),
+			       0::bigint
+			FROM usage_daily
+			WHERE dim = $1 AND day >= (now() AT TIME ZONE 'Asia/Shanghai')::date - (($2::int - 1) * INTERVAL '1 day')
+			GROUP BY dim_id
+			ORDER BY COALESCE(SUM(total_tokens), 0) DESC, COALESCE(SUM(requests), 0) DESC, dim_id ASC
+			LIMIT $3`, dim, days, limit)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 	items := []map[string]any{}
@@ -472,7 +564,7 @@ func (c *Connector) UsageBreakdown(ctx context.Context, dim string, days, limit 
 	for rows.Next() {
 		var id string
 		var totals usageTotals
-		if err := rows.Scan(&id, &totals.Requests, &totals.Success, &totals.Fail, &totals.PromptTokens, &totals.CompletionTokens, &totals.TotalTokens); err != nil {
+		if err := rows.Scan(&id, &totals.Requests, &totals.Success, &totals.Fail, &totals.PromptTokens, &totals.CompletionTokens, &totals.TotalTokens, &totals.CacheReadTokens); err != nil {
 			return nil, err
 		}
 		item := totals.mapWithRate()
@@ -548,6 +640,15 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 		args = append(args, *okFlag)
 		where = append(where, "e.ok = $"+itoaSQL(len(args)))
 	}
+	// stream filter: "1"/"true" → stream only; "0"/"false" → non-stream only.
+	// Unknown / "all" / empty ignored. NULL stream rows count as non-stream when
+	// filtering non-stream (legacy rows before the column was always set).
+	switch strings.ToLower(strings.TrimSpace(filters["stream"])) {
+	case "1", "true", "yes", "stream", "streaming":
+		where = append(where, "e.stream IS TRUE")
+	case "0", "false", "no", "nonstream", "non-stream", "non_stream":
+		where = append(where, "(e.stream IS NOT TRUE)")
+	}
 	wh := ""
 	if len(where) > 0 {
 		wh = " WHERE " + strings.Join(where, " AND ")
@@ -607,8 +708,12 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 		}
 		items = append(items, map[string]any{
 			"id": id, "created_at": unixOrNil(createdAt), "api_key_id": stringPtr(apiKeyID), "account_id": stringPtr(accountID),
-			"model": stringPtr(model), "protocol": stringPtr(protocol), "path": stringPtr(path), "stream": boolPtr(stream), "ok": boolPtr(okValue),
+			"model": stringPtr(model), "protocol": stringPtr(protocol), "path": stringPtr(path),
+			// Always a concrete bool so admin 模式 column never receives null (empty cell).
+			"stream":        stream != nil && *stream,
+			"ok":            boolPtr(okValue),
 			"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": totalTok, "cache_read_tokens": cacheRead,
+			"billed_tokens": max64(0, totalTok-cacheRead), "prompt_tokens_billed": max64(0, prompt-cacheRead),
 			"cache_creation_tokens": cacheCreate, "reasoning_tokens": reasoning, "client_ip": stringPtr(clientIP), "user_agent": stringPtr(userAgent),
 			"status_code": intPtr(statusCode), "latency_ms": intPtr(latency), "ttft_ms": intPtr(ttft), "error": stringPtr(errText), "detail": detailMap,
 			"reasoning_effort": reasoningEffort,
@@ -658,12 +763,12 @@ func (c *Connector) usageCacheAggregate(ctx context.Context, days int) (map[stri
 		return out, err
 	}
 	out["lifetime"] = life
-	today, err := scanBucket(base + ` WHERE created_at >= date_trunc('day', now())`)
+	today, err := scanBucket(base + ` WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai')`)
 	if err != nil {
 		return out, err
 	}
 	out["today"] = today
-	window, err := scanBucket(base+` WHERE created_at >= date_trunc('day', now()) - (($1::int - 1) * INTERVAL '1 day')`, days)
+	window, err := scanBucket(base+` WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai') - (($1::int - 1) * INTERVAL '1 day')`, days)
 	if err != nil {
 		return out, err
 	}
@@ -727,26 +832,138 @@ func cloneAnyMap(input map[string]any) map[string]any {
 	return out
 }
 
+// UsageLightBilled returns a minimal today/lifetime billed token snapshot for
+// /admin/api/status. Avoids UsageSummary's series + multi-bucket cache aggregates.
+func (c *Connector) UsageLightBilled(ctx context.Context) (map[string]any, error) {
+	if c == nil || c.Pool == nil {
+		return nil, errors.New("postgres unavailable")
+	}
+	billed := func(total, cache int64) int64 {
+		b := total - cache
+		if b < 0 {
+			return 0
+		}
+		return b
+	}
+	// Today: only today's partition-ish range via created_at index (not full table).
+	var todayReq, todayTotal, todayCache int64
+	err := c.Pool.QueryRow(ctx, `
+		SELECT
+		  COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(SUM(total_tokens) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(SUM(cache_read_tokens) FILTER (WHERE ok IS TRUE), 0)
+		FROM usage_events
+		WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai')`).Scan(&todayReq, &todayTotal, &todayCache)
+	if err != nil {
+		return nil, err
+	}
+	// Lifetime: prefer compact usage_daily global rows (no cache column) so we
+	// never full-scan usage_events on the status path. Cache subtract for
+	// lifetime is best-effort from today only when daily has no cache.
+	var lifeReq, lifeTotal int64
+	err = c.Pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(requests),0), COALESCE(SUM(total_tokens),0)
+		FROM usage_daily
+		WHERE dim = 'global' AND dim_id = ''`).Scan(&lifeReq, &lifeTotal)
+	if err != nil {
+		// Fallback: events lifetime (may be slower; callers must timeout).
+		var lifeCache int64
+		err2 := c.Pool.QueryRow(ctx, `
+			SELECT
+			  COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
+			  COALESCE(SUM(total_tokens) FILTER (WHERE ok IS TRUE), 0),
+			  COALESCE(SUM(cache_read_tokens) FILTER (WHERE ok IS TRUE), 0)
+			FROM usage_events`).Scan(&lifeReq, &lifeTotal, &lifeCache)
+		if err2 != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"today_requests":   todayReq,
+			"today_tokens":     billed(todayTotal, todayCache),
+			"today_tokens_raw": todayTotal,
+			"today_cache_read": todayCache,
+			"total_tokens":     billed(lifeTotal, lifeCache),
+			"total_tokens_raw": lifeTotal,
+			"total_cache_read": lifeCache,
+			"total_requests":   lifeReq,
+			"source":           "postgres",
+			"timezone":         usageDayTZ,
+		}, nil
+	}
+	return map[string]any{
+		"today_requests":   todayReq,
+		"today_tokens":     billed(todayTotal, todayCache),
+		"today_tokens_raw": todayTotal,
+		"today_cache_read": todayCache,
+		// usage_daily total is raw (includes cache). Without lifetime cache_read
+		// we expose raw as total_tokens_raw and approximate billed with redis on
+		// the hot path. When only PG is available, still better than hanging.
+		"total_tokens":     lifeTotal,
+		"total_tokens_raw": lifeTotal,
+		"total_cache_read": int64(0),
+		"total_requests":   lifeReq,
+		"source":           "postgres",
+	}, nil
+}
+
 func (c *Connector) usageRange(ctx context.Context, days int) (usageTotals, error) {
+	// Prefer usage_events so billed totals can subtract cache_read_tokens.
 	var totals usageTotals
 	err := c.Pool.QueryRow(ctx, `
+		SELECT
+		  COALESCE(COUNT(*), 0),
+		  COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(COUNT(*) FILTER (WHERE ok IS NOT TRUE), 0),
+		  COALESCE(SUM(prompt_tokens) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(SUM(completion_tokens) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(SUM(total_tokens) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(SUM(cache_read_tokens) FILTER (WHERE ok IS TRUE), 0)
+		FROM usage_events
+		WHERE created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai') - (($1::int - 1) * INTERVAL '1 day')`, days,
+	).Scan(&totals.Requests, &totals.Success, &totals.Fail, &totals.PromptTokens, &totals.CompletionTokens, &totals.TotalTokens, &totals.CacheReadTokens)
+	if err == nil {
+		return totals, nil
+	}
+	var fallback usageTotals
+	err2 := c.Pool.QueryRow(ctx, `
 		SELECT COALESCE(SUM(requests),0), COALESCE(SUM(success),0), COALESCE(SUM(fail),0),
 		       COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0)
 		FROM usage_daily
-		WHERE dim = 'global' AND dim_id = '' AND day >= CURRENT_DATE - (($1::int - 1) * INTERVAL '1 day')`, days,
-	).Scan(&totals.Requests, &totals.Success, &totals.Fail, &totals.PromptTokens, &totals.CompletionTokens, &totals.TotalTokens)
-	return totals, err
+		WHERE dim = 'global' AND dim_id = '' AND day >= (now() AT TIME ZONE 'Asia/Shanghai')::date - (($1::int - 1) * INTERVAL '1 day')`, days,
+	).Scan(&fallback.Requests, &fallback.Success, &fallback.Fail, &fallback.PromptTokens, &fallback.CompletionTokens, &fallback.TotalTokens)
+	if err2 != nil {
+		return totals, err
+	}
+	return fallback, nil
 }
 
 func (c *Connector) usageLifetime(ctx context.Context) (usageTotals, error) {
 	var totals usageTotals
 	err := c.Pool.QueryRow(ctx, `
+		SELECT
+		  COALESCE(COUNT(*), 0),
+		  COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(COUNT(*) FILTER (WHERE ok IS NOT TRUE), 0),
+		  COALESCE(SUM(prompt_tokens) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(SUM(completion_tokens) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(SUM(total_tokens) FILTER (WHERE ok IS TRUE), 0),
+		  COALESCE(SUM(cache_read_tokens) FILTER (WHERE ok IS TRUE), 0)
+		FROM usage_events`,
+	).Scan(&totals.Requests, &totals.Success, &totals.Fail, &totals.PromptTokens, &totals.CompletionTokens, &totals.TotalTokens, &totals.CacheReadTokens)
+	if err == nil {
+		return totals, nil
+	}
+	var fallback usageTotals
+	err2 := c.Pool.QueryRow(ctx, `
 		SELECT COALESCE(SUM(requests),0), COALESCE(SUM(success),0), COALESCE(SUM(fail),0),
 		       COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0)
 		FROM usage_daily
 		WHERE dim = 'global' AND dim_id = ''`,
-	).Scan(&totals.Requests, &totals.Success, &totals.Fail, &totals.PromptTokens, &totals.CompletionTokens, &totals.TotalTokens)
-	return totals, err
+	).Scan(&fallback.Requests, &fallback.Success, &fallback.Fail, &fallback.PromptTokens, &fallback.CompletionTokens, &fallback.TotalTokens)
+	if err2 != nil {
+		return totals, err
+	}
+	return fallback, nil
 }
 
 func successRate(success, requests int64) any {
@@ -761,6 +978,13 @@ func intPtr(ptr *int) any {
 		return nil
 	}
 	return *ptr
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func clamp(value, min, max, fallback int) int {

@@ -41,10 +41,26 @@ window.G2A = window.G2A || {};
       if (ms < 1e12) ms = ms * 1000;
       const d = new Date(ms);
       if (Number.isNaN(d.getTime())) return String(ts);
-      return (
-        d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) +
-        " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes())
-      );
+      // Always display in Asia/Shanghai so usage / logs match 上海日切.
+      try {
+        const parts = new Intl.DateTimeFormat("en-CA", {
+          timeZone: "Asia/Shanghai",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        }).formatToParts(d);
+        const get = (t) => (parts.find((p) => p.type === t) || {}).value || "";
+        return get("year") + "-" + get("month") + "-" + get("day") + " " + get("hour") + ":" + get("minute");
+      } catch (_) {
+        // Fallback: browser local (usually already Shanghai for CN hosts).
+        return (
+          d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) +
+          " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes())
+        );
+      }
     } catch (e) {
       return String(ts);
     }

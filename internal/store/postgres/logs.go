@@ -54,11 +54,14 @@ func (c *Connector) ListTasks(ctx context.Context, page, pageSize int, q, kind, 
 	}
 	offset := (page - 1) * pageSize
 	queryArgs := append(append([]any{}, args...), pageSize, offset)
+	// Prefer updated_at so in-flight jobs (same task_id, progress upserts) float
+	// to the top as they advance — ORDER BY created_at alone left "stale" rows
+	// at the top while the live row sat mid-page after refresh.
 	rows, err := c.Pool.Query(ctx, `
 		SELECT id, created_at, updated_at, finished_at, kind, task_id,
 		       status, summary, detail, ok, progress_done, progress_total
 		FROM task_logs`+wh+`
-		ORDER BY created_at DESC, id DESC
+		ORDER BY COALESCE(updated_at, created_at) DESC NULLS LAST, id DESC
 		LIMIT $`+itoaSQL(len(args)+1)+` OFFSET $`+itoaSQL(len(args)+2), queryArgs...)
 	if err != nil {
 		return nil, err

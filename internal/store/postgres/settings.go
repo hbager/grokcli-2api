@@ -66,15 +66,17 @@ func (c *Connector) PublicSettings(ctx context.Context) (map[string]any, error) 
 		"conversation_affinity_ttl_sec": floatSetting(values, "conversation_affinity_ttl_sec", 7200),
 		"token_maintain_interval_sec":   floatSetting(values, "token_maintain_interval_sec", 90),
 		"token_refresh_skew_sec":        floatSetting(values, "token_refresh_skew_sec", 300),
-		"model_health_interval_sec":     floatSetting(values, "model_health_interval_sec", 900),
+		"model_health_interval_sec":     floatSetting(values, "model_health_interval_sec", 180),
 		"model_health_auto_disable":     boolSetting(values, "model_health_auto_disable", true),
+		"model_health_probe_batch":      floatSetting(values, "model_health_probe_batch", 120),
+		"model_health_probe_workers":    floatSetting(values, "model_health_probe_workers", 12),
 		"probe_models":                  valueOr(values, "probe_models", []string{}),
 		"default_model":                 stringSetting(values, "default_model", ""),
 		"registration_config":           mapSetting(values, "registration_config"),
-		"outbound_proxy_config":         mapSetting(values, "outbound_proxy_config"),
+		"outbound_proxy_config":         publicOutboundProxyConfig(mapSetting(values, "outbound_proxy_config")),
 		"outbound_proxy_pool":           outboundProxyPoolSummary(mapSetting(values, "outbound_proxy_config")),
-		"sub2api_config":                mapSetting(values, "sub2api_config"),
-		"cliproxyapi_config":            mapSetting(values, "cliproxyapi_config"),
+		"sub2api_config":                publicIntegrationConfig("sub2api_config", mapSetting(values, "sub2api_config")),
+		"cliproxyapi_config":            publicIntegrationConfig("cliproxyapi_config", mapSetting(values, "cliproxyapi_config")),
 		"updated_at":                    values["__updated_at"],
 	}
 	// Pool / cooldown / kick policy: always return effective defaults so the
@@ -123,6 +125,85 @@ func mapSetting(values map[string]any, key string) map[string]any {
 		return map[string]any{}
 	}
 	return value
+}
+
+// publicIntegrationConfig copies nested integration settings for admin UI while
+// redacting secrets. Keeps auto_push_on_register / enabled so the "注册后自动入库"
+// checkboxes round-trip correctly through GET /admin/api/settings.
+func publicIntegrationConfig(kind string, raw map[string]any) map[string]any {
+	if raw == nil {
+		return map[string]any{}
+	}
+	out := map[string]any{}
+	for k, v := range raw {
+		out[k] = v
+	}
+	switch kind {
+	case "sub2api_config":
+		pw, _ := out["password"].(string)
+		tok, _ := out["token"].(string)
+		out["has_password"] = strings.TrimSpace(pw) != "" || strings.TrimSpace(tok) != ""
+		delete(out, "password")
+		delete(out, "token")
+		// Normalize bool so JSON null does not leave the checkbox sticky-false.
+		if v, ok := out["auto_push_on_register"]; ok {
+			out["auto_push_on_register"] = truthySetting(v)
+		} else {
+			out["auto_push_on_register"] = false
+		}
+		if v, ok := out["enabled"]; ok {
+			out["enabled"] = truthySetting(v)
+		} else {
+			out["enabled"] = false
+		}
+	case "cliproxyapi_config":
+		mk, _ := out["management_key"].(string)
+		out["has_management_key"] = strings.TrimSpace(mk) != ""
+		delete(out, "management_key")
+		if v, ok := out["auto_push_on_register"]; ok {
+			out["auto_push_on_register"] = truthySetting(v)
+		} else {
+			out["auto_push_on_register"] = false
+		}
+		if v, ok := out["enabled"]; ok {
+			out["enabled"] = truthySetting(v)
+		} else {
+			out["enabled"] = false
+		}
+	}
+	return out
+}
+
+// publicOutboundProxyConfig redacts proxy_password for admin settings UI.
+func publicOutboundProxyConfig(raw map[string]any) map[string]any {
+	if raw == nil {
+		return map[string]any{}
+	}
+	out := map[string]any{}
+	for k, v := range raw {
+		out[k] = v
+	}
+	pw, _ := out["proxy_password"].(string)
+	out["has_password"] = strings.TrimSpace(pw) != ""
+	delete(out, "proxy_password")
+	return out
+}
+func truthySetting(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		s := strings.TrimSpace(strings.ToLower(t))
+		return s == "1" || s == "true" || s == "yes" || s == "on"
+	case float64:
+		return t != 0
+	case int:
+		return t != 0
+	case int64:
+		return t != 0
+	default:
+		return false
+	}
 }
 
 func stringSetting(values map[string]any, key, fallback string) string {
@@ -293,6 +374,8 @@ func (c *Connector) UpdateRuntimeSettings(ctx context.Context, patch map[string]
 		{key: "token_refresh_skew_sec", kind: "float", minF: 0, maxF: 1800},
 		{key: "model_health_interval_sec", kind: "float", minF: 0, maxF: 86400},
 		{key: "model_health_auto_disable", kind: "bool"},
+		{key: "model_health_probe_batch", kind: "float", minF: 1, maxF: 1000},
+		{key: "model_health_probe_workers", kind: "float", minF: 1, maxF: 64},
 		{key: "default_model", kind: "string"},
 		{key: "max_failover_attempts", kind: "int", minF: 1, maxF: 64},
 		{key: "cooldown_default_sec", kind: "float", minF: 1, maxF: 600},

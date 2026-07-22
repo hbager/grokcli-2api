@@ -34,3 +34,32 @@ func TestUsageFromOpenAICacheAliases(t *testing.T) {
 		t.Fatalf("alias cache cr=%d cc=%d", cr, cc)
 	}
 }
+
+func TestUsageTotalsMapWithRateBilled(t *testing.T) {
+	u := usageTotals{
+		Requests: 2, Success: 2, Fail: 0,
+		PromptTokens: 1000, CompletionTokens: 50, TotalTokens: 1050,
+		CacheReadTokens: 400,
+	}
+	m := u.mapWithRate()
+	if m["total_tokens"] != int64(650) {
+		t.Fatalf("billed total_tokens=%v want 650", m["total_tokens"])
+	}
+	if m["billed_tokens"] != int64(650) {
+		t.Fatalf("billed_tokens=%v", m["billed_tokens"])
+	}
+	if m["prompt_tokens_billed"] != int64(600) {
+		t.Fatalf("prompt_tokens_billed=%v", m["prompt_tokens_billed"])
+	}
+	if m["total_tokens_raw"] != int64(1050) {
+		t.Fatalf("raw=%v", m["total_tokens_raw"])
+	}
+	if m["cache_read_tokens"] != int64(400) {
+		t.Fatalf("cache=%v", m["cache_read_tokens"])
+	}
+	// never negative
+	u2 := usageTotals{TotalTokens: 10, CacheReadTokens: 50}
+	if billedTokens(u2) != 0 {
+		t.Fatalf("billed negative case %d", billedTokens(u2))
+	}
+}

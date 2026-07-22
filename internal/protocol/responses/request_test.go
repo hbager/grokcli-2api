@@ -69,3 +69,41 @@ func TestInputToMessagesFlattensInputTextParts(t *testing.T) {
 		t.Fatalf("user content not flattened: %#v", messages[1])
 	}
 }
+
+func TestInputToMessagesDropsEmptyContentBlocks(t *testing.T) {
+	messages := InputToMessages([]any{
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "input_text", "text": ""},
+		}},
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "input_text", "text": "ok"},
+			map[string]any{"type": "input_text", "text": ""},
+		}},
+		map[string]any{"role": "assistant", "content": ""},
+	}, "")
+	// empty user dropped, empty assistant dropped, mixed user keeps only "ok"
+	if len(messages) != 1 {
+		t.Fatalf("messages=%#v", messages)
+	}
+	if messages[0]["content"] != "ok" {
+		t.Fatalf("content=%#v", messages[0]["content"])
+	}
+}
+
+func TestInputToMessagesKeepsToolOnlyAssistant(t *testing.T) {
+	messages := InputToMessages([]any{
+		map[string]any{
+			"role":    "assistant",
+			"content": "",
+			"tool_calls": []any{
+				map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "shell", "arguments": "{}"}},
+			},
+		},
+	}, "")
+	if len(messages) != 1 {
+		t.Fatalf("messages=%#v", messages)
+	}
+	if messages[0]["content"] != nil {
+		t.Fatalf("tool-only assistant content should be nil, got %#v", messages[0]["content"])
+	}
+}

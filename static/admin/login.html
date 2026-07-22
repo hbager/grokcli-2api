@@ -68,11 +68,11 @@
       try {
         var t = localStorage.getItem("g2a_theme");
         if (t !== "light" && t !== "dark") {
-          t = "dark";
+          t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
         }
         document.documentElement.setAttribute("data-theme", t);
         document.documentElement.style.colorScheme = t;
-        document.documentElement.style.background = t === "light" ? "#f6f1e7" : "#171713";
+        document.documentElement.style.background = t === "light" ? "#f5f7fb" : "#0a0a0f";
         var tok = localStorage.getItem("g2a_admin_token") || "";
         var ts = Number(localStorage.getItem("g2a_admin_token_ts") || 0) || 0;
         var grace = tok && ts && (Date.now() - ts) < 7 * 24 * 3600 * 1000;
@@ -95,11 +95,11 @@
       try {
         var t = localStorage.getItem("g2a_theme");
         if (t !== "light" && t !== "dark") {
-          t = "dark";
+          t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
         }
         document.documentElement.setAttribute("data-theme", t);
         document.documentElement.style.colorScheme = t;
-        document.documentElement.style.background = t === "light" ? "#f6f1e7" : "#171713";
+        document.documentElement.style.background = t === "light" ? "#f5f7fb" : "#0a0a0f";
       } catch (e) {
         document.documentElement.setAttribute("data-theme", "dark");
       }
@@ -111,19 +111,13 @@
   <title>登录 · grokcli-2api</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Azeret+Mono:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700;800&family=Barlow:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.880e6214a1.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.0be58dd7f9.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 </head>
 <body class="g2a-body g2a-login-body">
   <div id="toast" class="g2a-message"></div>
   <div style="position:fixed;top:16px;right:16px;z-index:30"><button type="button" class="g2a-theme-toggle" data-theme-toggle aria-label="切换主题"><span class="ico">☀️</span><span class="label">白天</span></button></div>
-
-  <div class="g2a-login-story" aria-hidden="true">
-    <div class="eyebrow">GROK GATEWAY / OPERATIONS</div>
-    <h2>Stay sharp.<br />Keep it moving.</h2>
-    <p>账号池、凭证与流量状态集中掌握。快速发现异常，果断处理，不让噪音拖慢运维。</p>
-  </div>
 
   <div id="boot-view" class="g2a-login-screen">
     <div class="g2a-login-panel g2a-card">
@@ -138,9 +132,10 @@
         <span class="g2a-spinner" aria-hidden="true"></span>
         <div>
           <h1 id="boot-desc" class="g2a-login-title">正在连接服务…</h1>
-          <p id="boot-hint" class="g2a-muted">检测管理服务可用性</p>
+          <p id="boot-hint" class="g2a-muted">检测鉴权与数据库连接状态</p>
         </div>
       </div>
+      <div id="boot-conn" class="g2a-conn-list" style="margin-top:16px"></div>
     </div>
   </div>
 
@@ -156,6 +151,8 @@
 
       <h1 id="auth-title" class="g2a-login-title">登录管理台</h1>
       <p id="auth-desc" class="g2a-muted g2a-login-desc">使用管理员密码进入（会话 Token 鉴权）</p>
+
+      <div id="auth-conn" class="g2a-conn-list" style="margin-bottom:16px"></div>
 
       <form id="auth-form" class="g2a-login-form" autocomplete="on">
         <label class="g2a-label" for="auth-password">管理员密码</label>
@@ -174,8 +171,8 @@
     </div>
   </div>
 
-  <script src="/static/dist/utils.11f94e0961.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/utils.4f6a1861a5.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/api.9ac71f7ed9.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.d65f32a200.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script>document.addEventListener("DOMContentLoaded", function(){ window.__g2aBootLogin && __g2aBootLogin(); });</script>

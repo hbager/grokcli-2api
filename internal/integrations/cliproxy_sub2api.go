@@ -412,12 +412,119 @@ func TestSub2API(ctx context.Context, cfg map[string]any) map[string]any {
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
-	// list groups smoke test
+	// list groups smoke test — return the group list (not just a count) so the
+	// admin "刷新分组" / test connection UI can populate the select.
 	groups, err := sub2ListGroups(ctx, base, token)
 	if err != nil {
-		return map[string]any{"ok": false, "error": err.Error(), "token_ok": true}
+		return map[string]any{"ok": false, "error": err.Error(), "token_ok": true, "groups": []any{}, "group_count": 0}
 	}
-	return map[string]any{"ok": true, "message": "login ok", "groups": len(groups), "token_ok": true}
+	return map[string]any{
+		"ok": true, "message": "login ok", "token_ok": true,
+		"groups": groups, "group_count": len(groups),
+	}
+}
+
+// ListSub2APIGroups logs in with stored config and returns remote groups.
+// Used by GET /admin/api/settings/sub2api/groups ("刷新分组").
+func ListSub2APIGroups(ctx context.Context, store Store) map[string]any {
+	cfg := sub2Config(ctx, store)
+	base := strings.TrimRight(stringField(cfg, "base_url"), "/")
+	email := stringField(cfg, "email")
+	password := stringField(cfg, "password")
+	if base == "" {
+		return map[string]any{"ok": false, "error": "请先填写 sub2api URL", "groups": []any{}, "count": 0}
+	}
+	if email == "" || password == "" {
+		return map[string]any{"ok": false, "error": "请先填写 sub2api 登录邮箱/密码", "groups": []any{}, "count": 0}
+	}
+	token, err := sub2Login(ctx, base, email, password)
+	if err != nil {
+		return map[string]any{"ok": false, "error": "sub2api login failed: " + err.Error(), "groups": []any{}, "count": 0}
+	}
+	groups, err := sub2ListGroups(ctx, base, token)
+	if err != nil {
+		return map[string]any{"ok": false, "error": err.Error(), "groups": []any{}, "count": 0, "token_ok": true}
+	}
+	// Normalize for the admin select: id/name/platform.
+	out := make([]map[string]any, 0, len(groups))
+	for _, g := range groups {
+		if g == nil {
+			continue
+		}
+		id := g["id"]
+		name := firstNonEmpty(stringField(g, "name"), stringField(g, "title"), fmt.Sprint(id))
+		plat := firstNonEmpty(stringField(g, "platform"), stringField(g, "platform_id"))
+		row := map[string]any{"id": id, "name": name}
+		if plat != "" {
+			row["platform"] = plat
+		}
+		if v, ok := g["description"]; ok {
+			row["description"] = v
+		}
+		if v, ok := g["status"]; ok {
+			row["status"] = v
+		}
+		if v, ok := g["account_count"]; ok {
+			row["account_count"] = v
+		} else if v, ok := g["accounts_count"]; ok {
+			row["account_count"] = v
+		}
+		out = append(out, row)
+	}
+	return map[string]any{"ok": true, "groups": out, "count": len(out), "token_ok": true}
+}
+
+// CreateSub2APIGroup creates a remote group and optionally stores it as default.
+// Used by POST /admin/api/settings/sub2api/groups ("创建分组").
+func CreateSub2APIGroup(ctx context.Context, store Store, name, platform string, setDefault bool) map[string]any {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return map[string]any{"ok": false, "error": "group name is required"}
+	}
+	if platform == "" {
+		platform = "grok"
+	}
+	cfg := sub2Config(ctx, store)
+	base := strings.TrimRight(stringField(cfg, "base_url"), "/")
+	email := stringField(cfg, "email")
+	password := stringField(cfg, "password")
+	if base == "" || email == "" || password == "" {
+		return map[string]any{"ok": false, "error": "sub2api URL/登录未配置"}
+	}
+	token, err := sub2Login(ctx, base, email, password)
+	if err != nil {
+		return map[string]any{"ok": false, "error": "sub2api login failed: " + err.Error()}
+	}
+	created, err := sub2CreateGroup(ctx, base, token, name, platform)
+	if err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	gid := intField(created, "id", 0)
+	if gid <= 0 {
+		// re-list and match by name
+		if groups, gerr := sub2ListGroups(ctx, base, token); gerr == nil {
+			for _, g := range groups {
+				if strings.EqualFold(stringField(g, "name"), name) {
+					gid = intField(g, "id", 0)
+					created = g
+					break
+				}
+			}
+		}
+	}
+	out := map[string]any{"ok": gid > 0, "group": created}
+	if gid <= 0 {
+		out["error"] = "group created but id missing"
+		return out
+	}
+	if setDefault && store != nil {
+		patch := map[string]any{"group_id": gid, "group_name": name}
+		if cfg, err := SaveConfig(ctx, store, "sub2api_config", patch); err == nil {
+			out["config"] = cfg
+		}
+	}
+	out["group_id"] = gid
+	return out
 }
 
 // PushSub2API pushes selected/all local accounts into sub2api via OAuth create API.
@@ -672,6 +779,60 @@ func sub2ListGroups(ctx context.Context, base, token string) ([]map[string]any, 
 		}
 	}
 	return out, nil
+}
+
+func sub2CreateGroup(ctx context.Context, base, token, name, platform string) (map[string]any, error) {
+	if platform == "" {
+		platform = "grok"
+	}
+	body := map[string]any{
+		"name":            name,
+		"platform":        platform,
+		"description":     "created by grokcli-2api",
+		"rate_multiplier": 1.0,
+		"is_exclusive":    false,
+	}
+	payload, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v1/admin/groups", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "grokcli-2api-sub2api-push/1.0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("create group status %d: %s", resp.StatusCode, string(raw))
+	}
+	var parsed any
+	_ = json.Unmarshal(raw, &parsed)
+	// sub2api may wrap as {code:0, data:{...}} with non-zero code on business error
+	if m, ok := parsed.(map[string]any); ok {
+		if code, has := m["code"]; has {
+			switch c := code.(type) {
+			case float64:
+				if c != 0 && c != 200 {
+					return nil, fmt.Errorf("create group code %v: %s", code, digString(parsed, "message", "error", "msg"))
+				}
+			case string:
+				if c != "" && c != "0" && c != "200" {
+					return nil, fmt.Errorf("create group code %v: %s", code, digString(parsed, "message", "error", "msg"))
+				}
+			}
+		}
+	}
+	if m := digMap(parsed, "data"); m != nil {
+		return m, nil
+	}
+	if m, ok := parsed.(map[string]any); ok {
+		return m, nil
+	}
+	return map[string]any{"raw": string(raw)}, nil
 }
 
 func sub2CreateAccount(ctx context.Context, client *http.Client, base, token string, body map[string]any) (map[string]any, error) {

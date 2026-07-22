@@ -8,8 +8,12 @@ import (
 )
 
 const (
-	InflightTTLSeconds = 90
-	SoftUsedTTLSeconds = 45
+	// InflightTTLSeconds bounds a stuck inflight counter if Release is lost.
+	// Shorter TTL recovers faster after process crash while still covering long streams.
+	InflightTTLSeconds = 60
+	// SoftUsedTTLSeconds is a brief "recently used" mark so the picker spreads load
+	// across the pool instead of hammering the same least_used accounts (WAF 403 risk).
+	SoftUsedTTLSeconds = 30
 )
 
 func (c *Client) RRNext(ctx context.Context) (int64, error) {
@@ -79,6 +83,84 @@ func (c *Client) GetInflight(ctx context.Context, accountID string) (int64, erro
 		return 0, nil
 	}
 	return n, nil
+}
+
+// GetSoftUsedAgeSec returns seconds since last soft_used mark, or -1 if absent/invalid.
+func (c *Client) GetSoftUsedAgeSec(ctx context.Context, accountID string, now time.Time) (float64, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return -1, nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	value, err := c.Get(ctx, c.key("soft_used", accountID))
+	if err != nil || strings.TrimSpace(value) == "" {
+		return -1, err
+	}
+	stamp, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil || stamp <= 0 {
+		return -1, nil
+	}
+	age := float64(now.UnixNano())/1e9 - stamp
+	if age < 0 {
+		age = 0
+	}
+	return age, nil
+}
+
+// GetSoftUsedAgeSecMany batches soft_used age lookups (seconds). Missing keys map to -1.
+func (c *Client) GetSoftUsedAgeSecMany(ctx context.Context, accountIDs []string, now time.Time) map[string]float64 {
+	out := make(map[string]float64, len(accountIDs))
+	if c == nil || len(accountIDs) == 0 {
+		return out
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	nowSec := float64(now.UnixNano()) / 1e9
+	ids := make([]string, 0, len(accountIDs))
+	keys := make([]string, 0, len(accountIDs))
+	for _, id := range accountIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		ids = append(ids, id)
+		keys = append(keys, c.key("soft_used", id))
+		out[id] = -1
+	}
+	if len(keys) == 0 {
+		return out
+	}
+	args := append([]string{"MGET"}, keys...)
+	values, err := c.commandArray(ctx, args...)
+	if err != nil || len(values) == 0 {
+		for _, id := range ids {
+			age, _ := c.GetSoftUsedAgeSec(ctx, id, now)
+			out[id] = age
+		}
+		return out
+	}
+	for i, id := range ids {
+		if i >= len(values) {
+			break
+		}
+		raw := strings.TrimSpace(values[i])
+		if raw == "" {
+			continue
+		}
+		stamp, err := strconv.ParseFloat(raw, 64)
+		if err != nil || stamp <= 0 {
+			continue
+		}
+		age := nowSec - stamp
+		if age < 0 {
+			age = 0
+		}
+		out[id] = age
+	}
+	return out
 }
 
 func (c *Client) MarkSoftUsed(ctx context.Context, accountID string, ttlSeconds int, now time.Time) (float64, error) {

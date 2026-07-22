@@ -27,10 +27,15 @@ type APIKeyRecord struct {
 }
 
 func (c *Connector) ListAPIKeys(ctx context.Context) ([]APIKeyRecord, error) {
+	// Newest first so freshly-created keys appear at the top of the admin table.
+	// COALESCE note/request_count: older DBs / partial rows may have NULL and would
+	// otherwise make Scan fail for the whole list (create succeeds, list looks empty).
 	rows, err := c.Pool.Query(ctx, `
-		SELECT id, name, prefix, key_hash, secret, enabled, note,
-		       created_at, last_used_at, request_count
-		FROM api_keys ORDER BY created_at`)
+		SELECT id, name, prefix, key_hash, secret, enabled,
+		       COALESCE(note, ''),
+		       created_at, last_used_at, COALESCE(request_count, 0)
+		FROM api_keys
+		ORDER BY created_at DESC NULLS LAST, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -63,8 +68,9 @@ func (c *Connector) FindAPIKeyByHash(ctx context.Context, keyHash string) (*APIK
 		return nil, nil
 	}
 	row := c.Pool.QueryRow(ctx, `
-		SELECT id, name, prefix, key_hash, secret, enabled, note,
-		       created_at, last_used_at, request_count
+		SELECT id, name, prefix, key_hash, secret, enabled,
+		       COALESCE(note, ''),
+		       created_at, last_used_at, COALESCE(request_count, 0)
 		FROM api_keys WHERE key_hash = $1 LIMIT 1`, keyHash)
 	var rec APIKeyRecord
 	if err := row.Scan(
@@ -252,7 +258,9 @@ func (c *Connector) RegenerateAPIKey(ctx context.Context, id string) (CreateAPIK
 
 func (c *Connector) getAPIKey(ctx context.Context, id string) (*APIKeyRecord, error) {
 	row := c.Pool.QueryRow(ctx, `
-		SELECT id, name, prefix, key_hash, secret, enabled, note, created_at, last_used_at, request_count
+		SELECT id, name, prefix, key_hash, secret, enabled,
+		       COALESCE(note, ''),
+		       created_at, last_used_at, COALESCE(request_count, 0)
 		FROM api_keys WHERE id = $1
 	`, id)
 	var rec APIKeyRecord

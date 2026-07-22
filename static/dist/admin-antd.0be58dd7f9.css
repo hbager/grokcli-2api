@@ -128,7 +128,7 @@ a:hover { color: var(--ant-color-primary-hover); }
 .g2a-sider-foot a { color: var(--sider-text-muted); font-size: 12px; padding: 4px 6px; text-decoration: none !important; }
 .g2a-sider-foot a:hover { color: var(--sider-text-strong); }
 
-.g2a-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.g2a-main { flex: 1; min-width: 0; max-width: 100%; display: flex; flex-direction: column; }
 .g2a-header {
   display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
   padding: 20px 28px 8px; flex-wrap: wrap;
@@ -136,7 +136,14 @@ a:hover { color: var(--ant-color-primary-hover); }
 .g2a-header h1 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -.02em; color: var(--ant-color-text); }
 .g2a-header p { margin: 6px 0 0; color: var(--ant-color-text-tertiary); font-size: 13px; }
 .g2a-header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.g2a-content { padding: 12px 28px 40px; max-width: 1280px; width: 100%; }
+.g2a-content {
+  padding: 12px 28px 40px;
+  max-width: 1280px;
+  width: 100%;
+  min-width: 0;
+  /* Contain wide tables (usage events) so mobile body does not expand / lock. */
+  overflow-x: clip;
+}
 
 /* cards */
 .g2a-card, .card {
@@ -248,7 +255,12 @@ textarea { min-height: 90px; resize: vertical; font-family: var(--mono); font-si
 /* table */
 .g2a-table-wrap, .table-responsive {
   border: 1px solid var(--ant-color-border);
-  border-radius: 10px; overflow: auto; background: var(--table-bg);
+  border-radius: 10px;
+  overflow: auto;
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  background: var(--table-bg);
 }
 .g2a-table, table {
   width: 100%; border-collapse: collapse; font-size: 13px;
@@ -263,6 +275,30 @@ textarea { min-height: 90px; resize: vertical; font-family: var(--mono); font-si
 .g2a-table tr:hover td, table tr:hover td { background: rgba(255,255,255,.02); }
 .g2a-table tr:last-child td, table tr:last-child td { border-bottom: 0; }
 .g2a-pager { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+/* Compact page-size select (账号列表「每页 N / 页」) */
+.g2a-page-size-label {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.g2a-page-size-select,
+#acc-page-size.g2a-page-size-select {
+  min-width: 0 !important;
+  width: auto;
+  max-width: 4.2rem;
+  height: 28px;
+  padding: 0 22px 0 8px;
+  font-size: 12px;
+  line-height: 26px;
+  border-radius: 6px;
+}
+.g2a-page-size-suffix {
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  margin-left: -4px;
+}
 .g2a-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0 4px; }
 .g2a-toolbar input { max-width: 280px; }
 /* Compact sort control pinned to the right of account toolbar. */
@@ -289,6 +325,19 @@ textarea { min-height: 90px; resize: vertical; font-family: var(--mono); font-si
   font-size: 12px;
   line-height: 26px;
   border-radius: 6px;
+}
+/* Sort only applies on the full account list ("全部"). Gray out when filtered. */
+.g2a-sort-wrap.is-disabled,
+#acc-sort-wrap.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.g2a-sort-wrap.is-disabled .g2a-sort-select,
+#acc-sort-wrap.is-disabled #acc-sort {
+  pointer-events: none;
+  color: var(--ant-color-text-disabled, #999);
+  background: var(--ant-color-fill-quaternary, rgba(0,0,0,.04));
+  cursor: not-allowed;
 }
 @media (max-width: 900px) {
   .g2a-sort-wrap { margin-left: 0; }
@@ -384,12 +433,35 @@ html[data-theme="light"] #guide-linux {
 
 /* mobile */
 .g2a-mobile-nav, .mobile-nav {
-  display: none; gap: 8px; overflow-x: auto; padding: 0 28px 8px; scrollbar-width: none;
+  display: none;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 0 16px 8px;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  /* Stay above soft-nav dimmer so 用量/日志 chips remain tappable mid-transition. */
+  position: relative;
+  z-index: 5;
+  flex: 0 0 auto;
+  max-width: 100%;
 }
 .g2a-mobile-nav::-webkit-scrollbar, .mobile-nav::-webkit-scrollbar { display: none; }
 .g2a-mobile-nav a, .mobile-nav a, .mobile-nav .nav-btn {
-  flex: 0 0 auto; border: 1px solid var(--ant-color-border); background: var(--ant-color-bg-container);
-  color: var(--ant-color-text-secondary); border-radius: 999px; padding: 6px 12px; font-size: 13px; text-decoration: none !important;
+  flex: 0 0 auto;
+  border: 1px solid var(--ant-color-border);
+  background: var(--ant-color-bg-container);
+  color: var(--ant-color-text-secondary);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 13px;
+  text-decoration: none !important;
+  /* Larger touch target on phones */
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 .g2a-mobile-nav a.is-active, .g2a-mobile-nav a.active, .mobile-nav a.active {
   color: #fff; background: var(--ant-color-primary); border-color: var(--ant-color-primary);
@@ -400,7 +472,18 @@ html[data-theme="light"] #guide-linux {
   .g2a-mobile-nav, .mobile-nav { display: flex; }
   .g2a-header, .g2a-content { padding-left: 16px; padding-right: 16px; }
   .g2a-grid-2, .grid-2 { grid-template-columns: 1fr; }
-  .g2a-content { padding-bottom: 56px; }
+  .g2a-content { padding-bottom: 56px; overflow-x: clip; }
+  .g2a-card, .card { max-width: 100%; min-width: 0; }
+  .g2a-form-row { min-width: 0; }
+  .g2a-field { min-width: 0 !important; max-width: 100%; }
+  /* Soft-nav busy must never freeze the mobile chip bar (用量 entry point). */
+  body.g2a-softnav-busy .g2a-mobile-nav,
+  body.g2a-softnav-busy .mobile-nav,
+  body.g2a-softnav-busy .g2a-mobile-nav a,
+  body.g2a-softnav-busy .mobile-nav a {
+    pointer-events: auto !important;
+    opacity: 1 !important;
+  }
 }
 
 /* bootstrap leftovers harmless */
@@ -839,6 +922,151 @@ body.g2a-softnav-busy .g2a-content::after {
   0% { opacity: .2; }
   50% { opacity: 1; }
   100% { opacity: .2; }
+}
+
+/* usage-events aligned table */
+.g2a-table-usage-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  /* Isolate layout so fixed min-width table cannot expand the document. */
+  contain: inline-size;
+}
+.g2a-table-usage {
+  table-layout: fixed;
+  /* Desktop keeps full column set; mobile scrolls horizontally inside wrap. */
+  min-width: 1100px;
+  width: max-content;
+  max-width: none;
+}
+@media (max-width: 960px) {
+  .g2a-table-usage {
+    min-width: 980px;
+    font-size: 12px;
+  }
+  .g2a-table-usage th,
+  .g2a-table-usage td {
+    padding: 8px 6px;
+  }
+}
+.g2a-table-usage th,
+.g2a-table-usage td {
+  vertical-align: middle;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 10px 8px;
+  box-sizing: border-box;
+}
+.g2a-table-usage th {
+  white-space: nowrap;
+}
+.g2a-table-usage td.ue-num,
+.g2a-table-usage th.ue-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.g2a-table-usage td.ue-center,
+.g2a-table-usage th.ue-center {
+  text-align: center;
+}
+.g2a-table-usage .ue-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--ant-color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.25;
+}
+.g2a-table-usage .ue-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+.g2a-table-usage .ue-proto .ue-main {
+  font-weight: 600;
+}
+.g2a-table-usage .g2a-tag {
+  max-width: 100%;
+  vertical-align: middle;
+  display: inline-block;
+}
+.g2a-table-usage td.ue-mode,
+.g2a-table-usage th.ue-mode {
+  text-align: center;
+  overflow: visible;
+  white-space: nowrap;
+}
+.g2a-table-usage .ue-mode-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.75em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+}
+.g2a-table-usage .ue-mode-pill.is-stream {
+  color: #1f9d63;
+  background: rgba(62, 207, 142, 0.16);
+  border: 1px solid rgba(62, 207, 142, 0.45);
+}
+.g2a-table-usage .ue-mode-pill.is-sync {
+  color: #b8860b;
+  background: rgba(250, 173, 20, 0.14);
+  border: 1px solid rgba(250, 173, 20, 0.4);
+}
+.g2a-table-usage .ue-mode-pill.is-unknown {
+  color: var(--ant-color-text-tertiary, #8b8b9a);
+  background: rgba(127, 127, 145, 0.1);
+  border: 1px solid rgba(127, 127, 145, 0.25);
+}
+html[data-theme="light"] .g2a-table-usage .ue-mode-pill.is-stream {
+  color: #0d7a4a;
+}
+html[data-theme="light"] .g2a-table-usage .ue-mode-pill.is-sync {
+  color: #9a6700;
+}
+html[data-theme="light"] .g2a-table-usage .ue-sub {
+  color: rgba(0,0,0,.45);
+}
+
+/* Registration multi-domain list */
+textarea#reg-domain {
+  min-height: 72px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: pre;
+}
+
+
+/* Account quota usage meter (Free token / SuperGrok $) */
+.g2a-quota-meter {
+  margin-top: 5px;
+  height: 4px;
+  width: 100%;
+  max-width: 160px;
+  border-radius: 999px;
+  background: rgba(127, 127, 145, 0.18);
+  overflow: hidden;
+}
+.g2a-quota-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width .25s ease;
+}
+html[data-theme="light"] .g2a-quota-meter {
+  background: rgba(0, 0, 0, 0.08);
 }
 
 /* ── Honeybadger operations console ───────────────────────────── */

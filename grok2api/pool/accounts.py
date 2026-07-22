@@ -112,6 +112,15 @@ def merge_durable_account_fields(
     if sso_val:
         entry["sso"] = sso_val
         entry.setdefault("sso_cookie", sso_val)
+        entry.setdefault("sso_token", sso_val)
+        sc = entry.get("session_cookies")
+        if not isinstance(sc, dict):
+            sc = {}
+        else:
+            sc = dict(sc)
+        sc.setdefault("sso", sso_val)
+        sc.setdefault("sso-rw", sso_val)
+        entry["session_cookies"] = sc
     if not entry.get("password") and entry.get("register_password"):
         entry["password"] = entry.get("register_password")
     if not entry.get("register_password") and entry.get("password"):
@@ -579,6 +588,15 @@ def _normalize_entry(
     if sso_val:
         entry["sso"] = sso_val
         entry.setdefault("sso_cookie", sso_val)
+        entry.setdefault("sso_token", sso_val)
+        sc = entry.get("session_cookies")
+        if not isinstance(sc, dict):
+            sc = {}
+        else:
+            sc = dict(sc)
+        sc.setdefault("sso", sso_val)
+        sc.setdefault("sso-rw", sso_val)
+        entry["session_cookies"] = sc
     pwd_val = entry.get("password") or entry.get("register_password")
     if isinstance(pwd_val, str) and pwd_val.strip():
         entry["password"] = pwd_val.strip()
@@ -816,6 +834,15 @@ def cliproxyapi_record_to_entry(obj: dict[str, Any]) -> dict[str, Any]:
     if sso_val:
         entry["sso"] = sso_val
         entry.setdefault("sso_cookie", sso_val)
+        entry.setdefault("sso_token", sso_val)
+        sc = entry.get("session_cookies")
+        if not isinstance(sc, dict):
+            sc = {}
+        else:
+            sc = dict(sc)
+        sc.setdefault("sso", sso_val)
+        sc.setdefault("sso-rw", sso_val)
+        entry["session_cookies"] = sc
     return entry
 
 

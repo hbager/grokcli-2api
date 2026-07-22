@@ -164,6 +164,44 @@ func TestOpenUsesResponsesPathAndBridgesChatChunks(t *testing.T) {
 	}
 }
 
+func TestOpenUsesResponsesPathAndBridgesCompletedOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("path=%s want /v1/responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		frames := []string{
+			`event: response.created` + "\n" + `data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.5-build-free","created_at":1700000000}}` + "\n\n",
+			`event: response.completed` + "\n" + `data: {"type":"response.completed","response":{"id":"resp_1","model":"grok-4.5-build-free","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final-only"}]}],"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}` + "\n\n",
+		}
+		for _, frame := range frames {
+			_, _ = w.Write([]byte(frame))
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{BaseURL: server.URL + "/v1", HTTP: server.Client()}
+	response, err := client.Open(context.Background(), Account{ID: "a", Token: "token"}, "grok-4.5", map[string]any{
+		"stream":   false,
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, `"content":"final-only"`) {
+		t.Fatalf("missing completed output bridge: %s", text)
+	}
+	if !strings.Contains(text, "data: [DONE]") {
+		t.Fatalf("missing DONE: %s", text)
+	}
+}
+
 func TestOpenUsesDynamicAccountStickyOutboundProxy(t *testing.T) {
 	writeSSE := func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -553,14 +591,60 @@ func TestReadSSEWithIdleKeepalive(t *testing.T) {
 	}
 }
 
+func TestReadSSEMultiLineData(t *testing.T) {
+	src := "data: line1\ndata: line2\n\ndata: [DONE]\n\n"
+	var got []string
+	err := ReadSSE(strings.NewReader(src), func(event Event) error {
+		if event.Done {
+			got = append(got, "[DONE]")
+			return nil
+		}
+		got = append(got, string(event.Data))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "line1\nline2" || got[1] != "[DONE]" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestExtractConvIDClaudeCodeUser(t *testing.T) {
+	id := extractConvID(map[string]any{
+		"user": "user_abc_account__session_01234567-89ab-cdef-0123-456789abcdef",
+	})
+	if !strings.HasPrefix(id, "session_") {
+		t.Fatalf("expected session_… conv id, got %q", id)
+	}
+	id = extractConvID(map[string]any{
+		"prompt_cache_key": "pck-stable",
+		"user":             "user_x__session_deadbeef-0000-0000-0000-000000000000",
+	})
+	if id != "pck-stable" {
+		t.Fatalf("pck should win: %q", id)
+	}
+	id = extractConvID(map[string]any{
+		"metadata": map[string]any{
+			"user_id": "user_y__session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		},
+	})
+	if !strings.HasPrefix(id, "session_") {
+		t.Fatalf("metadata session: %q", id)
+	}
+}
+
 func TestClampGrokEffort(t *testing.T) {
 	cases := map[string]string{
 		"low":        "low",
 		"medium":     "medium",
 		"high":       "high",
+		"Proactive":  "high",
 		"xhigh":      "xhigh",
 		"extra-high": "xhigh",
 		"max":        "xhigh",
+		"ultracode":  "xhigh",
+		"Ultra":      "xhigh",
 		"standard":   "high",
 		"auto":       "low",
 		"default":    "medium",

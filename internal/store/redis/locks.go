@@ -21,8 +21,33 @@ func (c *Client) LeaderLockKey() string {
 	return c.key("lock", "maintainer_leader")
 }
 
+// MaintenanceLockKey is the legacy shared slot. Prefer MaintenanceLockKeyFor
+// so model_health and token_maintainer do not block each other.
 func (c *Client) MaintenanceLockKey() string {
 	return c.key("lock", "maintenance")
+}
+
+// MaintenanceLockKeyFor returns a per-owner maintenance lock key.
+// owner is sanitized to a short slug (e.g. "model_health", "token_maintainer").
+func (c *Client) MaintenanceLockKeyFor(owner string) string {
+	owner = strings.TrimSpace(strings.ToLower(owner))
+	if owner == "" {
+		owner = "default"
+	}
+	// keep key short / redis-safe
+	var b strings.Builder
+	for _, r := range owner {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	slug := b.String()
+	if slug == "" {
+		slug = "default"
+	}
+	return c.key("lock", "maintenance", slug)
 }
 
 // TryAcquireLock SET NX EX.
@@ -55,8 +80,10 @@ func (c *Client) ReleaseLock(ctx context.Context, key, token string) (bool, erro
 	return c.CompareAndDelete(ctx, key, token)
 }
 
-// AcquireMaintenanceLock acquires g2a:lock:maintenance with renew loop.
-// Returns release function and whether acquired.
+// AcquireMaintenanceLock acquires a per-owner maintenance lock with renew loop.
+// owner is part of the Redis key so concurrent jobs (model_health vs token_maintainer)
+// do not serialize each other — that used to make "全部模型探测" return 0/0 when the
+// token maintainer held the shared lock (deferred_busy on first wave → job abort).
 func (c *Client) AcquireMaintenanceLock(ctx context.Context, owner string, timeout time.Duration, blocking bool) (acquired bool, release func(), err error) {
 	release = func() {}
 	if !c.Enabled() {
@@ -66,7 +93,7 @@ func (c *Client) AcquireMaintenanceLock(ctx context.Context, owner string, timeo
 		timeout = 60 * time.Second
 	}
 	token := fmt.Sprintf("%s|%s|%d", strings.TrimSpace(owner), WorkerID(), time.Now().Unix())
-	lockKey := c.MaintenanceLockKey()
+	lockKey := c.MaintenanceLockKeyFor(owner)
 	deadline := time.Now()
 	if blocking {
 		deadline = time.Now().Add(timeout)
@@ -119,13 +146,25 @@ func (c *Client) MaintenanceLockStatus(ctx context.Context) map[string]any {
 	if !c.Enabled() {
 		return map[string]any{"backend": "none"}
 	}
-	cur, err := c.Get(ctx, c.MaintenanceLockKey())
-	if err != nil || strings.TrimSpace(cur) == "" {
-		return map[string]any{"backend": "redis", "busy": false, "holder": nil, "token": nil}
+	// Report both legacy shared key and known owner keys for admin diagnostics.
+	keys := []string{
+		c.MaintenanceLockKey(),
+		c.MaintenanceLockKeyFor("model_health"),
+		c.MaintenanceLockKeyFor("token_maintainer"),
 	}
-	holder := cur
-	if i := strings.Index(cur, "|"); i >= 0 {
-		holder = cur[:i]
+	holders := map[string]any{}
+	busy := false
+	for _, k := range keys {
+		cur, err := c.Get(ctx, k)
+		if err != nil || strings.TrimSpace(cur) == "" {
+			continue
+		}
+		busy = true
+		holder := cur
+		if i := strings.Index(cur, "|"); i >= 0 {
+			holder = cur[:i]
+		}
+		holders[k] = map[string]any{"holder": holder, "token": cur}
 	}
-	return map[string]any{"backend": "redis", "busy": true, "holder": holder, "token": cur}
+	return map[string]any{"backend": "redis", "busy": busy, "locks": holders}
 }

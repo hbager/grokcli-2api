@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.880e6214a1.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.0be58dd7f9.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -132,7 +132,7 @@
       <header class="g2a-header">
         <div>
           <h1 id="page-title">账号 / 轮询</h1>
-          <p id="page-sub">Grok 账号、设备码登录、额度与导入导出</p>
+          <p id="page-sub">Grok 账号、设备码登录、Free/SuperGrok 额度（token/美元）与导入导出</p>
         </div>
         <div class="g2a-header-actions">
           <span id="status-pill" class="g2a-tag">—</span>
@@ -175,6 +175,9 @@
     <div class="g2a-actions">
       <button class="g2a-btn g2a-btn-default" id="btn-refresh-acc">刷新</button>
       <button class="g2a-btn g2a-btn-default" id="btn-refresh-quota-2">查全部额度</button>
+      <label class="g2a-check" title="本页缺失额度优先补齐；已有缓存的约 15 分钟才重查。每 3 分钟一轮、每批最多 2 个，避免上游连接过多。额度与类型已落库，刷新页面会先读库。" style="margin-left:6px">
+        <input type="checkbox" id="chk-quota-live" checked /> 额度自动刷新
+      </label>
       <button class="g2a-btn g2a-btn-default" id="btn-probe-all-2">全部模型探测</button>
       <button class="g2a-btn g2a-btn-default" id="btn-logout-cli">登出全部会话</button>
     </div>
@@ -229,11 +232,11 @@
         <option value="0">无 SSO</option>
       </select>
     </label>
-    <label class="g2a-sort-wrap" for="acc-sort" title="账号排序">
+    <label class="g2a-sort-wrap" id="acc-sort-wrap" for="acc-sort" title="仅在「全部」列表可用；状态筛选时固定按新加入排序">
       <span class="g2a-sort-label">排序</span>
       <select id="acc-sort" class="g2a-sort-select" aria-label="账号排序">
-        <option value="newest" selected>最新</option>
-        <option value="oldest">最早</option>
+        <option value="newest" selected>最新加入</option>
+        <option value="oldest">最早加入</option>
         <option value="expires_desc">过期↓</option>
         <option value="expires_asc">过期↑</option>
         <option value="last_used_desc">最近用</option>
@@ -241,8 +244,6 @@
         <option value="requests_desc">请求↓</option>
         <option value="email_asc">邮箱A-Z</option>
         <option value="email_desc">邮箱Z-A</option>
-        <option value="cooldown_first">冷却</option>
-        <option value="disabled_first">禁用</option>
       </select>
     </label>
   </div>
@@ -258,9 +259,10 @@
           <th><input type="checkbox" id="acc-check-page" /></th>
           <th>邮箱 / ID</th>
           <th>Token</th>
+          <th>类型</th>
           <th>轮询状态</th>
           <th>用量</th>
-          <th>额度</th>
+          <th>额度使用</th>
           <th>探测</th>
           <th>过期</th>
           <th>操作</th>
@@ -272,14 +274,16 @@
   <div class="g2a-pager" id="accounts-pager">
     <button class="g2a-btn g2a-btn-default" id="btn-acc-page" style="display:none"></button>
     <button class="g2a-btn g2a-btn-default" id="acc-page-prev">上一页</button>
-    <span id="acc-page-info" class="g2a-muted">—</span>
     <button class="g2a-btn g2a-btn-default" id="acc-page-next">下一页</button>
-    <select id="acc-page-size">
-      <option value="10">10 / 页</option>
-      <option value="25" selected>25 / 页</option>
-      <option value="50">50 / 页</option>
-      <option value="100">100 / 页</option>
+    <span id="acc-page-info" class="g2a-muted">—</span>
+    <label for="acc-page-size" class="g2a-muted g2a-page-size-label">每页</label>
+    <select id="acc-page-size" class="g2a-input g2a-page-size-select" title="每页显示数量">
+      <option value="10">10</option>
+      <option value="25" selected>25</option>
+      <option value="50">50</option>
+      <option value="100">100</option>
     </select>
+    <span class="g2a-muted g2a-page-size-suffix">/ 页</span>
   </div>
 </section>
 
@@ -287,7 +291,7 @@
   <div class="g2a-card-head">
     <div>
       <h3>协议注册</h3>
-      <p>临时邮箱（MoeMail / YYDS）+ 过盾服务自动建号并导入账号池。本地过盾以内联方式运行（无需填写 URL）；也可切换到 YesCaptcha 云端。</p>
+      <p>临时邮箱（MoeMail / YYDS / GPTMail / CF）+ 过盾服务自动建号并导入账号池。每种邮箱服务使用<strong>独立</strong>的 Key / 域名 / URL，分库存储，互不覆盖。本地过盾以内联方式运行（无需填写 URL）；也可切换到 YesCaptcha 云端。</p>
     </div>
     <div class="g2a-actions">
       <button class="g2a-btn g2a-btn-default" id="btn-save-reg">保存配置</button>
@@ -305,20 +309,78 @@
         <option value="yyds">YYDS Mail（vip.215.im）</option>
         <option value="gptmail">GPTMail（mail.chatgpt.org.uk）</option>
         <option value="cfmail">Cloudflare Temp Email</option>
+        <option value="tempmail">TempMail.lol（免费无需 Key）</option>
       </select>
     </div>
-    <div class="g2a-field" id="reg-base-url-wrap">
-      <label id="reg-base-url-label">MoeMail Base URL</label>
-      <input id="reg-base-url" placeholder="https://moemail.example.com" />
+    <div class="g2a-field" style="grid-column:1/-1">
+      <div id="reg-mail-help" class="g2a-alert hidden" style="display:none;margin:0;padding:10px 12px;font-size:12.5px;line-height:1.55"></div>
     </div>
-    <div class="g2a-field">
-      <label id="reg-api-key-label">邮箱 API Key</label>
-      <input id="reg-api-key" placeholder="按服务填写，各自独立保存" autocomplete="off" name="reg-api-key" />
-      <label class="g2a-check"><input type="checkbox" id="reg-api-key-clear" /> 清除当前服务已保存的 Key</label>
+
+    <!-- MoeMail: Base URL + API Key + domains (self-hosted) -->
+    <div class="g2a-field reg-mail-panel" data-mail="moemail" id="reg-panel-moemail-base" style="grid-column:1/-1">
+      <label for="reg-moemail-base-url">MoeMail Base URL</label>
+      <input id="reg-moemail-base-url" placeholder="https://moemail.example.com" autocomplete="off" name="reg-moemail-base-url" />
     </div>
-    <div class="g2a-field">
-      <label id="reg-domain-label">邮箱域名</label>
-      <input id="reg-domain" placeholder="留空则自动获取（YYDS/GPTMail/CF）" autocomplete="off" name="reg-domain" spellcheck="false" />
+    <div class="g2a-field reg-mail-panel" data-mail="moemail" id="reg-panel-moemail-key">
+      <label for="reg-moemail-api-key">MoeMail API Key</label>
+      <input id="reg-moemail-api-key" type="password" placeholder="mk_..." autocomplete="new-password" name="reg-moemail-api-key" />
+    </div>
+    <div class="g2a-field reg-mail-panel" data-mail="moemail" id="reg-panel-moemail-domain" style="grid-column:1/-1">
+      <label for="reg-moemail-domain">MoeMail 邮箱域名（可多个）</label>
+      <textarea id="reg-moemail-domain" class="g2a-input" rows="3" placeholder="一行一个域名&#10;example.com&#10;mail.example.com" autocomplete="off" name="reg-moemail-domain" spellcheck="false"></textarea>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">必填你的 MoeMail 域名；多个域名时批量注册按 1→2→3… 轮询。</div>
+    </div>
+
+    <!-- YYDS Mail: key + optional domains (fixed host) -->
+    <div class="g2a-field reg-mail-panel" data-mail="yyds" id="reg-panel-yyds-key" style="display:none">
+      <label for="reg-yyds-api-key">YYDS API Key</label>
+      <input id="reg-yyds-api-key" type="password" placeholder="AC-..." autocomplete="new-password" name="reg-yyds-api-key" />
+    </div>
+    <div class="g2a-field reg-mail-panel" data-mail="yyds" id="reg-panel-yyds-domain" style="grid-column:1/-1;display:none">
+      <label for="reg-yyds-domain">YYDS 邮箱域名（可多个）</label>
+      <textarea id="reg-yyds-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=自动随机公开域名" autocomplete="off" name="reg-yyds-domain" spellcheck="false"></textarea>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：maliapi.215.im（文档 <a href="https://vip.215.im/docs" target="_blank" rel="noopener">vip.215.im/docs</a>）。Key 填 <code>AC-…</code>；域名留空则从公开目录随机，多行则批量轮询。收信走 <code>/v1/messages/next</code> 取验证码。</div>
+    </div>
+
+    <!-- GPTMail: optional key + optional domains (fixed host) -->
+    <div class="g2a-field reg-mail-panel" data-mail="gptmail" id="reg-panel-gptmail-key" style="display:none">
+      <label for="reg-gptmail-api-key">GPTMail API Key</label>
+      <input id="reg-gptmail-api-key" type="password" placeholder="sk-…（文档页公共测试 Key 或商店 Key）" autocomplete="new-password" name="reg-gptmail-api-key" />
+    </div>
+    <div class="g2a-field reg-mail-panel" data-mail="gptmail" id="reg-panel-gptmail-domain" style="grid-column:1/-1;display:none">
+      <label for="reg-gptmail-domain">GPTMail 邮箱域名（可多个）</label>
+      <textarea id="reg-gptmail-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=GPTMail 随机分配" autocomplete="off" name="reg-gptmail-domain" spellcheck="false"></textarea>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：https://mail.chatgpt.org.uk · 文档 <a href="https://mail.chatgpt.org.uk/zh/api/" target="_blank" rel="noopener">/zh/api/</a>。Header <code>X-API-Key: sk-…</code>；域名留空则 generate 随机，或填多行轮询。勿再用 gpt-test。</div>
+    </div>
+
+    <!-- Cloudflare Temp Email: Base URL + admin password + domains -->
+    <div class="g2a-field reg-mail-panel" data-mail="cfmail" id="reg-panel-cfmail-base" style="grid-column:1/-1;display:none">
+      <label for="reg-cfmail-base-url">CF Temp Email Base URL</label>
+      <input id="reg-cfmail-base-url" placeholder="https://temp-email-api.your-domain.com 或 *.workers.dev" autocomplete="off" name="reg-cfmail-base-url" />
+    </div>
+    <div class="g2a-field reg-mail-panel" data-mail="cfmail" id="reg-panel-cfmail-key" style="display:none">
+      <label for="reg-cfmail-api-key">CF Temp Email Admin 密码</label>
+      <input id="reg-cfmail-api-key" type="password" placeholder="ADMIN_PASSWORDS（请求头 x-admin-auth）" autocomplete="new-password" name="reg-cfmail-api-key" />
+    </div>
+    <div class="g2a-field reg-mail-panel" data-mail="cfmail" id="reg-panel-cfmail-domain" style="grid-column:1/-1;display:none">
+      <label for="reg-cfmail-domain">CF Temp Email 域名（可多个）</label>
+      <textarea id="reg-cfmail-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=GET /open_api/settings 自动选；Base 填 Worker API 源（非 Pages 前端）" autocomplete="off" name="reg-cfmail-domain" spellcheck="false"></textarea>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">与 MoeMail 的 Base URL / Key / 域名完全独立，切换不会互相覆盖。</div>
+    </div>
+
+    <!-- TempMail.lol: free no key; optional Plus/Ultra Bearer key -->
+    <div class="g2a-field reg-mail-panel" data-mail="tempmail" id="reg-panel-tempmail-key" style="display:none">
+      <label for="reg-tempmail-api-key">TempMail.lol API Key（可选）</label>
+      <input id="reg-tempmail-api-key" type="password" placeholder="免费层级留空；Plus/Ultra 填 Bearer Key" autocomplete="new-password" name="reg-tempmail-api-key" />
+    </div>
+    <div class="g2a-field" style="grid-column:1/-1">
+      <label class="g2a-check"><input type="checkbox" id="reg-api-key-clear" /> 清除当前邮箱服务已保存的 Key</label>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">Key 输入留空会保留服务器现值；只有勾选此项才会清除当前服务的 Key。</div>
+    </div>
+    <div class="g2a-field reg-mail-panel" data-mail="tempmail" id="reg-panel-tempmail-domain" style="grid-column:1/-1;display:none">
+      <label for="reg-tempmail-domain">TempMail.lol 自定义域名（可选，付费）</label>
+      <textarea id="reg-tempmail-domain" class="g2a-input" rows="2" placeholder="免费层级请留空（系统随机域名）；自定义域名需 Plus/Ultra" autocomplete="off" name="reg-tempmail-domain" spellcheck="false"></textarea>
+      <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：api.tempmail.lol · 文档 <a href="https://tempmail.lol/zh/api" target="_blank" rel="noopener">tempmail.lol/zh/api</a>。免费：POST /v2/inbox/create（无需 Key），收信 GET /v2/inbox?token=…</div>
     </div>
     <div class="g2a-field">
       <label for="reg-captcha-provider">过盾方式</label>
@@ -328,12 +390,12 @@
       </select>
     </div>
     <div class="g2a-field" id="reg-yescaptcha-wrap" style="display:none">
-      <label>YesCaptcha Key</label>
-      <input id="reg-yescaptcha-key" placeholder="仅 YesCaptcha 模式需要" />
-      <label class="g2a-check"><input type="checkbox" id="reg-yescaptcha-key-clear" /> 清除已保存的 Key</label>
+      <label for="reg-yescaptcha-key">YesCaptcha Key</label>
+      <input id="reg-yescaptcha-key" type="password" placeholder="仅 YesCaptcha 模式需要" autocomplete="new-password" />
+      <label class="g2a-check"><input type="checkbox" id="reg-yescaptcha-key-clear" /> 清除已保存的 YesCaptcha Key</label>
     </div>
     <div class="g2a-field"><label>数量</label><input id="reg-count" type="number" min="1" value="1" /></div>
-    <div class="g2a-field"><label title="同时注册的线程数：3 就是同时只跑 3 个，完成一个再补一个">线程数</label><input id="reg-concurrency" type="number" min="1" max="10" value="5" /></div>
+    <div class="g2a-field"><label title="同时注册数（1–4）。受 GROK2API_REG_LOCAL_CONCURRENCY / MAX_CONCURRENCY 上限约束；本地过盾建议 ≤4">线程数</label><input id="reg-concurrency" type="number" min="1" max="4" value="2" /></div>
     <div class="g2a-field"><label title="同一波线程启动时的错峰间隔（毫秒）">错峰 ms</label><input id="reg-stagger-ms" type="number" min="0" value="300" /></div>
     <div class="g2a-field">
       <label for="reg-probe-delay-sec" title="新账号入池后等待多少秒再自动测活；0=立即测活">测活等待秒</label>
@@ -354,7 +416,11 @@
       <p class="g2a-muted" style="margin:4px 0 0" id="reg-proxy-hint">支持多行代理池；批量注册时按策略轮换。共享账号可填下方用户名/密码。</p>
     </div>
     <div class="g2a-field"><label>代理用户名</label><input id="reg-proxy-username" placeholder="可选，共享认证" /></div>
-    <div class="g2a-field"><label>代理密码</label><input id="reg-proxy-password" type="password" placeholder="可选，共享认证" /><label class="g2a-check"><input type="checkbox" id="reg-proxy-password-clear" /> 清除已保存的密码</label></div>
+    <div class="g2a-field">
+      <label for="reg-proxy-password">代理密码</label>
+      <input id="reg-proxy-password" type="password" placeholder="可选，共享认证" autocomplete="new-password" />
+      <label class="g2a-check"><input type="checkbox" id="reg-proxy-password-clear" /> 清除已保存的代理密码</label>
+    </div>
     <div class="g2a-field">
       <label for="reg-proxy-strategy" title="round_robin=按序轮换 · random=随机 · sticky=始终用第一个">代理策略</label>
       <select id="reg-proxy-strategy">
@@ -486,10 +552,10 @@
       </div>
     </div>
   </div>
-  <script src="/static/dist/utils.11f94e0961.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/utils.4f6a1861a5.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/api.9ac71f7ed9.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.d65f32a200.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.5b68f5842a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.f31ec4a78e.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

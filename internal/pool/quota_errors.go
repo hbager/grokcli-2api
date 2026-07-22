@@ -3,7 +3,9 @@ package pool
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,6 +21,9 @@ const (
 	ClassServer        FailureClass = "server_error"
 	ClassModelCapacity FailureClass = "model_capacity"
 	ClassBilling       FailureClass = "billing_quota"
+	// ClassEmptyUpstream is a transient HTTP 200 with no content/tool payload.
+	// Matches Python empty_upstream short cool (8–20s) — must NOT use 5xx 3m cool.
+	ClassEmptyUpstream FailureClass = "empty_upstream"
 )
 
 // CooldownDecision is the structured action for pool/picker after a failure.
@@ -51,11 +56,12 @@ var (
 // Decision priority is body/code text first, status second:
 //  1. free-usage / 额度用完 phrasing → hard account cooldown only (no model block)
 //  2. billing hard-quota → long cooldown
-//  3. model capacity / overloaded → short cool
-//  4. auth 401/403 → short cool
-//  5. bare rate-limit / 429 without quota language → shorter cool
-//  6. bare 5xx → brief cool
-//  7. validation / client errors → do NOT cool
+//  3. empty model output / no content/tool_calls → model soft-block (模型封禁) + cool
+//  4. model capacity / overloaded → short cool
+//  5. auth 401/403 → short cool
+//  6. bare rate-limit / 429 without quota language → shorter cool
+//  7. bare 5xx → brief cool
+//  8. validation / client errors → do NOT cool
 //
 // requestedModel is the outbound model for this request; used as a fallback when
 // the upstream body does not name a model (common for Chinese/admin paraphrases).
@@ -150,6 +156,35 @@ func ClassifyUpstreamFailure(status int, errText string, requestedModel ...strin
 		return d
 	}
 
+	// Empty HTTP 200 / empty model output: soft-block the requested model so the
+	// account shows under admin「模型封禁」and is skipped for that model only.
+	// Do NOT sticky-cool the whole account (other models stay pickable).
+	// Status is often rewritten to 502 by the proxy path; body text must win over
+	// bare 5xx classification.
+	if isEmptyModelOutputText(low) || isEmptyModelOutputCode(codeFromJSON) {
+		// Default 4 minutes — long enough for admin chips, short enough that empty-storms do not shrink the pool.
+		// Override via GROK2API_EMPTY_OUTPUT_BLOCK_SEC (30–86400).
+		blockSec := 4 * 60
+		if v := strings.TrimSpace(os.Getenv("GROK2API_EMPTY_OUTPUT_BLOCK_SEC")); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 30 && n <= 24*3600 {
+				blockSec = n
+			}
+		}
+		until := time.Now().Add(time.Duration(blockSec) * time.Second)
+		bm := defaultModel(model)
+		return CooldownDecision{
+			Class: ClassEmptyUpstream,
+			Code:  string(ClassEmptyUpstream),
+			Model: bm,
+			Until: &until,
+			// Account-wide cool would tag the row as 冷却 and hide it from 模型封禁.
+			ShouldCooldown: false,
+			// Soft-block the model → pool_status=model_blocked + picker skip.
+			BlockModel: bm != "",
+			Reason:     firstNonEmpty(text, "empty model output"),
+		}
+	}
+
 	// Model capacity / overloaded (not account free-usage) — short cool only.
 	if isModelCapacityText(low) {
 		until := time.Now().Add(3 * time.Minute)
@@ -164,15 +199,27 @@ func ClassifyUpstreamFailure(status int, errText string, requestedModel ...strin
 		}
 	}
 
-	// Auth — short cool so we don't hot-loop a bad token before refresh.
-	if status == http.StatusUnauthorized || status == http.StatusForbidden || isAuthText(low) {
-		until := time.Now().Add(5 * time.Minute)
+	// Auth / WAF / edge block — cool so the picker stops re-using the same token
+	// against a 403 wall (Cloudflare / edge bans heat up with rapid retries).
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || isAuthText(low) || isEdgeBlockText(low) {
+		// 403 / Cloudflare-like: longer cool. 401 token issues: moderate cool.
+		cool := 8 * time.Minute
+		if status == http.StatusUnauthorized && !isEdgeBlockText(low) {
+			cool = 3 * time.Minute
+		} else if status == http.StatusForbidden || isEdgeBlockText(low) {
+			cool = 15 * time.Minute
+		}
+		until := time.Now().Add(cool)
+		reason := "auth error"
+		if status == http.StatusForbidden || isEdgeBlockText(low) {
+			reason = "edge/waf blocked (403)"
+		}
 		return CooldownDecision{
 			Class:          ClassAuth,
 			Code:           string(ClassAuth),
 			Until:          &until,
 			ShouldCooldown: true,
-			Reason:         firstNonEmpty(text, "auth error"),
+			Reason:         firstNonEmpty(text, reason),
 		}
 	}
 
@@ -193,6 +240,8 @@ func ClassifyUpstreamFailure(status int, errText string, requestedModel ...strin
 	}
 
 	// Upstream 5xx — brief cool.
+	// Note: empty-model-output paths often surface as synthetic 502; those are
+	// already handled above via body text before this branch.
 	if status >= 500 && status <= 599 {
 		until := time.Now().Add(3 * time.Minute)
 		return CooldownDecision{
@@ -403,6 +452,32 @@ func isRateLimitText(low string) bool {
 		strings.Contains(low, "速率限制")
 }
 
+// isEmptyModelOutputText detects synthetic empty-HTTP-200 failures produced by
+// the Go proxy/server when upstream returns 200 with no content/tool_calls.
+// Must be classified before bare 5xx: FailureReporter surfaces these as 502.
+func isEmptyModelOutputText(low string) bool {
+	if low == "" {
+		return false
+	}
+	return strings.Contains(low, "empty model output") ||
+		strings.Contains(low, "no content/tool_calls") ||
+		strings.Contains(low, "no client-visible content") ||
+		strings.Contains(low, "empty_upstream") ||
+		strings.Contains(low, "empty upstream")
+}
+
+func isEmptyModelOutputCode(code string) bool {
+	c := strings.ToLower(strings.TrimSpace(code))
+	if c == "" {
+		return false
+	}
+	return c == "empty_upstream" ||
+		c == "empty-model-output" ||
+		c == "empty_model_output" ||
+		strings.Contains(c, "empty_upstream") ||
+		strings.Contains(c, "empty-model-output")
+}
+
 func isAuthText(low string) bool {
 	return strings.Contains(low, "invalid api key") ||
 		strings.Contains(low, "invalid token") ||
@@ -410,6 +485,29 @@ func isAuthText(low string) bool {
 		strings.Contains(low, "authentication") ||
 		strings.Contains(low, "未授权") ||
 		strings.Contains(low, "鉴权失败")
+}
+
+// isEdgeBlockText detects Cloudflare / reverse-proxy WAF style blocks that often
+// surface as HTTP 403 (or HTML bodies) when a single token is hammered.
+func isEdgeBlockText(low string) bool {
+	if low == "" {
+		return false
+	}
+	return strings.Contains(low, "cloudflare") ||
+		strings.Contains(low, "cf-ray") ||
+		strings.Contains(low, "cf-mitigated") ||
+		strings.Contains(low, "attention required") ||
+		strings.Contains(low, "just a moment") ||
+		strings.Contains(low, "access denied") ||
+		strings.Contains(low, "request blocked") ||
+		strings.Contains(low, "web application firewall") ||
+		strings.Contains(low, "waf") ||
+		strings.Contains(low, "captcha") && strings.Contains(low, "challenge") ||
+		strings.Contains(low, "error 1015") || // CF rate limited
+		strings.Contains(low, "error 1020") || // CF access denied
+		strings.Contains(low, "error 1006") ||
+		strings.Contains(low, "403 forbidden") ||
+		strings.Contains(low, "http 403")
 }
 
 func freeUsageCooldownDuration(low string) time.Duration {
