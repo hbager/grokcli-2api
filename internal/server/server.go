@@ -4168,32 +4168,46 @@ func anthropicErrorFromCause(err error) (message, errorType string) {
 	return firstNonEmptyStr(message, "request failed"), errorType
 }
 
+func writePublicAdminStatus(w http.ResponseWriter, status int, ok, setupNeeded bool) {
+	writeJSON(w, status, map[string]any{
+		"ok":           ok,
+		"setup_needed": setupNeeded,
+		"version":      buildinfo.Version,
+	})
+}
+
 func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, protected bool) {
-	if !options.AdminReadEnabled {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "Go admin read routes are not enabled"})
-		return
-	}
-	if !isReady(options) {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": readyReason(options)})
-		return
-	}
 	if protected {
 		if _, ok := admin.RequireSession(r, options.AdminSessions); !ok {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
 			return
 		}
-	} else {
-		// Unprotected /admin/api/status is polled every ~8s by the admin UI.
-		// Serve a short-lived snapshot so reverse proxies never hit 502 on
-		// 7k-account PoolSummary scans.
-		statusPayloadMu.Lock()
-		if statusPayloadCache != nil && time.Since(statusPayloadAt) < 3*time.Second {
-			out := cloneStringAnyMap(statusPayloadCache)
-			statusPayloadMu.Unlock()
-			writeJSON(w, http.StatusOK, out)
+	}
+	if !options.AdminReadEnabled {
+		if !protected {
+			writePublicAdminStatus(w, http.StatusServiceUnavailable, false, false)
 			return
 		}
-		statusPayloadMu.Unlock()
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "Go admin read routes are not enabled"})
+		return
+	}
+	if !isReady(options) {
+		if !protected {
+			writePublicAdminStatus(w, http.StatusServiceUnavailable, false, false)
+			return
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": readyReason(options)})
+		return
+	}
+	if !protected {
+		setupNeeded := false
+		if options.Store != nil {
+			if has, err := options.Store.HasAdminPassword(r.Context()); err == nil {
+				setupNeeded = !has
+			}
+		}
+		writePublicAdminStatus(w, http.StatusOK, true, setupNeeded)
+		return
 	}
 	store := options.Store
 	accountCount, modelCount := int64(0), int64(0)
@@ -4274,20 +4288,13 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 		"leader":                leaderStatus(r.Context(), options),
 		"redis":                 map[string]any{"enabled": redisEnabled, "prefix": options.Config.RedisPrefix},
 		"stream":                streamSnapshot(),
-		// Never block /status on a live upstream probe — only attach a recent cache.
+		// Never block /dashboard on a live upstream probe — only attach a recent cache.
 		"upstream_status": cachedUpstreamStatus(),
 	}
-	if protected {
-		payload["credentials"] = map[string]any{"email": nil, "active_count": pool.Live, "account_count": accountCount, "ok": pool.Live > 0}
-		payload["models"] = modelCatalog(options).PublicModels(r.Context())
-		payload["account_modes"] = []string{"round_robin", "random", "least_used"}
-		payload["full"] = false
-	} else {
-		statusPayloadMu.Lock()
-		statusPayloadCache = cloneStringAnyMap(payload)
-		statusPayloadAt = time.Now()
-		statusPayloadMu.Unlock()
-	}
+	payload["credentials"] = map[string]any{"email": nil, "active_count": pool.Live, "account_count": accountCount, "ok": pool.Live > 0}
+	payload["models"] = modelCatalog(options).PublicModels(r.Context())
+	payload["account_modes"] = []string{"round_robin", "random", "least_used"}
+	payload["full"] = false
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -4539,7 +4546,7 @@ func recordRedisUsage(options Options, apiKeyID, accountID, model string, prompt
 	if options.Redis == nil || !options.Redis.Enabled() {
 		return
 	}
-	// Store billed tokens so /admin/api/status light snapshot does not over-count
+	// Store billed tokens so the /admin/api/dashboard light snapshot does not over-count
 	// prompt cache hits (and does not need a full PG UsageSummary scan).
 	billed := total - cacheRead
 	if billed < 0 {
@@ -4573,14 +4580,9 @@ func touchRedisPool(options Options, accountID string, success bool, errText str
 	_, _ = options.Redis.TouchStats(ctx, accountID, touch)
 }
 
-// usageLight cache: /admin/api/status is polled every ~few seconds by the admin UI.
-// Never run full UsageSummary / full-table scans here — reverse proxies
-// (Cloudflare/nginx) return HTML 502 when this path stalls.
+// usageLight cache keeps dashboard refreshes from running full UsageSummary /
+// full-table scans. Reverse proxies can return HTML 502 when this path stalls.
 var (
-	statusPayloadMu    sync.Mutex
-	statusPayloadCache map[string]any
-	statusPayloadAt    time.Time
-
 	usageLightMu         sync.Mutex
 	usageLightCache      map[string]any
 	usageLightAt         time.Time

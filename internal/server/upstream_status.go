@@ -14,7 +14,7 @@ import (
 )
 
 // upstreamStatusCache keeps the last probe result so the models-page poller and
-// /admin/api/status can share a fresh snapshot without hammering cli-chat-proxy.
+// /admin/api/dashboard can share a fresh snapshot without hammering cli-chat-proxy.
 var (
 	upstreamStatusMu    sync.Mutex
 	upstreamStatusCache map[string]any
@@ -43,7 +43,7 @@ func serveUpstreamStatus(w http.ResponseWriter, r *http.Request, options Options
 }
 
 // cachedUpstreamStatus returns the last probe if still within stale TTL, else nil.
-// Safe for embedding into /admin/api/status (never blocks on a live probe).
+// Safe for embedding into /admin/api/dashboard (never blocks on a live probe).
 func cachedUpstreamStatus() map[string]any {
 	upstreamStatusMu.Lock()
 	defer upstreamStatusMu.Unlock()

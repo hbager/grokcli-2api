@@ -101,6 +101,56 @@ func TestOutboundProxyPasswordClearUsesExplicitControl(t *testing.T) {
 	}
 }
 
+func TestAdminOverviewRefreshUsesProtectedDashboard(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "..", "static", "js", "core.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, bounds := range [][2]string{
+		{"async function refreshOverviewStatus", "async function loadDashboard"},
+		{"async function softRefreshPoolChips", "function patchAccountRowById"},
+		{"async function refreshAccountsListUI", "async function hotRefreshAccountsPage"},
+		{"function startAutoUiRefresh", "function renderGuide"},
+	} {
+		start := strings.Index(text, bounds[0])
+		if start < 0 {
+			t.Fatalf("missing frontend function %q", bounds[0])
+		}
+		end := strings.Index(text[start:], bounds[1])
+		if end < 0 {
+			t.Fatalf("missing frontend function boundary %q", bounds[1])
+		}
+		body := text[start : start+end]
+		if !strings.Contains(body, `api("/dashboard")`) {
+			t.Fatalf("%s must refresh protected dashboard state", bounds[0])
+		}
+		if strings.Contains(body, `api("/status")`) {
+			t.Fatalf("%s must not expect internal fields from public status", bounds[0])
+		}
+	}
+	loadStart := strings.Index(text, "async function loadDashboard")
+	if loadStart < 0 {
+		t.Fatal("missing loadDashboard")
+	}
+	loadEnd := strings.Index(text[loadStart:], "function fmtNum")
+	if loadEnd < 0 {
+		t.Fatal("missing loadDashboard boundary")
+	}
+	loadBody := text[loadStart : loadStart+loadEnd]
+	if !strings.Contains(loadBody, "async function loadDashboard(prefetchedDashboard = null)") {
+		t.Fatal("loadDashboard must accept prefetched dashboard state")
+	}
+	if !strings.Contains(loadBody, "prefetchedDashboard || await api(\"/dashboard\")") {
+		t.Fatal("loadDashboard must reuse prefetched dashboard state")
+	}
+	for _, forbidden := range []string{"st.account_mode", "st.accounts", "st.pool", "st.credentials_email", "st.credentials_ok"} {
+		if strings.Contains(loadBody, forbidden) {
+			t.Fatalf("loadDashboard must not read admin field %q from public status", forbidden)
+		}
+	}
+}
+
 func TestNewChatServiceUsesRuntimeFailoverLimit(t *testing.T) {
 	runtime := config.NewRuntimeConfig(config.Config{MaxFailoverAttempts: 2})
 	service := newChatService(Options{RuntimeConfig: runtime})
@@ -254,23 +304,89 @@ type fakeAdminSessions struct{ ok bool }
 
 func (f fakeAdminSessions) VerifyAdminSession(string) bool { return f.ok }
 
+func assertPublicAdminStatusContract(t *testing.T, recorder *httptest.ResponseRecorder, wantOK bool) {
+	t.Helper()
+	var status map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status) != 3 {
+		t.Fatalf("public admin status keys = %#v, want only ok/setup_needed/version", status)
+	}
+	for _, key := range []string{"ok", "setup_needed", "version"} {
+		if _, ok := status[key]; !ok {
+			t.Fatalf("public admin status missing %q: %#v", key, status)
+		}
+	}
+	if status["ok"] != wantOK {
+		t.Fatalf("public admin status ok = %#v, want %t", status["ok"], wantOK)
+	}
+	if _, ok := status["setup_needed"].(bool); !ok {
+		t.Fatalf("public admin status setup_needed = %#v", status["setup_needed"])
+	}
+	if version, ok := status["version"].(string); !ok || strings.TrimSpace(version) == "" {
+		t.Fatalf("public admin status version = %#v", status["version"])
+	}
+}
+
 func TestAdminReadRoutesRequireFlagReadinessAndSession(t *testing.T) {
 	recorder := httptest.NewRecorder()
+	NewMux(Options{
+		Ready:            func() bool { return true },
+		AdminReadEnabled: false,
+		AdminSessions:    fakeAdminSessions{ok: false},
+	}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/api/dashboard", nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("disabled dashboard without session = %d body=%q", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
 	NewMux(Options{Ready: func() bool { return true }}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/api/status", nil))
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("disabled status route = %d", recorder.Code)
 	}
+	assertPublicAdminStatusContract(t, recorder, false)
 
 	recorder = httptest.NewRecorder()
-	NewMux(Options{Ready: func() bool { return false }, AdminReadEnabled: true}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/api/status", nil))
+	NewMux(Options{
+		Ready:            func() bool { return false },
+		Reason:           func() string { return "internal readiness detail" },
+		AdminReadEnabled: true,
+	}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/api/status", nil))
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("not-ready status route = %d", recorder.Code)
+	}
+	assertPublicAdminStatusContract(t, recorder, false)
+	if strings.Contains(recorder.Body.String(), "internal readiness detail") {
+		t.Fatalf("not-ready status leaked readiness detail: %q", recorder.Body.String())
 	}
 
 	recorder = httptest.NewRecorder()
 	NewMux(Options{Ready: func() bool { return true }, AdminReadEnabled: true}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/api/status", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("public admin status = %d body=%q", recorder.Code, recorder.Body.String())
+	}
+	assertPublicAdminStatusContract(t, recorder, true)
+	var publicStatus map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &publicStatus); err != nil {
+		t.Fatal(err)
+	}
+	if publicStatus["setup_needed"] != false {
+		t.Fatalf("public admin status values = %#v", publicStatus)
+	}
+
+	recorder = httptest.NewRecorder()
+	NewMux(Options{
+		Ready:            func() bool { return false },
+		Reason:           func() string { return "internal readiness detail" },
+		AdminReadEnabled: true,
+		AdminSessions:    fakeAdminSessions{ok: false},
+	}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/api/dashboard", nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("not-ready dashboard without session = %d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "internal readiness detail") {
+		t.Fatalf("not-ready dashboard leaked readiness detail: %q", recorder.Body.String())
 	}
 
 	recorder = httptest.NewRecorder()
@@ -279,7 +395,37 @@ func TestAdminReadRoutesRequireFlagReadinessAndSession(t *testing.T) {
 		t.Fatalf("dashboard without session = %d", recorder.Code)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/admin/api/models", nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/dashboard", nil)
+	req.Header.Set("X-Admin-Token", "token")
+	recorder = httptest.NewRecorder()
+	NewMux(Options{
+		Ready:            func() bool { return false },
+		Reason:           func() string { return "internal readiness detail" },
+		AdminReadEnabled: true,
+		AdminSessions:    fakeAdminSessions{ok: true},
+	}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("not-ready dashboard with session = %d body=%q", recorder.Code, recorder.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/api/dashboard", nil)
+	req.Header.Set("X-Admin-Token", "token")
+	recorder = httptest.NewRecorder()
+	NewMux(Options{Ready: func() bool { return true }, AdminReadEnabled: true, AdminSessions: fakeAdminSessions{ok: true}}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("dashboard with session = %d body=%q", recorder.Code, recorder.Body.String())
+	}
+	var dashboard map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &dashboard); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"accounts", "pool", "store"} {
+		if _, ok := dashboard[key]; !ok {
+			t.Fatalf("dashboard missing %q: %#v", key, dashboard)
+		}
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/api/models", nil)
 	req.Header.Set("X-Admin-Token", "token")
 	recorder = httptest.NewRecorder()
 	NewMux(Options{Ready: func() bool { return true }, AdminReadEnabled: true, AdminSessions: fakeAdminSessions{ok: true}}).ServeHTTP(recorder, req)
