@@ -53,7 +53,7 @@ func TestConsoleOpenUsesSSOCookie(t *testing.T) {
 		_, _ = io.WriteString(w, payload)
 	}))
 	defer srv.Close()
-	client := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	client := &Client{BaseURL: srv.URL, HTTP: srv.Client(), DisableBrowserTLS: true}
 	resp, err := client.Open(t.Context(), pool.ConsoleAccount{ID: "a", SSO: "eyJtest"}, "grok-4.3", map[string]any{
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 	})
@@ -88,5 +88,41 @@ func TestNormalizeConsoleBodyMultiAgentXHigh(t *testing.T) {
 	r, _ := out["reasoning"].(map[string]any)
 	if r == nil || r["effort"] != "xhigh" {
 		t.Fatalf("reasoning=%#v want effort=xhigh", out["reasoning"])
+	}
+}
+
+func TestConsoleOpenMergesCloudflareCookies(t *testing.T) {
+	var gotCookie string
+	payload := "event: response.completed\ndata: " + `{"type":"response.completed","response":{"id":"r1","model":"grok-4.3","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCookie = r.Header.Get("Cookie")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, payload)
+	}))
+	defer srv.Close()
+	client := &Client{BaseURL: srv.URL, HTTP: srv.Client(), DisableBrowserTLS: true}
+	resp, err := client.Open(t.Context(), pool.ConsoleAccount{
+		ID:  "a",
+		SSO: "eyJtest",
+		Cookies: map[string]string{
+			"cf_clearance": "clear-1",
+			"__cf_bm":      "bm-1",
+		},
+	}, "grok-4.3", map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if !strings.Contains(gotCookie, "sso=eyJtest") {
+		t.Fatalf("cookie missing sso: %q", gotCookie)
+	}
+	if !strings.Contains(gotCookie, "cf_clearance=clear-1") {
+		t.Fatalf("cookie missing cf_clearance: %q", gotCookie)
+	}
+	if !strings.Contains(gotCookie, "__cf_bm=bm-1") {
+		t.Fatalf("cookie missing __cf_bm: %q", gotCookie)
 	}
 }

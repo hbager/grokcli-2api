@@ -4043,6 +4043,23 @@ def _run_registration(
             update("importing", defer_msg)
             sso_cookie = str(sso or "").strip()
             reg_password = str(password or sess.get("password") or "").strip()
+            try:
+                from grok2api.pool.accounts import (
+                    merge_session_cookies_with_sso as _merge_sc,
+                    pick_cloudflare_cookies as _pick_cf,
+                )
+            except Exception:
+                def _merge_sc(sc, s):  # type: ignore
+                    out = dict(sc or {})
+                    out["sso"] = s
+                    out["sso-rw"] = s
+                    return out
+
+                def _pick_cf(entry):  # type: ignore
+                    return {}
+
+            sc_merged = _merge_sc(session_cookies, sso_cookie)
+            cf_cookies = _pick_cf({"session_cookies": sc_merged})
             import_payload = {
                 "key": f"sso-pending:{email}",
                 "auth_mode": "sso_pending",
@@ -4052,13 +4069,15 @@ def _run_registration(
                 "sso": sso_cookie,
                 "sso_cookie": sso_cookie,
                 "sso_token": sso_cookie,
-                "session_cookies": {"sso": sso_cookie, "sso-rw": sso_cookie},
+                "session_cookies": sc_merged,
                 "cookie": f"sso={sso_cookie}",
                 "password": reg_password,
                 "register_password": reg_password,
                 "needs_sso_convert": True,
                 "sso_convert_error": token_err or "empty",
             }
+            if cf_cookies:
+                import_payload["cloudflare_cookies"] = cf_cookies
             if token_err_desc:
                 import_payload["sso_convert_error_desc"] = str(token_err_desc)[:240]
             if sess.get("batch_id"):
@@ -4163,10 +4182,26 @@ def _run_registration(
             import_payload["sso"] = sso_cookie
             import_payload["sso_cookie"] = sso_cookie
             import_payload["sso_token"] = sso_cookie
-            sc = dict(session_cookies or {})
-            sc["sso"] = sso_cookie
-            sc["sso-rw"] = sso_cookie
+            try:
+                from grok2api.pool.accounts import (
+                    merge_session_cookies_with_sso as _merge_sc2,
+                    pick_cloudflare_cookies as _pick_cf2,
+                )
+            except Exception:
+                def _merge_sc2(sc, s):  # type: ignore
+                    out = dict(sc or {})
+                    out["sso"] = s
+                    out["sso-rw"] = s
+                    return out
+
+                def _pick_cf2(entry):  # type: ignore
+                    return {}
+
+            sc = _merge_sc2(session_cookies, sso_cookie)
             import_payload["session_cookies"] = sc
+            cf_cookies = _pick_cf2({"session_cookies": sc})
+            if cf_cookies:
+                import_payload["cloudflare_cookies"] = cf_cookies
             # Also keep a cookie-header form for GetSSOValue regex paths.
             import_payload.setdefault("cookie", f"sso={sso_cookie}")
         if reg_password:

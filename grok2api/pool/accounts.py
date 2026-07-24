@@ -83,6 +83,7 @@ _DURABLE_ACCOUNT_FIELDS = (
     "set_cookie",
     "set-cookie",
     "set_cookies",
+    "cloudflare_cookies",
     "password",
     "register_password",
     "registration_session_id",
@@ -121,11 +122,81 @@ def merge_durable_account_fields(
         sc.setdefault("sso", sso_val)
         sc.setdefault("sso-rw", sso_val)
         entry["session_cookies"] = sc
+        cf = pick_cloudflare_cookies(entry)
+        if cf:
+            existing_cf = entry.get("cloudflare_cookies")
+            if not isinstance(existing_cf, dict):
+                existing_cf = {}
+            else:
+                existing_cf = dict(existing_cf)
+            for k, v in cf.items():
+                existing_cf.setdefault(k, v)
+            entry["cloudflare_cookies"] = existing_cf
     if not entry.get("password") and entry.get("register_password"):
         entry["password"] = entry.get("register_password")
     if not entry.get("register_password") and entry.get("password"):
         entry["register_password"] = entry.get("password")
     return entry
+
+
+
+_CF_COOKIE_NAMES = (
+    "cf_clearance",
+    "__cf_bm",
+    "_cfuvid",
+    "cf_chl_2",
+    "cf_chl_prog",
+    "cf_chl_rc_i",
+    "cf_chl_rc_ni",
+    "cf_chl_rc_m",
+)
+
+
+def is_cloudflare_cookie_name(name: str) -> bool:
+    n = str(name or "").strip().lower()
+    if not n or n.startswith("sso"):
+        return False
+    if n in _CF_COOKIE_NAMES:
+        return True
+    return n.startswith("cf_") or n.startswith("__cf") or n.startswith("_cf")
+
+
+def pick_cloudflare_cookies(entry: dict[str, Any] | None) -> dict[str, str]:
+    """Extract CF edge cookies; cloudflare_cookies wins over session jars."""
+    if not isinstance(entry, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key in ("session_cookies", "cookies"):
+        raw = entry.get(key)
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if is_cloudflare_cookie_name(str(k)) and v not in (None, ""):
+                    out[str(k)] = str(v).strip()
+    raw = entry.get("cloudflare_cookies")
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if is_cloudflare_cookie_name(str(k)) and v not in (None, ""):
+                out[str(k)] = str(v).strip()
+    return out
+
+
+def merge_session_cookies_with_sso(
+    session_cookies: dict[str, Any] | None, sso: str
+) -> dict[str, str]:
+    """Keep jar CF cookies while forcing current sso / sso-rw."""
+    out: dict[str, str] = {}
+    if isinstance(session_cookies, dict):
+        for k, v in session_cookies.items():
+            if k in (None, "") or v in (None, ""):
+                continue
+            out[str(k)] = str(v).strip()
+    sso_val = str(sso or "").strip()
+    if sso_val.lower().startswith("sso="):
+        sso_val = sso_val.split("=", 1)[1].strip()
+    if sso_val:
+        out["sso"] = sso_val
+        out["sso-rw"] = sso_val
+    return out
 
 
 def _accounts_store_source() -> str:

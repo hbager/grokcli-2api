@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/hm2899/grokcli-2api/internal/accounts"
 	"github.com/hm2899/grokcli-2api/internal/pool"
+	"github.com/hm2899/grokcli-2api/internal/upstream/browserhttp"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 	"github.com/hm2899/grokcli-2api/internal/upstream/outboundproxy"
 )
@@ -18,10 +21,23 @@ import (
 const DefaultBaseURL = "https://console.x.ai"
 
 // Client talks to Grok Console Responses API using an SSO cookie.
+// BrowserTLS (default on) uses Chrome JA3/H2 impersonation — plain Go
+// net/http is fingerprint-blocked by Cloudflare on console.x.ai.
 type Client struct {
 	BaseURL string
-	HTTP    *http.Client
-	UA      string
+	// HTTP optional stdlib client (tests / explicit override). When set and
+	// BrowserTLS is false, used as-is. When BrowserTLS is true and HTTP is
+	// set, BrowserTLS still wins unless DisableBrowserTLS is true.
+	HTTP *http.Client
+	// Proxy optional dynamic outbound proxy (same signature as http.Transport.Proxy).
+	Proxy func(*http.Request) (*url.URL, error)
+	// ProxyURL optional static proxy URL.
+	ProxyURL string
+	// DisableBrowserTLS forces plain HTTP (only for unit tests with httptest).
+	DisableBrowserTLS bool
+	UA                string
+
+	browser *browserhttp.Client
 }
 
 func (c *Client) base() string {
@@ -40,13 +56,40 @@ func (c *Client) endpoint() string {
 	return b + "/v1/responses"
 }
 
-func (c *Client) httpClient() *http.Client {
-	if c != nil && c.HTTP != nil {
-		return c.HTTP
-	}
-	// Reuse build client transport defaults (proxy-aware via env / outboundproxy).
-	return grok.NewHTTPClient(nil)
+// doer is the minimal interface used by Open (stdlib or browser TLS).
+type doer interface {
+	Do(req *http.Request) (*http.Response, error)
 }
+
+func (c *Client) transport() doer {
+	if c == nil {
+		return grok.NewHTTPClient(nil)
+	}
+	// Unit tests: httptest injects HTTP + DisableBrowserTLS.
+	if c.DisableBrowserTLS {
+		if c.HTTP != nil {
+			return c.HTTP
+		}
+		return grok.NewHTTPClient(c.Proxy)
+	}
+	// Production: Chrome TLS/HTTP2 fingerprint (plain Go net/http is CF-blocked).
+	if c.browser == nil {
+		proxyFn := c.Proxy
+		if proxyFn == nil && c.HTTP != nil {
+			if tr, ok := c.HTTP.Transport.(*http.Transport); ok && tr.Proxy != nil {
+				proxyFn = tr.Proxy
+			}
+		}
+		c.browser = &browserhttp.Client{
+			Profile:  "chrome_131",
+			Timeout:  120 * time.Second,
+			ProxyURL: c.ProxyURL,
+			Proxy:    proxyFn,
+		}
+	}
+	return c.browser
+}
+
 
 // Open converts a chat-style body to Responses, POSTs to Console, and bridges
 // SSE back to chat.completion.chunk so proxy/chat can stay unchanged.
@@ -68,7 +111,7 @@ func (c *Client) Open(ctx context.Context, account pool.ConsoleAccount, model st
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range c.headers(account.SSO) {
+	for k, v := range c.headers(account.SSO, account.Cookies) {
 		req.Header.Set(k, v)
 	}
 	stream := true
@@ -78,7 +121,7 @@ func (c *Client) Open(ctx context.Context, account pool.ConsoleAccount, model st
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
-	resp, err := c.httpClient().Do(req)
+	resp, err := c.transport().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -100,28 +143,28 @@ func (c *Client) Open(ctx context.Context, account pool.ConsoleAccount, model st
 	return resp, nil
 }
 
-func (c *Client) headers(sso string) map[string]string {
+func (c *Client) headers(sso string, cfCookies map[string]string) map[string]string {
 	ua := strings.TrimSpace(c.UA)
 	if ua == "" {
-		ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-	}
-	sso = strings.TrimSpace(sso)
-	if strings.HasPrefix(strings.ToLower(sso), "sso=") {
-		sso = strings.TrimSpace(strings.SplitN(sso, "=", 2)[1])
+		// Match registration / curl_cffi chrome131 surface.
+		ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 	}
 	return map[string]string{
-		"Accept":          "*/*",
-		"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-		"Authorization":   "Bearer anonymous",
-		"Content-Type":    "application/json",
-		"Cookie":          "sso=" + sso + "; sso-rw=" + sso,
-		"Origin":          "https://console.x.ai",
-		"Referer":         "https://console.x.ai/",
-		"Sec-Fetch-Dest":  "empty",
-		"Sec-Fetch-Mode":  "cors",
-		"Sec-Fetch-Site":  "same-origin",
-		"User-Agent":      ua,
-		"x-cluster":       "https://us-east-1.api.x.ai",
+		"Accept":             "*/*",
+		"Accept-Language":    "en-US,en;q=0.9",
+		"Authorization":      "Bearer anonymous",
+		"Content-Type":       "application/json",
+		"Cookie":             accounts.BuildSSOCookieHeader(sso, cfCookies),
+		"Origin":             "https://console.x.ai",
+		"Referer":            "https://console.x.ai/",
+		"Sec-Ch-Ua":          `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`,
+		"Sec-Ch-Ua-Mobile":   "?0",
+		"Sec-Ch-Ua-Platform": `"Windows"`,
+		"Sec-Fetch-Dest":     "empty",
+		"Sec-Fetch-Mode":     "cors",
+		"Sec-Fetch-Site":     "same-origin",
+		"User-Agent":         ua,
+		"x-cluster":          "https://us-east-1.api.x.ai",
 	}
 }
 

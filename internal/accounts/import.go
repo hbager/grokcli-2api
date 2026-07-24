@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +18,8 @@ var ssoCookieRE = regexp.MustCompile(`(?i)(?:^|[;,\s])sso(?:-rw)?=([^;,\s]+)`)
 
 var durableFields = []string{
 	"sso", "sso_cookie", "sso_token", "session_cookies", "cookies", "cookie",
-	"set_cookie", "set-cookie", "set_cookies", "password", "register_password",
+	"set_cookie", "set-cookie", "set_cookies", "cloudflare_cookies",
+	"password", "register_password",
 	"registration_session_id", "registration_batch_id", "sso_backup_path",
 	"source", "id_token", "refresh_token",
 }
@@ -471,6 +473,138 @@ func GetSSOValue(entry map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// cloudflareCookieNames are edge cookies worth replaying with console/web SSO.
+var cloudflareCookieNames = []string{
+	"cf_clearance",
+	"__cf_bm",
+	"_cfuvid",
+	"cf_chl_2",
+	"cf_chl_prog",
+	"cf_chl_rc_i",
+	"cf_chl_rc_ni",
+	"cf_chl_rc_m",
+}
+
+func isCloudflareCookieName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "" {
+		return false
+	}
+	for _, known := range cloudflareCookieNames {
+		if n == known {
+			return true
+		}
+	}
+	// Accept future cf_* challenge cookies, but never sso*.
+	if strings.HasPrefix(n, "cf_") || strings.HasPrefix(n, "__cf") || strings.HasPrefix(n, "_cf") {
+		if strings.HasPrefix(n, "sso") {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func stringMapField(entry map[string]any, key string) map[string]string {
+	if entry == nil {
+		return nil
+	}
+	raw, ok := entry[key]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch m := raw.(type) {
+	case map[string]string:
+		out := make(map[string]string, len(m))
+		for k, v := range m {
+			k = strings.TrimSpace(k)
+			v = strings.TrimSpace(v)
+			if k != "" && v != "" {
+				out[k] = v
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]string, len(m))
+		for k, v := range m {
+			k = strings.TrimSpace(k)
+			if k == "" {
+				continue
+			}
+			s := strings.TrimSpace(fmt.Sprint(v))
+			if s == "" || s == "<nil>" {
+				continue
+			}
+			out[k] = s
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+// GetCloudflareCookies extracts CF edge cookies from dedicated or session jars.
+// cloudflare_cookies wins over session_cookies/cookies for the same name.
+func GetCloudflareCookies(entry map[string]any) map[string]string {
+	if entry == nil {
+		return nil
+	}
+	out := map[string]string{}
+	for _, key := range []string{"session_cookies", "cookies"} {
+		for name, val := range stringMapField(entry, key) {
+			if isCloudflareCookieName(name) {
+				out[name] = val
+			}
+		}
+	}
+	for name, val := range stringMapField(entry, "cloudflare_cookies") {
+		if isCloudflareCookieName(name) {
+			out[name] = val
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// BuildSSOCookieHeader builds Cookie header: sso + sso-rw + optional CF cookies.
+func BuildSSOCookieHeader(sso string, cf map[string]string) string {
+	sso = strings.TrimSpace(sso)
+	if strings.HasPrefix(strings.ToLower(sso), "sso=") {
+		sso = strings.TrimSpace(strings.SplitN(sso, "=", 2)[1])
+	}
+	parts := []string{}
+	if sso != "" {
+		parts = append(parts, "sso="+sso, "sso-rw="+sso)
+	}
+	// Stable order for tests/logs.
+	names := make([]string, 0, len(cf))
+	for name, val := range cf {
+		name = strings.TrimSpace(name)
+		val = strings.TrimSpace(val)
+		if name == "" || val == "" || !isCloudflareCookieName(name) {
+			continue
+		}
+		// never override sso via cf map
+		if strings.EqualFold(name, "sso") || strings.EqualFold(name, "sso-rw") {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		parts = append(parts, name+"="+strings.TrimSpace(cf[name]))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // DecodeJWTClaims decodes the JWT payload section without signature verification.

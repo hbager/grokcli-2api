@@ -1491,11 +1491,19 @@ func (r chatPoolFailureReporter) ReportAccountFailure(accountID, model string, e
 }
 
 func newChatService(options Options) proxy.ChatService {
+	up := upstreamClient(options)
+	consoleClient := &console.Client{}
+	if up != nil && up.HTTP != nil {
+		if tr, ok := up.HTTP.Transport.(*http.Transport); ok && tr.Proxy != nil {
+			consoleClient.Proxy = tr.Proxy
+		}
+		consoleClient.HTTP = up.HTTP
+	}
 	return proxy.ChatService{
 		Catalog:               modelCatalog(options),
-		Client:                upstreamClient(options),
-		Console:               &console.Client{HTTP: upstreamClient(options).HTTP},
-		Web:                   &web.Client{HTTP: upstreamClient(options).HTTP},
+		Client:                up,
+		Console:               consoleClient,
+		Web:                   &web.Client{HTTP: up.HTTP},
 		PickObserver:          options.PickObserver,
 		AffinityStore:         options.AffinityStore,
 		FailureReporter:       chatPoolFailureReporter{options: options},

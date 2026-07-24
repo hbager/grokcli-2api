@@ -15,6 +15,7 @@ type Candidate struct {
 	ID               string
 	Token            string
 	SSO              string // xAI SSO cookie for web/console
+	Cookies          map[string]string // optional CF edge cookies for console/web
 	Email            string
 	UserID           string
 	TeamID           string
@@ -63,13 +64,14 @@ func (c Candidate) UpstreamAccount() grok.Account {
 }
 
 func (c Candidate) ConsoleAccount() ConsoleAccount {
-	return ConsoleAccount{ID: c.ID, SSO: c.SSO}
+	return ConsoleAccount{ID: c.ID, SSO: c.SSO, Cookies: c.Cookies}
 }
 
 // ConsoleAccount is the SSO-bearing identity for console upstream.
 type ConsoleAccount struct {
-	ID  string
-	SSO string
+	ID      string
+	SSO     string
+	Cookies map[string]string // optional CF edge cookies (cf_clearance, ...)
 }
 
 func Pick(candidates []Candidate, model, mode string, now time.Time) (Candidate, error) {
