@@ -49,6 +49,10 @@ DEFAULT_SCOPES = [
     "offline_access",
     "grok-cli:access",
     "api:access",
+    "conversations:read",
+    "conversations:write",
+    "workspaces:read",
+    "workspaces:write",
 ]
 
 # CLIProxyAPI can consume xAI OAuth records as auth JSON files.  For Grok CLI /
@@ -57,7 +61,7 @@ DEFAULT_SCOPES = [
 CLIPROXYAPI_GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 CLIPROXYAPI_GROK_HEADERS = {
     "X-XAI-Token-Auth": "xai-grok-cli",
-    "x-grok-client-version": "0.2.93",
+    "x-grok-client-version": "0.2.111",
     "x-grok-client-identifier": "grok-shell",
 }
 

@@ -135,8 +135,12 @@ MODELS_CACHE = Path(
 
 # Client headers for upstream proxy (version string only — no local CLI binary)
 # Keep surface as grok-cli so cli-chat-proxy accepts the session.
-CLI_VERSION = os.getenv("GROK2API_CLI_VERSION", "0.2.93")
+# Device-flow OAuth (SSO->token) must present surface=ui + referrer=grok-build
+# to match official grok-build wire contract (chenyme/grok2api#769).
+CLI_VERSION = os.getenv("GROK2API_CLI_VERSION", "0.2.111")
 CLIENT_SURFACE = os.getenv("GROK2API_CLIENT_SURFACE", "grok-cli")
+DEVICE_CLIENT_SURFACE = os.getenv("GROK2API_DEVICE_CLIENT_SURFACE", "ui")
+OIDC_DEVICE_REFERRER = os.getenv("GROK2API_OIDC_DEVICE_REFERRER", "grok-build")
 CLIENT_IDENTIFIER = os.getenv("GROK2API_CLIENT_IDENTIFIER", "grokcli-2api")
 
 # Default model when client omits / sends generic names
@@ -238,7 +242,8 @@ OIDC_TOKEN_URL = os.getenv(
 OIDC_SCOPES = os.getenv(
     "GROK2API_OIDC_SCOPES",
     "openid profile email offline_access grok-cli:access api:access "
-    "conversations:read conversations:write",
+    "conversations:read conversations:write "
+    "workspaces:read workspaces:write",
 )
 # Email-assisted account registration.
 XAI_ACCOUNTS_URL = os.getenv("GROK2API_XAI_ACCOUNTS_URL", "https://accounts.x.ai/")

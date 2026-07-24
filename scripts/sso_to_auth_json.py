@@ -47,7 +47,15 @@ from curl_cffi import requests
 
 # Use project config when available, otherwise fall back to defaults
 try:
-    from grok2api.config import AUTH_FILE, GROK_CLI_CLIENT_ID, OIDC_ISSUER, OIDC_SCOPES
+    from grok2api.config import (
+        AUTH_FILE,
+        CLI_VERSION,
+        DEVICE_CLIENT_SURFACE,
+        GROK_CLI_CLIENT_ID,
+        OIDC_DEVICE_REFERRER,
+        OIDC_ISSUER,
+        OIDC_SCOPES,
+    )
 except Exception:  # pragma: no cover - standalone fallback
     AUTH_FILE = Path(os.getenv("GROK2API_AUTH_FILE", str(Path.home() / ".grok" / "auth.json")))
     GROK_CLI_CLIENT_ID = os.getenv("GROK2API_OIDC_CLIENT_ID", "b1a00492-073a-47ea-816f-4c329264a828")
@@ -55,10 +63,25 @@ except Exception:  # pragma: no cover - standalone fallback
     OIDC_SCOPES = os.getenv(
         "GROK2API_OIDC_SCOPES",
         "openid profile email offline_access grok-cli:access "
-        "api:access conversations:read conversations:write",
+        "api:access conversations:read conversations:write "
+        "workspaces:read workspaces:write",
     )
+    CLI_VERSION = os.getenv("GROK2API_CLI_VERSION", "0.2.111")
+    DEVICE_CLIENT_SURFACE = os.getenv("GROK2API_DEVICE_CLIENT_SURFACE", "ui")
+    OIDC_DEVICE_REFERRER = os.getenv("GROK2API_OIDC_DEVICE_REFERRER", "grok-build")
 
 AUTH_KEY = f"{OIDC_ISSUER}::{GROK_CLI_CLIENT_ID}"
+
+
+def _device_flow_headers() -> dict[str, str]:
+    """Headers required by official grok-build device OAuth wire contract."""
+    return {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "x-grok-client-version": str(CLI_VERSION or "0.2.111"),
+        "x-grok-client-surface": str(DEVICE_CLIENT_SURFACE or "ui"),
+    }
+
 
 # Serialize / throttle OIDC device-flow across concurrent registration workers.
 # xAI returns HTTP 429 slow_down / rate_limited when many device/code+verify
@@ -367,7 +390,12 @@ def request_device_code(
     registration workers enter device-flow together. Transport errors also
     retry while attempts remain (caller may switch proxy_url on hard fail).
     """
-    form = {"client_id": GROK_CLI_CLIENT_ID, "scope": OIDC_SCOPES}
+    form = {
+        "client_id": GROK_CLI_CLIENT_ID,
+        "scope": OIDC_SCOPES,
+        "referrer": OIDC_DEVICE_REFERRER,
+    }
+    device_headers = _device_flow_headers()
     timeout = _http_timeout()
     retries = _device_flow_retries()
     last_err = ""
@@ -379,7 +407,7 @@ def request_device_code(
                 r = session.post(
                     f"{OIDC_ISSUER}/oauth2/device/code",
                     data=form,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    headers=device_headers,
                     impersonate="chrome",
                     timeout=timeout,
                     **proxy_kw,
@@ -415,7 +443,7 @@ def request_device_code(
             f"{OIDC_ISSUER}/oauth2/device/code",
             data=data,
             method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers=device_headers,
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -475,6 +503,7 @@ def poll_token(
         "client_id": GROK_CLI_CLIENT_ID,
         "device_code": device_code,
     }
+    device_headers = _device_flow_headers()
     http_timeout = _http_timeout()
     proxy_kw = _proxy_kwargs(proxy_url)
     first = True
@@ -489,7 +518,7 @@ def poll_token(
                 r = session.post(
                     f"{OIDC_ISSUER}/oauth2/token",
                     data=form,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    headers=device_headers,
                     impersonate="chrome",
                     timeout=http_timeout,
                     **proxy_kw,
@@ -536,7 +565,7 @@ def poll_token(
             f"{OIDC_ISSUER}/oauth2/token",
             data=data,
             method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers=device_headers,
         )
         try:
             with urllib.request.urlopen(req, timeout=http_timeout) as resp:

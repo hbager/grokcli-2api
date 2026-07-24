@@ -18,7 +18,15 @@ from typing import Any
 import httpx
 
 from grok2api.pool.auth_store import mutate_auth_map, read_auth_map, upsert_auth_entry, write_auth_map
-from grok2api.config import GROK_CLI_CLIENT_ID, OIDC_DEVICE_URL, OIDC_SCOPES, OIDC_TOKEN_URL
+from grok2api.config import (
+    CLI_VERSION,
+    DEVICE_CLIENT_SURFACE,
+    GROK_CLI_CLIENT_ID,
+    OIDC_DEVICE_REFERRER,
+    OIDC_DEVICE_URL,
+    OIDC_SCOPES,
+    OIDC_TOKEN_URL,
+)
 
 # In-memory device sessions (server-side poll). When Redis is on, also mirrored
 # so other workers can poll status for multi-worker admin UX.
@@ -27,6 +35,16 @@ _device_sessions: dict[str, dict[str, Any]] = {}
 # Serialize refresh for same account (avoid parallel refresh_token races)
 _refresh_locks: dict[str, threading.Lock] = {}
 _refresh_locks_guard = threading.Lock()
+
+
+def _device_flow_headers() -> dict[str, str]:
+    """Official grok-build device OAuth headers (not used for refresh)."""
+    return {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "x-grok-client-version": str(CLI_VERSION or "0.2.111"),
+        "x-grok-client-surface": str(DEVICE_CLIENT_SURFACE or "ui"),
+    }
 
 
 def _device_redis() -> bool:
@@ -791,12 +809,12 @@ def start_device_authorization(
     """Start OIDC device flow; returns session for UI polling."""
     cid = client_id or GROK_CLI_CLIENT_ID
     scope = scopes or OIDC_SCOPES
-    form = {"client_id": cid, "scope": scope}
+    form = {"client_id": cid, "scope": scope, "referrer": OIDC_DEVICE_REFERRER}
     with httpx.Client(timeout=30.0) as client:
         resp = client.post(
             OIDC_DEVICE_URL,
             data=form,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers=_device_flow_headers(),
         )
         if resp.status_code >= 400:
             return {
@@ -910,7 +928,7 @@ def _device_poll_worker(session_id: str) -> None:
                 resp = client.post(
                     OIDC_TOKEN_URL,
                     data=form,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    headers=_device_flow_headers(),
                 )
                 try:
                     body = resp.json()
