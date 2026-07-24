@@ -696,19 +696,34 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 		}
 		detailMap := decodeMap(detail)
 		reasoningEffort := ""
+		upstreamModel := ""
+		thinkingIntensity := ""
 		if detailMap != nil {
 			if v, ok := detailMap["reasoning_effort"].(string); ok {
 				reasoningEffort = strings.TrimSpace(v)
 			}
+			if v, ok := detailMap["thinking_intensity"].(string); ok {
+				thinkingIntensity = strings.TrimSpace(v)
+			}
 			if reasoningEffort == "" {
-				if v, ok := detailMap["thinking_intensity"].(string); ok {
-					reasoningEffort = strings.TrimSpace(v)
+				reasoningEffort = thinkingIntensity
+			}
+			if thinkingIntensity == "" {
+				thinkingIntensity = reasoningEffort
+			}
+			if v, ok := detailMap["upstream_model"].(string); ok {
+				upstreamModel = strings.TrimSpace(v)
+			}
+			// Prefer public model from detail when column was filled with upstream name.
+			if v, ok := detailMap["model"].(string); ok {
+				if s := strings.TrimSpace(v); s != "" {
+					model = &s
 				}
 			}
 		}
 		items = append(items, map[string]any{
 			"id": id, "created_at": unixOrNil(createdAt), "api_key_id": stringPtr(apiKeyID), "account_id": stringPtr(accountID),
-			"model": stringPtr(model), "protocol": stringPtr(protocol), "path": stringPtr(path),
+			"model": stringPtr(model), "upstream_model": nullIfEmpty(upstreamModel), "protocol": stringPtr(protocol), "path": stringPtr(path),
 			// Always a concrete bool so admin 模式 column never receives null (empty cell).
 			"stream":        stream != nil && *stream,
 			"ok":            boolPtr(okValue),
@@ -716,8 +731,9 @@ func (c *Connector) UsageEvents(ctx context.Context, page, pageSize int, filters
 			"billed_tokens": max64(0, totalTok-cacheRead), "prompt_tokens_billed": max64(0, prompt-cacheRead),
 			"cache_creation_tokens": cacheCreate, "reasoning_tokens": reasoning, "client_ip": stringPtr(clientIP), "user_agent": stringPtr(userAgent),
 			"status_code": intPtr(statusCode), "latency_ms": intPtr(latency), "ttft_ms": intPtr(ttft), "error": stringPtr(errText), "detail": detailMap,
-			"reasoning_effort": reasoningEffort,
-			"api_key_name":     stringPtr(keyName), "api_key_prefix": stringPtr(keyPrefix), "account_email": stringPtr(accountEmail),
+			"reasoning_effort":   reasoningEffort,
+			"thinking_intensity": thinkingIntensity,
+			"api_key_name":       stringPtr(keyName), "api_key_prefix": stringPtr(keyPrefix), "account_email": stringPtr(accountEmail),
 		})
 	}
 	return map[string]any{
@@ -998,4 +1014,12 @@ func clamp(value, min, max, fallback int) int {
 		return max
 	}
 	return value
+}
+
+
+func nullIfEmpty(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return strings.TrimSpace(s)
 }

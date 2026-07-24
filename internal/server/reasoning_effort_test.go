@@ -45,3 +45,43 @@ func TestExtractReasoningEffort(t *testing.T) {
 		}
 	}
 }
+
+func TestUsageDetailRecordsPublicModelUpstreamAndFixedEffort(t *testing.T) {
+	// Alias forces xhigh even when request body has no effort field.
+	d := usageDetail("go_chat", map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, 12, 100, "console/grok-4.20-multi-agent-xhigh")
+	if d["upstream_model"] != "grok-4.20-multi-agent" {
+		t.Fatalf("upstream_model=%v", d["upstream_model"])
+	}
+	if d["model"] != "console/grok-4.20-multi-agent-xhigh" {
+		t.Fatalf("model=%v", d["model"])
+	}
+	if d["reasoning_effort"] != "xhigh" || d["thinking_intensity"] != "xhigh" {
+		t.Fatalf("effort fields=%#v", d)
+	}
+	if d["provider"] != "console" {
+		t.Fatalf("provider=%v", d["provider"])
+	}
+}
+
+func TestUsageDetailRequestEffortWinsOverEmptyFixed(t *testing.T) {
+	d := usageDetail("go_chat", map[string]any{
+		"reasoning_effort": "high",
+		"messages":         []any{},
+	}, 0, 50, "grok-4.5")
+	if d["reasoning_effort"] != "high" || d["thinking_intensity"] != "high" {
+		t.Fatalf("%#v", d)
+	}
+	if d["upstream_model"] != "grok-4.5" {
+		t.Fatalf("upstream=%v", d["upstream_model"])
+	}
+}
+
+func TestUsageDetailFixedEffortWinsWhenBodyOmitsEffort(t *testing.T) {
+	// Body may still carry unrelated fields; fixed route effort must fill logs.
+	d := usageDetail("go_chat", map[string]any{"stream": true}, 1, 2, "console/grok-4.20-multi-agent-xhigh")
+	if d["reasoning_effort"] != "xhigh" {
+		t.Fatalf("want fixed xhigh, got %#v", d)
+	}
+}

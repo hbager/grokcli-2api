@@ -767,7 +767,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 			if !ok {
 				status = http.StatusBadGateway
 			}
-			recordChatUsageWithHint(r, options, apiKey, opened.AccountID, opened.Model, chatReq.Stream, ok, status, started, stats.Usage, err, stats.FirstTokenMS, chatReq.Raw, stats.CompletionHint)
+			recordChatUsageWithHint(r, options, apiKey, opened.AccountID, chatReq.Model, chatReq.Stream, ok, status, started, stats.Usage, err, stats.FirstTokenMS, chatReq.Raw, stats.CompletionHint)
 			reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
 			return
 		}
@@ -795,7 +795,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		// Default shell-family tools to cmd even without an explicit map.
 		projectChatPayloadShellArgs(result.Payload, nil)
 	}
-	recordChatUsage(r, options, apiKey, result.AccountID, result.Model, chatReq.Stream, true, http.StatusOK, started, result.Usage, nil, 0, chatReq.Raw)
+	recordChatUsage(r, options, apiKey, result.AccountID, chatReq.Model, chatReq.Stream, true, http.StatusOK, started, result.Usage, nil, 0, chatReq.Raw)
 	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, result.Model)
 	setProtocolObservationHeaders(w, protocolObservation{
 		Protocol: "openai_chat", AccountID: result.AccountID, PreferAccount: result.PreferAccount,
@@ -1325,7 +1325,7 @@ func recordChatUsageWithHint(r *http.Request, options Options, apiKey *auth.APIK
 		v := ttftMS
 		ttftPtr = &v
 	}
-	detail := usageDetail("go_chat", requestBody, ttftMS, latency)
+	detail := usageDetail("go_chat", requestBody, ttftMS, latency, model)
 	if completionHint > 0 {
 		detail["streamer_estimate_tokens"] = completionHint
 		// Ensure admin surfaces completion as estimated when only streamer/hint filled it.
@@ -2424,7 +2424,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		// Hollow / half-open function_call streams return empty error from the
 		// stream function (ClientDeliveryOK). Zero usage tokens alone are not a
 		// failure — xAI often omits usage on short tool turns.
-		recordResponsesUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS, raw)
+		recordResponsesUsage(r, options, apiKey, opened.AccountID, model, true, ok, status, started, usage, err, firstTokenMS, raw)
 		reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
 		return
 	}
@@ -2439,7 +2439,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		writeOpenAIProxyError(w, err)
 		return
 	}
-	recordResponsesUsage(r, options, apiKey, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil, 0, raw)
+	recordResponsesUsage(r, options, apiKey, result.AccountID, model, false, true, http.StatusOK, started, result.Usage, nil, 0, raw)
 	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, result.Model)
 	content, reasoning, _, _, toolCalls := anthropicCompletionParts(result.Payload)
 	bindResponseAffinity(r.Context(), options, responseID, result.AccountID, result.Model, pck)
@@ -2711,11 +2711,7 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 		v := ttftMS
 		ttftPtr = &v
 	}
-	detail := map[string]any{"route": "go_responses"}
-	if effort := extractReasoningEffort(requestBody); effort != "" {
-		detail["reasoning_effort"] = effort
-		detail["thinking_intensity"] = effort
-	}
+	detail := usageDetail("go_responses", requestBody, ttftMS, latency, model)
 	if ttftMS > 0 {
 		detail["ttft_ms"] = ttftMS
 	}
@@ -3839,7 +3835,7 @@ func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 				TTFTMS:              ttftPtr,
 				Error:               errText,
 				Detail: func() map[string]any {
-					d := usageDetail("go_messages", requestBody, ttftMS, latency)
+					d := usageDetail("go_messages", requestBody, ttftMS, latency, model)
 					if !ok && (prompt+completion+total) == 0 {
 						d["empty_payload"] = true
 						if cause != nil {
@@ -8579,12 +8575,42 @@ func ensureLocalModelExtras(items []map[string]any, defaultModel string) []map[s
 	return items
 }
 
-func usageDetail(route string, requestBody map[string]any, ttftMS, latency int) map[string]any {
+// usageDetail builds per-request usage detail for admin logs.
+// publicModel is the client-facing id (e.g. console/grok-4.20-multi-agent-xhigh).
+// When the request body omits effort, route fixed effort (multi-agent xhigh) is used
+// so logs can prove 16-agent mode.
+func usageDetail(route string, requestBody map[string]any, ttftMS, latency int, publicModel string) map[string]any {
 	detail := map[string]any{"route": route, "latency_ms": latency}
 	if ttftMS > 0 {
 		detail["ttft_ms"] = ttftMS
 	}
-	if effort := extractReasoningEffort(requestBody); effort != "" {
+	publicModel = strings.TrimSpace(publicModel)
+	routeInfo := provider.ResolveRoute(publicModel, "grok-4.5")
+	if publicModel != "" {
+		detail["model"] = publicModel
+	} else if routeInfo.PublicID != "" {
+		detail["model"] = routeInfo.PublicID
+	}
+	upstream := strings.TrimSpace(routeInfo.Upstream)
+	if upstream == "" {
+		upstream = publicModel
+	}
+	if upstream != "" {
+		detail["upstream_model"] = upstream
+	}
+	if routeInfo.Provider != "" {
+		detail["provider"] = string(routeInfo.Provider)
+	}
+	effort := extractReasoningEffort(requestBody)
+	if effort == "" {
+		effort = strings.TrimSpace(routeInfo.ReasoningEffort)
+	}
+	// If body still has nested reasoning after route force, prefer explicit route force
+	// for fixed-effort aliases so admin matches what console actually sent.
+	if fixed := strings.TrimSpace(routeInfo.ReasoningEffort); fixed != "" {
+		effort = fixed
+	}
+	if effort != "" {
 		detail["reasoning_effort"] = effort
 		detail["thinking_intensity"] = effort
 	}
