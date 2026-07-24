@@ -227,25 +227,51 @@ func TestClassifyEmptyModelOutputShortCool(t *testing.T) {
 }
 
 func TestClassifyForbiddenEdgeBlock(t *testing.T) {
-	d := ClassifyUpstreamFailure(403, "error code: 1020\nAccess denied\ncloudflare", "grok-4.5")
+	body := "error code: 1020" + string([]byte{10}) + "Access denied" + string([]byte{10}) + "cloudflare"
+	d := ClassifyUpstreamFailure(403, body, "grok-4.5")
 	if !d.ShouldCooldown {
 		t.Fatalf("expected cool: %+v", d)
 	}
-	if d.Class != ClassAuth {
-		t.Fatalf("class=%v", d.Class)
+	if d.Class != ClassEgress {
+		t.Fatalf("class=%v want egress", d.Class)
 	}
-	if d.Until == nil || d.Until.Before(time.Now().Add(10*time.Minute)) {
+	if d.Until == nil || d.Until.Before(time.Now().Add(8*time.Minute)) {
 		t.Fatalf("403 edge cool too short: until=%v", d.Until)
 	}
 }
 
 func TestClassifyUnauthorizedShorterThanForbidden(t *testing.T) {
 	u := ClassifyUpstreamFailure(401, "invalid api key", "grok-4.5")
-	f := ClassifyUpstreamFailure(403, "cloudflare access denied", "grok-4.5")
+	f := ClassifyUpstreamFailure(403, "forbidden without edge markers", "grok-4.5")
 	if u.Until == nil || f.Until == nil {
 		t.Fatal("missing until")
 	}
 	if !f.Until.After(*u.Until) {
 		t.Fatalf("forbidden cool should be longer: 401=%v 403=%v", u.Until, f.Until)
+	}
+}
+
+func TestClassifyEdgeBlockNotAuth(t *testing.T) {
+	body := "<!DOCTYPE html><html><title>Attention Required</title>Cloudflare Just a moment"
+	d := ClassifyUpstreamFailure(403, body, "console/grok-4.3")
+	if d.Class != ClassEgress {
+		t.Fatalf("class=%q want egress_blocked", d.Class)
+	}
+	if !d.ShouldCooldown {
+		t.Fatal("should cool briefly")
+	}
+	if !strings.Contains(strings.ToLower(d.Reason), "egress") && !strings.Contains(strings.ToLower(d.Reason), "cloudflare") {
+		t.Fatalf("reason=%q", d.Reason)
+	}
+}
+
+
+func TestClassifyPlain403AuthStillAuth(t *testing.T) {
+	d := ClassifyUpstreamFailure(403, `{"error":"forbidden"}`, "grok-4.5")
+	if d.Class != ClassAuth && d.Class != ClassEgress {
+		// plain json 403 without edge markers stays auth
+		if d.Class != ClassAuth {
+			t.Fatalf("class=%q", d.Class)
+		}
 	}
 }

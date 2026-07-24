@@ -18,6 +18,8 @@ const (
 	ClassFreeUsage     FailureClass = "subscription:free-usage-exhausted"
 	ClassRateLimit     FailureClass = "rate_limit"
 	ClassAuth          FailureClass = "auth_error"
+	// ClassEgress is Cloudflare/WAF/edge block — not a dead SSO/token.
+	ClassEgress        FailureClass = "egress_blocked"
 	ClassServer        FailureClass = "server_error"
 	ClassModelCapacity FailureClass = "model_capacity"
 	ClassBilling       FailureClass = "billing_quota"
@@ -199,27 +201,33 @@ func ClassifyUpstreamFailure(status int, errText string, requestedModel ...strin
 		}
 	}
 
-	// Auth / WAF / edge block — cool so the picker stops re-using the same token
-	// against a 403 wall (Cloudflare / edge bans heat up with rapid retries).
-	if status == http.StatusUnauthorized || status == http.StatusForbidden || isAuthText(low) || isEdgeBlockText(low) {
-		// 403 / Cloudflare-like: longer cool. 401 token issues: moderate cool.
+	// Edge / WAF / Cloudflare first — do NOT treat as token/SSO death.
+	// Console/web 403 HTML challenges are egress problems; account may still be fine on build.
+	if isEdgeBlockText(low) || (status == http.StatusForbidden && looksLikeHTMLBlock(text)) {
+		until := time.Now().Add(12 * time.Minute)
+		return CooldownDecision{
+			Class:          ClassEgress,
+			Code:           string(ClassEgress),
+			Until:          &until,
+			ShouldCooldown: true,
+			BlockModel:     false,
+			Reason:         firstNonEmpty(summarizeEdgeBlock(text), "console/web blocked by cloudflare (egress)"),
+		}
+	}
+
+	// Auth / forbidden without edge HTML — short cool (possible SSO/token issue).
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || isAuthText(low) {
 		cool := 8 * time.Minute
-		if status == http.StatusUnauthorized && !isEdgeBlockText(low) {
+		if status == http.StatusUnauthorized {
 			cool = 3 * time.Minute
-		} else if status == http.StatusForbidden || isEdgeBlockText(low) {
-			cool = 15 * time.Minute
 		}
 		until := time.Now().Add(cool)
-		reason := "auth error"
-		if status == http.StatusForbidden || isEdgeBlockText(low) {
-			reason = "edge/waf blocked (403)"
-		}
 		return CooldownDecision{
 			Class:          ClassAuth,
 			Code:           string(ClassAuth),
 			Until:          &until,
 			ShouldCooldown: true,
-			Reason:         firstNonEmpty(text, reason),
+			Reason:         firstNonEmpty(text, "auth error"),
 		}
 	}
 
@@ -508,6 +516,35 @@ func isEdgeBlockText(low string) bool {
 		strings.Contains(low, "error 1006") ||
 		strings.Contains(low, "403 forbidden") ||
 		strings.Contains(low, "http 403")
+}
+
+
+func looksLikeHTMLBlock(text string) bool {
+	low := strings.ToLower(text)
+	return strings.Contains(low, "<!doctype html") ||
+		strings.Contains(low, "<html") ||
+		strings.Contains(low, "cloudflare") ||
+		strings.Contains(low, "attention required") ||
+		strings.Contains(low, "just a moment") ||
+		strings.Contains(low, "you have been blocked")
+}
+
+// summarizeEdgeBlock collapses CF HTML into a short operator-facing reason.
+func summarizeEdgeBlock(text string) string {
+	low := strings.ToLower(text)
+	switch {
+	case strings.Contains(low, "you have been blocked"), strings.Contains(low, "unable to access"):
+		return "blocked by cloudflare (egress)"
+	case strings.Contains(low, "just a moment"), strings.Contains(low, "attention required"):
+		return "cloudflare challenge (egress)"
+	case strings.Contains(low, "cloudflare"), strings.Contains(low, "cf-ray"):
+		return "cloudflare edge block (egress)"
+	default:
+		if looksLikeHTMLBlock(text) {
+			return "html edge block (egress)"
+		}
+		return ""
+	}
 }
 
 func freeUsageCooldownDuration(low string) time.Duration {

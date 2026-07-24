@@ -16,7 +16,8 @@ func TestCandidateEligibility(t *testing.T) {
 		want bool
 	}{
 		{"ok", Candidate{ID: "a", Token: "tok", Enabled: true}, true},
-		{"missing token", Candidate{ID: "a", Enabled: true}, false},
+		{"missing token and sso", Candidate{ID: "a", Enabled: true}, false},
+		{"sso only", Candidate{ID: "a", SSO: "sso", Enabled: true}, true},
 		{"disabled", Candidate{ID: "a", Token: "tok", Enabled: false}, false},
 		{"quota", Candidate{ID: "a", Token: "tok", Enabled: true, DisabledForQuota: true}, false},
 		{"expired", Candidate{ID: "a", Token: "tok", Enabled: true, ExpiresAt: &past}, false},
@@ -69,5 +70,24 @@ func TestModelBlockedObjectUntil(t *testing.T) {
 	// other model not blocked
 	if modelBlocked(blocked, "grok-3", now) {
 		t.Fatal("unrelated model should not block")
+	}
+}
+
+func TestAuthEligible(t *testing.T) {
+	tok := Candidate{ID: "a", Token: "t", Enabled: true}
+	sso := Candidate{ID: "b", SSO: "s", Enabled: true}
+	both := Candidate{ID: "c", Token: "t", SSO: "s", Enabled: true}
+	if !tok.AuthEligible("token") || tok.AuthEligible("sso") {
+		t.Fatal("token-only auth surface")
+	}
+	if !sso.AuthEligible("sso") || sso.AuthEligible("token") {
+		t.Fatal("sso-only auth surface")
+	}
+	if !both.AuthEligible("token") || !both.AuthEligible("sso") {
+		t.Fatal("both surfaces")
+	}
+	got := FilterByAuth([]Candidate{tok, sso, both}, "sso")
+	if len(got) != 2 {
+		t.Fatalf("filter sso len=%d", len(got))
 	}
 }

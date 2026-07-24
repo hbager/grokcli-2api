@@ -1089,3 +1089,13 @@ func clampGrokEffort(effort string) string {
 	// Unknown non-empty → medium (safe middle) rather than pass-through garbage.
 	return "medium"
 }
+
+// ChatToResponsesPayload is the exported alias for multi-provider clients (console).
+func ChatToResponsesPayload(body map[string]any, model string) map[string]any {
+	return chatToResponsesPayload(body, model)
+}
+
+// ResponsesToChatStream is the exported alias for multi-provider clients (console).
+func ResponsesToChatStream(body io.ReadCloser) io.ReadCloser {
+	return responsesToChatStream(body)
+}

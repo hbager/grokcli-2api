@@ -30,6 +30,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/maintainer"
 	"github.com/hm2899/grokcli-2api/internal/modelhealth"
 	"github.com/hm2899/grokcli-2api/internal/models"
+	"github.com/hm2899/grokcli-2api/internal/provider"
 	"github.com/hm2899/grokcli-2api/internal/pool"
 	"github.com/hm2899/grokcli-2api/internal/protocol/anthropic"
 	"github.com/hm2899/grokcli-2api/internal/protocol/historycompact"
@@ -41,6 +42,8 @@ import (
 	regclient "github.com/hm2899/grokcli-2api/internal/registration/client"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/store/redis"
+	"github.com/hm2899/grokcli-2api/internal/upstream/console"
+	"github.com/hm2899/grokcli-2api/internal/upstream/web"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 )
 
@@ -1491,6 +1494,8 @@ func newChatService(options Options) proxy.ChatService {
 	return proxy.ChatService{
 		Catalog:               modelCatalog(options),
 		Client:                upstreamClient(options),
+		Console:               &console.Client{HTTP: upstreamClient(options).HTTP},
+		Web:                   &web.Client{HTTP: upstreamClient(options).HTTP},
 		PickObserver:          options.PickObserver,
 		AffinityStore:         options.AffinityStore,
 		FailureReporter:       chatPoolFailureReporter{options: options},
@@ -1624,6 +1629,12 @@ func openAIErrorFromCause(err error) (message, errorType string) {
 	if errors.As(err, &upstream) && upstream != nil {
 		if strings.TrimSpace(upstream.Body) != "" {
 			message = preferAnthropicErrorBody(upstream.Body)
+		}
+		// Collapse CF HTML for console/web into a short egress reason.
+		if decision := pool.ClassifyUpstreamFailure(upstream.Status, message); decision.Class == pool.ClassEgress {
+			message = firstNonEmptyStr(decision.Reason, "blocked by cloudflare (egress)")
+			errorType = "server_error"
+			return message, errorType
 		}
 		status := mapUpstreamStatusToOpenAI(upstream.Status)
 		errorType = openAIErrorTypeForStatus(status)
@@ -4311,12 +4322,17 @@ func serveAdminModels(w http.ResponseWriter, r *http.Request, options Options) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
 		return
 	}
+	data := modelCatalog(options).PublicModels(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object":        "list",
-		"data":          modelCatalog(options).PublicModels(r.Context()),
+		"data":          data,
 		"default_model": options.runtimeConfig().DefaultModel,
 		"storage":       "postgres",
-		"meta":          map[string]any{},
+		"providers":     []string{"build", "web", "console"},
+		"meta": map[string]any{
+			"phase": "1-catalog",
+			"note":  "web/console are static catalogs; build is remote cli-chat-proxy",
+		},
 	})
 }
 
@@ -8517,6 +8533,10 @@ func parseUpstreamModels(payload any) []map[string]any {
 				item[key] = v
 			}
 		}
+		if _, ok := item["provider"]; !ok {
+			item["provider"] = "build"
+			item["auth"] = "token"
+		}
 		items = append(items, item)
 	}
 	return items
@@ -8533,9 +8553,9 @@ func ensureLocalModelExtras(items []map[string]any, defaultModel string) []map[s
 		}
 	}
 	extras := []map[string]any{
-		{"id": defaultModel, "name": defaultModel, "owned_by": "xai"},
-		{"id": "grok-build", "name": "Grok Build", "description": "Grok coding / build model (cli-chat-proxy)", "owned_by": "xai", "synthetic": true},
-		{"id": "grok-search", "name": "Grok Search", "description": "Grok with web search enabled (local alias)", "owned_by": "xai", "synthetic": true},
+		{"id": defaultModel, "name": defaultModel, "owned_by": "xai", "provider": "build", "auth": "token"},
+		{"id": "grok-build", "name": "Grok Build", "description": "Grok coding / build model (cli-chat-proxy)", "owned_by": "xai", "synthetic": true, "provider": "build", "auth": "token"},
+		{"id": "grok-search", "name": "Grok Search", "description": "Grok with web search enabled (local alias)", "owned_by": "xai", "synthetic": true, "provider": "build", "auth": "token"},
 	}
 	for _, ex := range extras {
 		id := strings.ToLower(stringValue(ex["id"]))
@@ -8545,6 +8565,9 @@ func ensureLocalModelExtras(items []map[string]any, defaultModel string) []map[s
 		items = append(items, ex)
 		have[id] = true
 	}
+	// Phase 1: fold static web/console catalogs into every fetch/save/sync path.
+	items = provider.TagBuildProvider(items)
+	items = provider.MergeStaticInto(items)
 	return items
 }
 

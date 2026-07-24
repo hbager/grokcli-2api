@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hm2899/grokcli-2api/internal/accounts"
 	"github.com/hm2899/grokcli-2api/internal/pool"
 	"golang.org/x/sync/singleflight"
 )
@@ -57,13 +58,14 @@ func (c *Connector) GetPoolCandidate(ctx context.Context, accountID string) (*po
 	}
 	payload := decodeMap(payloadBytes)
 	candidate.Token, _ = firstString(payload, "key", "access_token", "token")
+	candidate.SSO = accounts.GetSSOValue(payload)
 	candidate.Email = stringValue(email, stringFromMap(payload, "email"))
 	candidate.UserID = stringValue(userID, firstMapString(payload, "user_id", "principal_id"))
 	candidate.TeamID = stringValue(teamID, stringFromMap(payload, "team_id"))
 	candidate.ExpiresAt = expiresAt
 	candidate.CooldownUntil = cooldownUntil
 	candidate.BlockedModels = decodeMap(blockedBytes)
-	if strings.TrimSpace(candidate.Token) == "" {
+	if strings.TrimSpace(candidate.Token) == "" && strings.TrimSpace(candidate.SSO) == "" {
 		return nil, nil
 	}
 	return &candidate, nil
@@ -106,6 +108,10 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 			        COALESCE(a.payload->>'key', '') <> ''
 			     OR COALESCE(a.payload->>'access_token', '') <> ''
 			     OR COALESCE(a.payload->>'token', '') <> ''
+			     OR NULLIF(btrim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL
+			     OR NULLIF(btrim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL
+			     OR NULLIF(btrim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL
+			     OR NULLIF(btrim(COALESCE(a.payload#>>'{session_cookies,sso}','')), '') IS NOT NULL
 			  )
 			ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.fail_count, 0) ASC, COALESCE(ap.request_count, 0) ASC, a.id ASC
 			LIMIT 48`)
@@ -124,13 +130,14 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 			}
 			payload := decodeMap(payloadBytes)
 			candidate.Token, _ = firstString(payload, "key", "access_token", "token")
+			candidate.SSO = accounts.GetSSOValue(payload)
 			candidate.Email = stringValue(email, stringFromMap(payload, "email"))
 			candidate.UserID = stringValue(userID, firstMapString(payload, "user_id", "principal_id"))
 			candidate.TeamID = stringValue(teamID, stringFromMap(payload, "team_id"))
 			candidate.ExpiresAt = expiresAt
 			candidate.CooldownUntil = cooldownUntil
 			candidate.BlockedModels = decodeMap(blockedBytes)
-			if strings.TrimSpace(candidate.Token) != "" {
+			if strings.TrimSpace(candidate.Token) != "" || strings.TrimSpace(candidate.SSO) != "" {
 				out = append(out, candidate)
 			}
 		}

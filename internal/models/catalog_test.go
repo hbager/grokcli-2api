@@ -43,10 +43,26 @@ func TestFallbackModelsIncludePythonExtras(t *testing.T) {
 		id, _ := item["id"].(string)
 		ids[id] = true
 	}
-	for _, id := range []string{"grok-4.5", "grok-build", "grok-search"} {
+	for _, id := range []string{"grok-4.5", "grok-build", "grok-search", "web/grok-chat-fast", "console/grok-4.3"} {
 		if !ids[id] {
 			t.Fatalf("missing model %s in %#v", id, items)
 		}
+	}
+}
+
+func TestResolveRouteMultiProvider(t *testing.T) {
+	catalog := NewCatalog(config.Config{DefaultModel: "grok-4.5"}, nil)
+	r := catalog.ResolveRoute("web/grok-chat-fast")
+	if r.Provider != "web" || r.Upstream != "grok-chat-fast" || r.Auth != "sso" {
+		t.Fatalf("web route=%+v", r)
+	}
+	r = catalog.ResolveRoute("console/grok-4.3")
+	if r.Provider != "console" || r.Upstream != "grok-4.3" {
+		t.Fatalf("console route=%+v", r)
+	}
+	r = catalog.ResolveRoute("gpt-4o")
+	if r.Provider != "build" || r.Upstream != "grok-4.5" {
+		t.Fatalf("build alias route=%+v", r)
 	}
 }
 

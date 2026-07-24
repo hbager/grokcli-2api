@@ -18,6 +18,9 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/pool"
 	"github.com/hm2899/grokcli-2api/internal/protocol/anthropic"
 	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
+	"github.com/hm2899/grokcli-2api/internal/provider"
+	"github.com/hm2899/grokcli-2api/internal/upstream/console"
+	"github.com/hm2899/grokcli-2api/internal/upstream/web"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 )
 
@@ -32,6 +35,8 @@ type AccountFailureReporter interface {
 type ChatService struct {
 	Catalog       *models.Catalog
 	Client        *grok.Client
+	Console       *console.Client // Phase 2: SSO console upstream
+	Web           *web.Client     // Phase 3: SSO web chat upstream
 	Now           func() time.Time
 	PickObserver  PickObserver
 	AffinityStore AffinityStore
@@ -151,7 +156,8 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 	if err != nil {
 		return ChatResult{}, err
 	}
-	accounts := upstreamAccounts(chain)
+	route := s.resolveRoute(request)
+	_ = client
 	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
 	ensureUpstreamCacheKey(body, request)
 	fingerprint := ChatFingerprint(request)
@@ -162,31 +168,31 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		prefer = chain[0].ID
 	}
 	first := ""
-	if len(accounts) > 0 {
-		first = accounts[0].ID
+	if len(chain) > 0 {
+		first = chain[0].ID
 	}
 	var lastEmpty error
 	lastFailAccountID := ""
 	stickyFirst := s.StickyFirstOnly
 	if !stickyFirst {
-		stickyFirst = prefer != "" && first != "" && prefer == first && len(accounts) > 1
+		stickyFirst = prefer != "" && first != "" && prefer == first && len(chain) > 1
 	}
 	// stickyMissID defers pin clear until a later account actually succeeds.
 	stickyMissID := ""
-	for i, account := range accounts {
-		s.markAttempt(ctx, account.ID)
-		attempt, err := OpenWithFailover(ctx, client, []grok.Account{account}, model, body, &CommitState{})
+	for i, candidate := range chain {
+		s.markAttempt(ctx, candidate.ID)
+		accountID, rc, err := s.openAccountAttempt(ctx, candidate, route, body)
 		if err != nil {
 			// Intermediate + final losers: report so free-usage / 额度用完 bodies
 			// enter the cooldown pool even when a later account succeeds.
-			s.reportAccountFailure(account.ID, model, err)
-			s.releasePick(ctx, account.ID)
-			lastFailAccountID = account.ID
+			s.reportAccountFailure(accountID, model, err)
+			s.releasePick(ctx, accountID)
+			lastFailAccountID = accountID
 			if stickyFirst && i == 0 && shouldDropStickyPin(err) {
-				stickyMissID = account.ID
+				stickyMissID = accountID
 			}
 			// Retryable/non-retryable both continue within short chain until exhausted.
-			if i == len(accounts)-1 {
+			if i == len(chain)-1 {
 				if lastEmpty != nil {
 					return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: lastFailAccountID}, lastEmpty
 				}
@@ -196,33 +202,33 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		}
 		collector := newChatCollector(model)
 		collector.SetAllowedTools(extractAllowedToolNames(request.Raw))
-		readErr := grok.ReadSSE(attempt.Body, collector.feed)
-		_ = attempt.Body.Close()
+		readErr := grok.ReadSSE(rc, collector.feed)
+		_ = rc.Close()
 		if readErr != nil {
-			s.reportAccountFailure(attempt.Account.ID, model, readErr)
-			s.releasePick(ctx, attempt.Account.ID)
-			return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, readErr
+			s.reportAccountFailure(accountID, model, readErr)
+			s.releasePick(ctx, accountID)
+			return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, readErr
 		}
 		if !collector.emptyModelOutput() {
-			failover := first != "" && attempt.Account.ID != first
+			failover := first != "" && accountID != first
 			// Only drop sticky pin once we know a different account produced live output.
 			if failover && stickyMissID != "" {
 				s.noteStickyOutcome(ctx, request, stickyMissID, false)
 			}
 			// Always pin the live account so multi-turn cache stays on the healthy row.
-			s.bindAffinity(ctx, request, attempt.Account.ID)
+			s.bindAffinity(ctx, request, accountID)
 			return ChatResult{
-				Payload: collector.response(), AccountID: attempt.Account.ID, Model: collector.model, Usage: collector.usage, PickHeld: true,
+				Payload: collector.response(), AccountID: accountID, Model: collector.model, Usage: collector.usage, PickHeld: true,
 				PreferAccount: prefer, FirstAccount: first, Failover: failover,
 				Fingerprint: fingerprint, Accounts: len(chain), Prep: prep,
 			}, nil
 		}
 		lastEmpty = &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
-		s.reportAccountFailure(attempt.Account.ID, model, lastEmpty)
-		s.releasePick(ctx, attempt.Account.ID)
-		lastFailAccountID = attempt.Account.ID
+		s.reportAccountFailure(accountID, model, lastEmpty)
+		s.releasePick(ctx, accountID)
+		lastFailAccountID = accountID
 		if stickyFirst && i == 0 {
-			stickyMissID = account.ID
+			stickyMissID = candidate.ID
 		}
 	}
 	if lastEmpty == nil {
@@ -273,7 +279,8 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 	if err != nil {
 		return StreamOpen{}, err
 	}
-	accounts := upstreamAccounts(chain)
+	route := s.resolveRoute(request)
+	_ = client
 	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
 	ensureUpstreamCacheKey(body, request)
 	fingerprint := ChatFingerprint(request)
@@ -284,13 +291,13 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 		prefer = chain[0].ID
 	}
 	first := ""
-	if len(accounts) > 0 {
-		first = accounts[0].ID
+	if len(chain) > 0 {
+		first = chain[0].ID
 	}
 	// Sticky-first: try preferred/first account alone before spending TTFT on failover chain.
 	stickyFirst := s.StickyFirstOnly
 	if !stickyFirst {
-		stickyFirst = prefer != "" && first != "" && prefer == first && len(accounts) > 1
+		stickyFirst = prefer != "" && first != "" && prefer == first && len(chain) > 1
 	}
 
 	meta := StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep}
@@ -298,27 +305,27 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 
 	// openOne tries a single account: dial + empty-stream peek.
 	// On success returns a live guarded body. On empty/error releases pick and returns ok=false.
-	openOne := func(account grok.Account) (StreamOpen, bool, error) {
-		s.markAttempt(ctx, account.ID)
-		attempt, err := OpenWithFailover(ctx, client, []grok.Account{account}, model, body, &CommitState{})
+	openOneCandidate := func(candidate pool.Candidate) (StreamOpen, bool, error) {
+		s.markAttempt(ctx, candidate.ID)
+		accountID, rc, err := s.openAccountAttempt(ctx, candidate, route, body)
 		if err != nil {
-			s.reportAccountFailure(account.ID, model, err)
-			s.releasePick(ctx, account.ID)
-			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: account.ID}, false, err
+			s.reportAccountFailure(accountID, model, err)
+			s.releasePick(ctx, accountID)
+			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, false, err
 		}
-		guarded, empty, err := guardStreamAgainstEmpty(attempt.Body)
+		guarded, empty, err := guardStreamAgainstEmpty(rc)
 		if err != nil {
-			_ = attempt.Body.Close()
-			s.reportAccountFailure(attempt.Account.ID, model, err)
-			s.releasePick(ctx, account.ID)
-			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, false, err
+			_ = rc.Close()
+			s.reportAccountFailure(accountID, model, err)
+			s.releasePick(ctx, accountID)
+			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, false, err
 		}
 		if empty {
 			_ = guarded.Close()
-			s.releasePick(ctx, account.ID)
+			s.releasePick(ctx, accountID)
 			emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
-			s.reportAccountFailure(attempt.Account.ID, model, emptyErr)
-			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, false, emptyErr
+			s.reportAccountFailure(accountID, model, emptyErr)
+			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, false, emptyErr
 		}
 		// Silence-pass may still hollow-end empty (Claude high-effort). Confirm briefly
 		// before binding sticky / returning live to streamAnthropic.
@@ -327,50 +334,50 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 			if guarded != nil {
 				_ = guarded.Close()
 			}
-			s.reportAccountFailure(attempt.Account.ID, model, err)
-			s.releasePick(ctx, account.ID)
-			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, false, err
+			s.reportAccountFailure(accountID, model, err)
+			s.releasePick(ctx, accountID)
+			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, false, err
 		}
 		if empty {
 			if guarded != nil {
 				_ = guarded.Close()
 			}
-			s.releasePick(ctx, account.ID)
+			s.releasePick(ctx, accountID)
 			emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
-			s.reportAccountFailure(attempt.Account.ID, model, emptyErr)
-			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: attempt.Account.ID}, false, emptyErr
+			s.reportAccountFailure(accountID, model, emptyErr)
+			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, false, emptyErr
 		}
-		failover := first != "" && attempt.Account.ID != first
+		failover := first != "" && accountID != first
 		// Always pin the live stream account (rebind after sticky failover).
-		s.bindAffinity(ctx, request, attempt.Account.ID)
+		s.bindAffinity(ctx, request, accountID)
 		return StreamOpen{
-			Body: guarded, AccountID: attempt.Account.ID, Model: model, PickHeld: true,
+			Body: guarded, AccountID: accountID, Model: model, PickHeld: true,
 			PreferAccount: prefer, FirstAccount: first, Failover: failover,
 			Fingerprint: fingerprint, Accounts: len(chain), Prep: prep,
 		}, true, nil
 	}
 
 	// Phase 1: top account alone (preserves sticky prompt-cache warmth when pinned).
-	// Always race the remainder after first miss — sequential openOne over the full
+	// Always race the remainder after first miss — sequential open over the full
 	// chain made empty storms take tens of seconds before client 502.
-	primary := accounts
-	rest := []grok.Account(nil)
-	if len(accounts) > 1 {
-		primary = accounts[:1]
-		rest = accounts[1:]
+	primary := chain
+	rest := []pool.Candidate(nil)
+	if len(chain) > 1 {
+		primary = chain[:1]
+		rest = chain[1:]
 	}
 	// stickyMissID: sticky/primary that failed. We defer clearStickyPins until a
 	// failover winner is confirmed. Clearing early then losing the race left the
 	// conversation with NO pin → next turn cold-picks a random account (intermittent
 	// cache miss under empty/timeout storms).
 	stickyMissID := ""
-	for _, account := range primary {
-		opened, ok, err := openOne(account)
+	for _, candidate := range primary {
+		opened, ok, err := openOneCandidate(candidate)
 		if ok {
 			return opened, nil
 		}
 		if stickyFirst && shouldDropStickyPin(err) {
-			stickyMissID = account.ID
+			stickyMissID = candidate.ID
 		}
 		if err != nil {
 			// Prefer the concrete failing account id so open-failure paths still
@@ -378,13 +385,13 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 			if strings.TrimSpace(opened.AccountID) != "" {
 				meta.AccountID = opened.AccountID
 			} else {
-				meta.AccountID = account.ID
+				meta.AccountID = candidate.ID
 			}
 			if ue, is := err.(*grok.UpstreamError); is && strings.Contains(ue.Body, "empty model output") {
 				lastEmpty = err
 				continue
 			}
-			// Always try remaining accounts (parallel phase) before failing the request.
+			// Always try remaining accounts (parallel/serial phase) before failing the request.
 			if len(rest) == 0 {
 				if lastEmpty != nil {
 					return meta, lastEmpty
@@ -395,17 +402,35 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 		}
 	}
 
-	// Phase 2: parallel first-byte probe on remaining failover candidates.
-	// Race dials; first non-empty stream wins. Others are closed immediately.
-	// Caps concurrency to keep upstream load bounded (default chain is 4).
+	// Phase 2: remaining failover candidates.
+	// Build keeps parallel first-byte race; console/web use sequential SSO opens.
 	if len(rest) == 0 {
 		if lastEmpty == nil {
 			lastEmpty = &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
 		}
 		return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, Failover: true}, lastEmpty
 	}
-	if len(rest) > 0 {
-		opened, err := s.parallelFirstByteOpen(ctx, rest, client, model, body, chain, prefer, first, fingerprint, prep, request)
+	if route.Provider != provider.Build {
+		for _, candidate := range rest {
+			opened, ok, err := openOneCandidate(candidate)
+			if ok {
+				if stickyMissID != "" {
+					s.noteStickyOutcome(ctx, request, stickyMissID, false)
+				}
+				return opened, nil
+			}
+			if err != nil {
+				if strings.TrimSpace(opened.AccountID) != "" {
+					meta.AccountID = opened.AccountID
+				} else {
+					meta.AccountID = candidate.ID
+				}
+				lastEmpty = err
+			}
+		}
+	} else {
+		restAccounts := upstreamAccounts(rest)
+		opened, err := s.parallelFirstByteOpen(ctx, restAccounts, client, model, body, chain, prefer, first, fingerprint, prep, request)
 		if err == nil {
 			// Confirmed failover winner — drop the dead sticky pin only now.
 			if stickyMissID != "" {
@@ -798,12 +823,17 @@ func (s *ChatService) prepare(ctx context.Context, request ChatRequest, candidat
 const defaultFailoverChain = 12
 
 func (s *ChatService) prepareChain(ctx context.Context, request ChatRequest, candidates []pool.Candidate, mode string) (string, []pool.Candidate, *grok.Client, error) {
-	model := s.resolveModel(request)
+	route := s.resolveRoute(request)
+	model := route.Upstream
+	if model == "" {
+		model = s.resolveModel(request)
+	}
 	now := time.Now()
 	if s.Now != nil {
 		now = s.Now()
 	}
 	candidates = append([]pool.Candidate(nil), candidates...)
+	candidates = pool.FilterByAuth(candidates, route.Auth)
 	fingerprint := ChatFingerprint(request)
 	// Skip second Redis affinity GET when server already pinned sticky to candidates[0]
 	// (RequestCount heavily boosted by listCandidatesForRequest).
@@ -819,7 +849,8 @@ func (s *ChatService) prepareChain(ctx context.Context, request ChatRequest, can
 	if maxAttempts < 1 || maxAttempts > 64 {
 		maxAttempts = defaultFailoverChain
 	}
-	chain := pool.Chain(candidates, model, mode, now, maxAttempts)
+	blockKey := s.resolveModel(request)
+	chain := pool.Chain(candidates, blockKey, mode, now, maxAttempts)
 	if len(chain) == 0 {
 		return "", nil, nil, pool.ErrNoEligibleAccounts
 	}
@@ -1872,6 +1903,57 @@ func (s *ChatService) resolveModel(request ChatRequest) string {
 		model = "grok-4.5"
 	}
 	return model
+}
+
+func (s *ChatService) resolveRoute(request ChatRequest) provider.Route {
+	model := s.resolveModel(request)
+	if s.Catalog != nil {
+		return s.Catalog.ResolveRoute(model)
+	}
+	return provider.ResolveRoute(model, "grok-4.5")
+}
+
+// openAccountAttempt routes to build (token) or console (SSO) upstream.
+func (s *ChatService) openAccountAttempt(ctx context.Context, candidate pool.Candidate, route provider.Route, body map[string]any) (accountID string, bodyRC io.ReadCloser, err error) {
+	model := route.Upstream
+	if model == "" {
+		model = route.PublicID
+	}
+	if route.Provider == provider.Console {
+		client := s.Console
+		if client == nil {
+			client = &console.Client{}
+		}
+		resp, err := client.Open(ctx, candidate.ConsoleAccount(), model, body, route.ReasoningEffort)
+		if err != nil {
+			return candidate.ID, nil, err
+		}
+		return candidate.ID, resp.Body, nil
+	}
+	if route.Provider == provider.Web {
+		client := s.Web
+		if client == nil {
+			client = &web.Client{}
+		}
+		// Image/video web models are catalog-only for now.
+		if _, ok := web.ModeForModel(model); !ok {
+			return candidate.ID, nil, &grok.UpstreamError{Status: 501, Body: "web non-chat capability not implemented yet: " + model}
+		}
+		resp, err := client.Open(ctx, candidate.ConsoleAccount(), model, body)
+		if err != nil {
+			return candidate.ID, nil, err
+		}
+		return candidate.ID, resp.Body, nil
+	}
+	client := s.Client
+	if client == nil {
+		client = &grok.Client{}
+	}
+	resp, err := client.Open(ctx, candidate.UpstreamAccount(), model, body)
+	if err != nil {
+		return candidate.ID, nil, err
+	}
+	return candidate.ID, resp.Body, nil
 }
 
 func (s *ChatService) releasePick(ctx context.Context, accountID string) {

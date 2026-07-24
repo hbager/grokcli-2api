@@ -14,6 +14,7 @@ var ErrNoEligibleAccounts = errors.New("no eligible accounts")
 type Candidate struct {
 	ID               string
 	Token            string
+	SSO              string // xAI SSO cookie for web/console
 	Email            string
 	UserID           string
 	TeamID           string
@@ -26,8 +27,13 @@ type Candidate struct {
 	Weight           int
 }
 
+// Eligible reports whether the account can be considered for *any* provider.
+// Auth surface (token vs SSO) is filtered later by AuthEligible.
 func (c Candidate) Eligible(model string, now time.Time) bool {
-	if strings.TrimSpace(c.ID) == "" || strings.TrimSpace(c.Token) == "" {
+	if strings.TrimSpace(c.ID) == "" {
+		return false
+	}
+	if strings.TrimSpace(c.Token) == "" && strings.TrimSpace(c.SSO) == "" {
 		return false
 	}
 	if !c.Enabled || c.DisabledForQuota {
@@ -42,8 +48,28 @@ func (c Candidate) Eligible(model string, now time.Time) bool {
 	return !modelBlocked(c.BlockedModels, model, now)
 }
 
+// AuthEligible filters by credential surface: "token" (build) or "sso" (web/console).
+func (c Candidate) AuthEligible(auth string) bool {
+	switch strings.ToLower(strings.TrimSpace(auth)) {
+	case "sso":
+		return strings.TrimSpace(c.SSO) != ""
+	default: // token / build
+		return strings.TrimSpace(c.Token) != ""
+	}
+}
+
 func (c Candidate) UpstreamAccount() grok.Account {
 	return grok.Account{ID: c.ID, Token: c.Token}
+}
+
+func (c Candidate) ConsoleAccount() ConsoleAccount {
+	return ConsoleAccount{ID: c.ID, SSO: c.SSO}
+}
+
+// ConsoleAccount is the SSO-bearing identity for console upstream.
+type ConsoleAccount struct {
+	ID  string
+	SSO string
 }
 
 func Pick(candidates []Candidate, model, mode string, now time.Time) (Candidate, error) {
@@ -172,4 +198,15 @@ func numericBlockActive(v, nowUnix float64) bool {
 	}
 	// small numbers like 1 => permanent true
 	return true
+}
+
+// FilterByAuth keeps candidates that can satisfy the required auth surface.
+func FilterByAuth(candidates []Candidate, auth string) []Candidate {
+	out := make([]Candidate, 0, len(candidates))
+	for _, c := range candidates {
+		if c.AuthEligible(auth) {
+			out = append(out, c)
+		}
+	}
+	return out
 }

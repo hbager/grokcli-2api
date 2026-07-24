@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/config"
+	"github.com/hm2899/grokcli-2api/internal/provider"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 )
 
@@ -30,10 +31,11 @@ func (c *Catalog) OpenAIList(ctx context.Context) map[string]any {
 
 func (c *Catalog) PublicModels(ctx context.Context) []map[string]any {
 	defaultModel := c.defaultModel()
+	var models []map[string]any
 	if c != nil && c.store != nil {
 		rows, err := c.store.ListModels(ctx, false)
 		if err == nil && len(rows) > 0 {
-			models := make([]map[string]any, 0, len(rows)+2)
+			models = make([]map[string]any, 0, len(rows)+16)
 			now := time.Now().Unix()
 			for _, row := range rows {
 				if strings.TrimSpace(row.ID) == "" {
@@ -41,14 +43,20 @@ func (c *Catalog) PublicModels(ctx context.Context) []map[string]any {
 				}
 				models = append(models, publicModelEntry(row, now))
 			}
-			models = mergeExtraModels(models, defaultModel)
-			sort.SliceStable(models, func(i, j int) bool {
-				return modelSortKey(models[i], defaultModel) < modelSortKey(models[j], defaultModel)
-			})
-			return models
 		}
 	}
-	return fallbackModels(defaultModel)
+	if len(models) == 0 {
+		models = fallbackModels(defaultModel)
+	} else {
+		models = mergeExtraModels(models, defaultModel)
+	}
+	// Always expose static web/console + tag bare build rows.
+	models = provider.TagBuildProvider(models)
+	models = provider.MergeStaticInto(models)
+	sort.SliceStable(models, func(i, j int) bool {
+		return modelSortKey(models[i], defaultModel) < modelSortKey(models[j], defaultModel)
+	})
+	return models
 }
 
 func (c *Catalog) Resolve(model string) string {
@@ -58,6 +66,10 @@ func (c *Catalog) Resolve(model string) string {
 		return defaultModel
 	}
 	low := strings.ToLower(m)
+	// Keep explicit multi-provider ids intact (web/... console/...).
+	if strings.HasPrefix(low, "web/") || strings.HasPrefix(low, "console/") {
+		return m
+	}
 	if low == "grok-search" || low == "web-search" {
 		return defaultModel
 	}
@@ -68,6 +80,11 @@ func (c *Catalog) Resolve(model string) string {
 		return resolved
 	}
 	return m
+}
+
+// ResolveRoute returns provider + upstream after alias normalization.
+func (c *Catalog) ResolveRoute(model string) provider.Route {
+	return provider.ResolveRoute(c.Resolve(model), c.defaultModel())
 }
 
 func (c *Catalog) defaultModel() string {
@@ -158,13 +175,17 @@ func modelSortKey(item map[string]any, defaultModel string) string {
 }
 
 func sortOrderFor(id, defaultModel string) int {
-	switch id {
-	case defaultModel:
+	switch {
+	case id == defaultModel:
 		return 0
-	case "grok-build":
+	case id == "grok-build":
 		return 1
-	case "grok-search":
+	case id == "grok-search":
 		return 2
+	case strings.HasPrefix(id, "console/"):
+		return 3
+	case strings.HasPrefix(id, "web/"):
+		return 4
 	default:
 		return 9
 	}
