@@ -18,6 +18,9 @@
 环境变量:
   GROK2API_AUTH_FILE  - 导入目标 auth.json（默认项目 data/auth.json）
   GROK2API_PROXY      - 代理地址，例如 http://127.0.0.1:7890
+  GROK2API_SSO_POLL_TIMEOUT - token 轮询超时秒数（默认 30）
+  # invalid_grant (new-account OIDC grant block) exits immediately; adapter
+  # schedules deferred re-convert via GROK2API_SSO_DEFER_SEC (default 900).
 """
 from __future__ import annotations
 
@@ -64,6 +67,30 @@ import threading as _threading
 
 _DEVICE_FLOW_LOCK = _threading.RLock()
 _DEVICE_FLOW_LAST_TS = 0.0
+
+# Last sso_to_token failure code for callers (adapter soft-save / defer).
+# Values: None | "invalid_grant" | "transport" | "auth" | "rate_limited" | "timeout" | "empty"
+_LAST_SSO_TOKEN_ERROR: str | None = None
+_LAST_SSO_TOKEN_ERROR_DESC: str | None = None
+_LAST_SSO_TOKEN_ERROR_LOCK = _threading.Lock()
+
+
+def get_last_sso_token_error() -> str | None:
+    """Return last sso_to_token error code (thread-safe snapshot)."""
+    with _LAST_SSO_TOKEN_ERROR_LOCK:
+        return _LAST_SSO_TOKEN_ERROR
+
+
+def get_last_sso_token_error_desc() -> str | None:
+    with _LAST_SSO_TOKEN_ERROR_LOCK:
+        return _LAST_SSO_TOKEN_ERROR_DESC
+
+
+def _set_last_sso_token_error(code: str | None, desc: str | None = None) -> None:
+    global _LAST_SSO_TOKEN_ERROR, _LAST_SSO_TOKEN_ERROR_DESC
+    with _LAST_SSO_TOKEN_ERROR_LOCK:
+        _LAST_SSO_TOKEN_ERROR = code
+        _LAST_SSO_TOKEN_ERROR_DESC = desc
 
 
 def _device_flow_gap_sec() -> float:
@@ -121,18 +148,17 @@ def _is_rate_limited_payload(text: str | None = None, url: str | None = None, st
 
 
 
-def _proxy_kwargs() -> dict:
-    """Return curl_cffi compatible proxy kwargs from env / proxy pool."""
+def _proxy_url_from_env() -> str:
+    """Resolve outbound proxy URL from proxy pool / env (same logic as legacy)."""
     try:
         try:
             from grok2api.upstream.proxy_pool import (
                 resolve_proxy_for_request,
-                curl_proxies_arg,
                 get_outbound_proxy_source,
                 first_working_proxy,
             )
         except Exception:
-            from proxy_pool import resolve_proxy_for_request, curl_proxies_arg  # type: ignore
+            from proxy_pool import resolve_proxy_for_request  # type: ignore
             get_outbound_proxy_source = None  # type: ignore
             first_working_proxy = None  # type: ignore
 
@@ -143,9 +169,8 @@ def _proxy_kwargs() -> dict:
             url = pool[0] if pool else None
         if not url and first_working_proxy is not None:
             url = first_working_proxy()
-        proxies = curl_proxies_arg(url)
-        if proxies:
-            return {"proxies": proxies}
+        if url:
+            return str(url).strip()
     except Exception:
         pass
     proxy = (
@@ -164,9 +189,123 @@ def _proxy_kwargs() -> dict:
             ),
             "",
         )
-    if proxy:
-        return {"proxies": {"http": proxy, "https": proxy}}
-    return {}
+    return proxy
+
+
+def _proxy_kwargs(proxy_url: str | None = None) -> dict:
+    """Return curl_cffi compatible proxy kwargs.
+
+    - None -> resolve from env / proxy pool (legacy)
+    - empty string -> force direct (no proxies)
+    - str -> use that URL
+    """
+    if proxy_url is None:
+        proxy_url = _proxy_url_from_env()
+    if not proxy_url:
+        return {}
+    try:
+        try:
+            from grok2api.upstream.proxy_pool import curl_proxies_arg
+        except Exception:
+            from proxy_pool import curl_proxies_arg  # type: ignore
+        proxies = curl_proxies_arg(proxy_url)
+        if proxies:
+            return {"proxies": proxies}
+    except Exception:
+        pass
+    return {"proxies": {"http": proxy_url, "https": proxy_url}}
+
+
+def _is_transport_error(err: Any = None, text: str | None = None) -> bool:
+    """Detect TLS / timeout / connection / proxy tunnel transport failures."""
+    blob = f"{err or ''} {text or ''}".lower()
+    if not blob.strip():
+        return False
+    needles = (
+        "curl: (28)",
+        "curl: (35)",
+        "curl: (7)",
+        "curl: (56)",
+        "curl (28)",
+        "curl (35)",
+        "curl (7)",
+        "curl (56)",
+        "(28)",
+        "(35)",
+        "timeout",
+        "timed out",
+        "tls",
+        "ssl",
+        "openssl",
+        "failed to perform",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "proxy tunnel",
+        "proxy connect",
+        "tunnel connection failed",
+        "could not connect",
+        "network is unreachable",
+        "name or service not known",
+        "nodename nor servname",
+        "getaddrinfo failed",
+        "host.docker.internal",
+    )
+    return any(k in blob for k in needles)
+
+
+def _device_flow_proxy_urls() -> list[str]:
+    """Ordered proxy candidates for OIDC device-flow (auth.x.ai).
+
+    Privacy default: if a proxy is configured, NEVER fall back to direct egress.
+    Direct would expose the host/container public IP — the whole reason users
+    set GROK2API_XAI_PROXY.
+
+    Candidates when proxy is set:
+      1) env/pool proxy as-is
+      2) host.docker.internal -> 127.0.0.1 rewrite (same proxy, host-side only)
+
+    Env GROK2API_SSO_DEVICE_PROXY:
+      (empty/default)  -> proxy only when configured; direct only if no proxy
+      proxy|only|env   -> proxy only (same as default when proxy exists)
+      direct|off|none  -> force direct (explicit opt-in; exposes egress IP)
+      allow_direct|fallback_direct -> proxy first, then direct (opt-in only)
+    """
+    mode = (os.getenv("GROK2API_SSO_DEVICE_PROXY") or "").strip().lower()
+    env_proxy = (_proxy_url_from_env() or "").strip()
+
+    def _proxy_candidates() -> list[str]:
+        out: list[str] = []
+        if not env_proxy:
+            return out
+        out.append(env_proxy)
+        if "host.docker.internal" in env_proxy:
+            rewritten = env_proxy.replace("host.docker.internal", "127.0.0.1")
+            if rewritten not in out:
+                out.append(rewritten)
+        return out
+
+    # Explicit force-direct (user accepts exposing egress IP).
+    if mode in ("direct", "off", "none", "no", "0", "false"):
+        return [""]
+
+    # Explicit allow direct only after proxy attempts fail.
+    if mode in ("allow_direct", "fallback_direct", "proxy_then_direct"):
+        cands = _proxy_candidates()
+        cands.append("")
+        return cands
+
+    # proxy|only|env|default: never direct when a proxy is configured.
+    if mode in ("proxy", "only", "env", ""):
+        cands = _proxy_candidates()
+        if cands:
+            return cands
+        # No proxy configured at all -> direct is the only path.
+        return [""]
+
+    # Unknown mode: still respect privacy (proxy only if set).
+    cands = _proxy_candidates()
+    return cands if cands else [""]
 
 
 def b64url_decode(seg: str) -> bytes:
@@ -217,16 +356,22 @@ def _poll_interval_sec(raw: Any = None) -> float:
     return max(0.4, min(hinted, 1.5))
 
 
-def request_device_code(session: Any | None = None) -> dict | None:
+def request_device_code(
+    session: Any | None = None,
+    *,
+    proxy_url: str | None = None,
+) -> dict | None:
     """Request OIDC device code. Prefer shared curl_cffi session when given.
 
     Retries on xAI rate limits (HTTP 429 / slow_down) — common when several
-    registration workers enter device-flow together.
+    registration workers enter device-flow together. Transport errors also
+    retry while attempts remain (caller may switch proxy_url on hard fail).
     """
     form = {"client_id": GROK_CLI_CLIENT_ID, "scope": OIDC_SCOPES}
     timeout = _http_timeout()
     retries = _device_flow_retries()
     last_err = ""
+    proxy_kw = _proxy_kwargs(proxy_url)
     for attempt in range(1, retries + 1):
         _wait_device_flow_slot()
         if session is not None:
@@ -237,7 +382,7 @@ def request_device_code(session: Any | None = None) -> dict | None:
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     impersonate="chrome",
                     timeout=timeout,
-                    **_proxy_kwargs(),
+                    **proxy_kw,
                 )
                 code = int(getattr(r, "status_code", 0) or 0)
                 body = (getattr(r, "text", None) or "")[:300]
@@ -254,6 +399,13 @@ def request_device_code(session: Any | None = None) -> dict | None:
                 last_err = str(e)
                 print(f"  ❌ device/code: {e}")
                 if attempt < retries and _is_rate_limited_payload(str(e)):
+                    time.sleep(_device_flow_backoff_sec(attempt))
+                    continue
+                # Transport errors: return None immediately so sso_to_token can
+                # fall through to the next proxy candidate (e.g. direct).
+                if _is_transport_error(e):
+                    return None
+                if attempt < retries:
                     time.sleep(_device_flow_backoff_sec(attempt))
                     continue
                 return None
@@ -288,6 +440,17 @@ def request_device_code(session: Any | None = None) -> dict | None:
     return None
 
 
+def _is_invalid_grant_error(error: str, description: str = "") -> bool:
+    """xAI blocks OIDC grant for brand-new accounts with invalid_grant/Access denied."""
+    err = (error or "").strip().lower()
+    desc = (description or "").strip().lower()
+    if err == "invalid_grant":
+        return True
+    if "access denied" in desc:
+        return True
+    return False
+
+
 def poll_token(
     device_code: str,
     interval: int | float = 1,
@@ -296,6 +459,7 @@ def poll_token(
     *,
     session: Any | None = None,
     immediate: bool = True,
+    proxy_url: str | None = None,
 ) -> dict | None:
     """Exchange an approved device_code for tokens.
 
@@ -312,7 +476,9 @@ def poll_token(
         "device_code": device_code,
     }
     http_timeout = _http_timeout()
+    proxy_kw = _proxy_kwargs(proxy_url)
     first = True
+    poll_token.last_error = None  # type: ignore[attr-defined]
     while time.time() < deadline:
         if not (first and immediate):
             time.sleep(interval_f)
@@ -326,7 +492,7 @@ def poll_token(
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     impersonate="chrome",
                     timeout=http_timeout,
-                    **_proxy_kwargs(),
+                    **proxy_kw,
                 )
                 code = int(getattr(r, "status_code", 0) or 0)
                 if code < 400:
@@ -337,11 +503,25 @@ def poll_token(
                 except Exception:
                     err = {}
                 error = str((err or {}).get("error") or "")
+                err_desc = str((err or {}).get("error_description") or "")
                 if error == "authorization_pending":
                     continue
                 if error == "slow_down":
                     interval_f = min(10.0, interval_f + 1.0)
                     continue
+                if _is_invalid_grant_error(error, err_desc):
+                    poll_token.last_error = {  # type: ignore[attr-defined]
+                        "_error": "invalid_grant",
+                        "_error_description": err_desc or error or "Access denied",
+                    }
+                    print(
+                        f"  ❌ token: invalid_grant"
+                        + (f" ({err_desc})" if err_desc else "")
+                    )
+                    return {
+                        "_error": "invalid_grant",
+                        "_error_description": err_desc or error or "Access denied",
+                    }
                 print(f"  ❌ token: {error or f'HTTP {code}'}")
                 return None
             except Exception as e:  # noqa: BLE001
@@ -366,12 +546,26 @@ def poll_token(
                 err = json.loads(e.read())
             except Exception:
                 err = {}
-            error = err.get("error", "")
+            error = str(err.get("error") or "")
+            err_desc = str(err.get("error_description") or "")
             if error == "authorization_pending":
                 continue
             if error == "slow_down":
                 interval_f = min(10.0, interval_f + 1.0)
                 continue
+            if _is_invalid_grant_error(error, err_desc):
+                poll_token.last_error = {  # type: ignore[attr-defined]
+                    "_error": "invalid_grant",
+                    "_error_description": err_desc or error or "Access denied",
+                }
+                print(
+                    f"  ❌ token: invalid_grant"
+                    + (f" ({err_desc})" if err_desc else "")
+                )
+                return {
+                    "_error": "invalid_grant",
+                    "_error_description": err_desc or error or "Access denied",
+                }
             print(f"  ❌ token: {error}")
             return None
         except Exception as e:  # noqa: BLE001
@@ -383,140 +577,243 @@ def poll_token(
     return None
 
 
+poll_token.last_error = None  # type: ignore[attr-defined]
+
+
 def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
-    """SSO cookie → token dict (access/refresh/expires_in).
+    """SSO cookie -> token dict (access/refresh/expires_in).
 
-    ``quiet=True`` reduces per-account stdout (faster under high concurrency).
+    quiet=True reduces per-account stdout (faster under high concurrency).
 
-    Retries the full device flow on xAI rate limits (device/code 429 slow_down,
-    verify/approve ``rate_limited``). Concurrent registration workers otherwise
-    produce consecutive conversion failures after SSO was already obtained.
+    Tries device-flow via ordered proxy candidates (env proxy -> docker
+    hostname rewrite -> direct) so auth.x.ai succeeds even when
+    GROK2API_XAI_PROXY points at host.docker.internal that is unreachable
+    from the host. Rate limits still back off within a proxy; transport
+    failures fall through to the next candidate.
+
+    On xAI new-account OIDC grant block (token invalid_grant / Access denied),
+    aborts the proxy/retry loop immediately and sets get_last_sso_token_error()
+    to invalid_grant so callers can soft-save SSO and defer convert.
     """
+    _set_last_sso_token_error(None)
     log = (lambda *a, **k: None) if quiet else print
     s = requests.Session()
     s.cookies.set("sso", sso_cookie, domain=".x.ai")
     timeout = _http_timeout()
-    proxy_kw = _proxy_kwargs()
 
-    # Skip accounts.x.ai preflight when cookie looks like a JWT — saves 0.5-2s
-    # and avoids an extra CF challenge under proxy pressure.
     sso_looks_jwt = str(sso_cookie or "").count(".") >= 2 and len(str(sso_cookie or "")) > 40
     if not sso_looks_jwt:
-        try:
-            r = s.get(
-                "https://accounts.x.ai/",
-                impersonate="chrome",
-                timeout=timeout,
-                **proxy_kw,
-            )
-        except Exception as e:
-            log(f"  ❌ 网络错误: {e}")
-            return None
-        if "sign-in" in r.url or "sign-up" in r.url:
-            log("  ❌ sso 无效")
+        preflight_ok = False
+        for pre_url in _device_flow_proxy_urls():
+            try:
+                r = s.get(
+                    "https://accounts.x.ai/",
+                    impersonate="chrome",
+                    timeout=timeout,
+                    **_proxy_kwargs(pre_url),
+                )
+                if "sign-in" in r.url or "sign-up" in r.url:
+                    log("  ❌ sso 无效")
+                    _set_last_sso_token_error("auth", "sso invalid")
+                    return None
+                preflight_ok = True
+                break
+            except Exception as e:
+                if _is_transport_error(e):
+                    continue
+                log(f"  ❌ 网络错误: {e}")
+                _set_last_sso_token_error("transport", str(e))
+                return None
+        if not preflight_ok:
+            log("  ❌ 网络错误: preflight transport failed on all proxies")
+            _set_last_sso_token_error("transport", "preflight transport failed on all proxies")
             return None
         log("  ✅ sso 有效")
     else:
         log("  ✅ sso shape ok (skip preflight)")
 
+    proxy_urls = _device_flow_proxy_urls()
     retries = _device_flow_retries()
-    for attempt in range(1, retries + 1):
-        log(f"  🔑 Device Flow... (try {attempt}/{retries})")
-        dc = request_device_code(session=s)
-        if not dc:
-            if attempt < retries:
-                time.sleep(_device_flow_backoff_sec(attempt))
-                continue
-            return None
-        log(f"  📋 user_code: {dc.get('user_code')}")
+    last_was_rate_limited = False
 
-        rate_limited = False
-        try:
-            s.get(
-                dc["verification_uri_complete"],
-                impersonate="chrome",
-                timeout=timeout,
-                **proxy_kw,
-            )
-            r = s.post(
-                f"{OIDC_ISSUER}/oauth2/device/verify",
-                data={"user_code": dc["user_code"]},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                impersonate="chrome",
-                timeout=timeout,
-                allow_redirects=True,
-                **proxy_kw,
-            )
-            if "consent" not in (r.url or ""):
-                log(f"  ❌ verify 失败: {r.url}")
-                if _is_rate_limited_payload(getattr(r, "text", None), r.url, getattr(r, "status_code", None)):
+    for p_idx, proxy_url in enumerate(proxy_urls):
+        proxy_kw = _proxy_kwargs(proxy_url)
+        proxy_label = proxy_url or "direct"
+        if p_idx > 0:
+            prev = proxy_urls[p_idx - 1] or "direct"
+            log(f"  ↻ device-flow proxy failed ({prev}); trying {proxy_label}")
+
+        transport_failed = False
+        for attempt in range(1, retries + 1):
+            log(f"  🔑 Device Flow... (try {attempt}/{retries}, {proxy_label})")
+            try:
+                dc = request_device_code(session=s, proxy_url=proxy_url)
+            except Exception as e:
+                if _is_transport_error(e):
+                    transport_failed = True
+                    break
+                log(f"  ❌ device/code: {e}")
+                _set_last_sso_token_error("auth", str(e))
+                return None
+            if not dc:
+                # request_device_code already retried rate-limit/transport;
+                # fall through to next proxy candidate instead of re-burning.
+                transport_failed = True
+                break
+            log(f"  📋 user_code: {dc.get('user_code')}")
+
+            rate_limited = False
+            try:
+                s.get(
+                    dc["verification_uri_complete"],
+                    impersonate="chrome",
+                    timeout=timeout,
+                    **proxy_kw,
+                )
+                r = s.post(
+                    f"{OIDC_ISSUER}/oauth2/device/verify",
+                    data={"user_code": dc["user_code"]},
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    impersonate="chrome",
+                    timeout=timeout,
+                    allow_redirects=True,
+                    **proxy_kw,
+                )
+                if "consent" not in (r.url or ""):
+                    log(f"  ❌ verify 失败: {r.url}")
+                    if _is_rate_limited_payload(
+                        getattr(r, "text", None), r.url, getattr(r, "status_code", None)
+                    ):
+                        rate_limited = True
+                    else:
+                        _set_last_sso_token_error("auth", f"verify failed: {r.url}")
+                        return None
+            except Exception as e:
+                log(f"  ❌ verify 异常: {e}")
+                if _is_transport_error(e):
+                    transport_failed = True
+                    break
+                if _is_rate_limited_payload(str(e)):
                     rate_limited = True
                 else:
+                    _set_last_sso_token_error("auth", str(e))
                     return None
-        except Exception as e:
-            log(f"  ❌ verify 异常: {e}")
-            if _is_rate_limited_payload(str(e)):
-                rate_limited = True
-            else:
+            if rate_limited:
+                last_was_rate_limited = True
+                if attempt < retries:
+                    time.sleep(_device_flow_backoff_sec(attempt))
+                    continue
+                _set_last_sso_token_error("rate_limited", "verify rate limited")
                 return None
-        if rate_limited:
-            if attempt < retries:
-                time.sleep(_device_flow_backoff_sec(attempt))
-                continue
-            return None
 
-        try:
-            r = s.post(
-                f"{OIDC_ISSUER}/oauth2/device/approve",
-                data={
-                    "user_code": dc["user_code"],
-                    "action": "allow",
-                    "principal_type": "User",
-                    "principal_id": "",
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                impersonate="chrome",
-                timeout=timeout,
-                allow_redirects=True,
-                **proxy_kw,
+            try:
+                r = s.post(
+                    f"{OIDC_ISSUER}/oauth2/device/approve",
+                    data={
+                        "user_code": dc["user_code"],
+                        "action": "allow",
+                        "principal_type": "User",
+                        "principal_id": "",
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    impersonate="chrome",
+                    timeout=timeout,
+                    allow_redirects=True,
+                    **proxy_kw,
+                )
+                if "done" not in (r.url or ""):
+                    log(f"  ❌ approve 失败: {r.url}")
+                    if _is_rate_limited_payload(
+                        getattr(r, "text", None), r.url, getattr(r, "status_code", None)
+                    ):
+                        last_was_rate_limited = True
+                        if attempt < retries:
+                            time.sleep(_device_flow_backoff_sec(attempt))
+                            continue
+                        _set_last_sso_token_error("rate_limited", "approve rate limited")
+                        return None
+                    _set_last_sso_token_error("auth", f"approve failed: {r.url}")
+                    return None
+                log("  ✅ 授权确认")
+            except Exception as e:
+                log(f"  ❌ approve 异常: {e}")
+                if _is_transport_error(e):
+                    transport_failed = True
+                    break
+                if _is_rate_limited_payload(str(e)) and attempt < retries:
+                    last_was_rate_limited = True
+                    time.sleep(_device_flow_backoff_sec(attempt))
+                    continue
+                _set_last_sso_token_error(
+                    "rate_limited" if _is_rate_limited_payload(str(e)) else "auth",
+                    str(e),
+                )
+                return None
+
+            try:
+                token = poll_token(
+                    dc["device_code"],
+                    dc.get("interval", 1),
+                    dc.get("expires_in", 1800),
+                    timeout=float(os.getenv("GROK2API_SSO_POLL_TIMEOUT", "30") or 30),
+                    session=s,
+                    immediate=True,
+                    proxy_url=proxy_url,
+                )
+            except Exception as e:
+                if _is_transport_error(e):
+                    transport_failed = True
+                    break
+                log(f"  ❌ token: {e}")
+                _set_last_sso_token_error("transport", str(e))
+                return None
+            # Permanent new-account OIDC grant block: do NOT burn remaining
+            # retries or other proxies (was ~8*3 device flows / ~95s).
+            if isinstance(token, dict) and token.get("_error") == "invalid_grant":
+                desc = str(token.get("_error_description") or "Access denied")
+                log(
+                    "  ⏳ token Access denied "
+                    "(new-account OIDC grant blocked; defer convert)"
+                )
+                _set_last_sso_token_error("invalid_grant", desc)
+                return None
+            if not token or not (isinstance(token, dict) and token.get("access_token")):
+                if attempt < retries:
+                    log("  ⏳ token poll empty — retry device flow")
+                    time.sleep(_device_flow_backoff_sec(attempt))
+                    continue
+                transport_failed = True
+                break
+            log(
+                f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
+                + (" + refresh_token" if token.get("refresh_token") else "")
             )
-            if "done" not in (r.url or ""):
-                log(f"  ❌ approve 失败: {r.url}")
-                if _is_rate_limited_payload(getattr(r, "text", None), r.url, getattr(r, "status_code", None)):
-                    if attempt < retries:
-                        time.sleep(_device_flow_backoff_sec(attempt))
-                        continue
-                return None
-            log("  ✅ 授权确认")
-        except Exception as e:
-            log(f"  ❌ approve 异常: {e}")
-            if _is_rate_limited_payload(str(e)) and attempt < retries:
-                time.sleep(_device_flow_backoff_sec(attempt))
-                continue
-            return None
+            _set_last_sso_token_error(None)
+            return token
 
-        # Approve already happened — poll immediately with a short interval.
-        token = poll_token(
-            dc["device_code"],
-            dc.get("interval", 1),
-            dc.get("expires_in", 1800),
-            timeout=float(os.getenv("GROK2API_SSO_POLL_TIMEOUT", "30") or 30),
-            session=s,
-            immediate=True,
-        )
-        if not token:
-            if attempt < retries:
-                log("  ⏳ token poll empty — retry device flow")
-                time.sleep(_device_flow_backoff_sec(attempt))
-                continue
+        if transport_failed and p_idx + 1 < len(proxy_urls):
+            continue
+        if transport_failed:
+            _set_last_sso_token_error(
+                "rate_limited" if last_was_rate_limited else "transport",
+                "device-flow transport/rate-limit exhausted",
+            )
             return None
-        log(
-            f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
-            + (" + refresh_token" if token.get("refresh_token") else "")
-        )
-        return token
+    if last_was_rate_limited:
+        _set_last_sso_token_error("rate_limited", "device-flow rate limited")
+    else:
+        _set_last_sso_token_error("empty", "device-flow returned no token")
     return None
 
+
+def sso_to_token_with_meta(
+    sso_cookie: str, *, quiet: bool = False
+) -> tuple[dict | None, str | None]:
+    """Returns (token, error_code). error_code in {None, 'invalid_grant', ...}."""
+    token = sso_to_token(sso_cookie, quiet=quiet)
+    if token and token.get("access_token"):
+        return token, None
+    return None, get_last_sso_token_error()
 
 def token_to_auth_entry(token: dict, email: str = "") -> tuple[str, dict]:
     """
