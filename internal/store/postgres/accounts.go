@@ -417,12 +417,6 @@ func buildAccountListWhere(query, status string, hasSSO *bool, surface ...string
 			COALESCE(a.payload->>'set-cookie','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*=' OR
 			COALESCE(a.payload->>'set_cookies','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*='
 		)`)
-	} else if selectedSurface == "oauth" {
-		clauses = append(clauses, `(
-			(NULLIF(btrim(COALESCE(a.payload->>'key','')), '') IS NOT NULL AND lower(a.payload->>'key') NOT LIKE 'sso-pending:%' AND lower(a.payload->>'key') NOT LIKE 'sso_pending:%') OR
-			(NULLIF(btrim(COALESCE(a.payload->>'access_token','')), '') IS NOT NULL AND lower(a.payload->>'access_token') NOT LIKE 'sso-pending:%' AND lower(a.payload->>'access_token') NOT LIKE 'sso_pending:%') OR
-			(NULLIF(btrim(COALESCE(a.payload->>'token','')), '') IS NOT NULL AND lower(a.payload->>'token') NOT LIKE 'sso-pending:%' AND lower(a.payload->>'token') NOT LIKE 'sso_pending:%')
-		)`)
 	}
 	if status != "" {
 		if selectedSurface == "sso" {

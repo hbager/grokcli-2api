@@ -75,6 +75,14 @@ func TestBuildAccountListWhereStatus(t *testing.T) {
 	if !containsFold(where, "blocked_models") {
 		t.Fatalf("model_blocked where=%q", where)
 	}
+	where, _ = buildAccountListWhere("", "disabled", nil, "oauth")
+	if containsFold(where, "sso-pending") || containsFold(where, "access_token") {
+		t.Fatalf("oauth surface must keep accounts without bearer visible: %q", where)
+	}
+	where, _ = buildAccountListWhere("", "disabled", nil, "sso")
+	if !containsFold(where, "session_cookies") {
+		t.Fatalf("sso surface must require an SSO credential: %q", where)
+	}
 }
 
 func containsFold(s, sub string) bool {

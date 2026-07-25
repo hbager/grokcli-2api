@@ -131,7 +131,7 @@ func (c *Connector) PoolSummary(ctx context.Context) (PoolSummary, error) {
 		      WHEN COALESCE(ap.disabled_for_quota, false) = true
 		        OR COALESCE(ap.pool_status, '') = 'quota_disabled'
 		        THEN 'quota_disabled'
-		      WHEN COALESCE(ap.enabled, true) = false
+		      WHEN COALESCE((ap.extra->>'oauth_enabled')::boolean, COALESCE(ap.enabled, true)) = false
 		        OR COALESCE(ap.pool_status, '') = 'disabled'
 		        THEN 'disabled'
 		      WHEN `+activeModelBlockSQL+`
