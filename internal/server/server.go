@@ -30,21 +30,21 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/maintainer"
 	"github.com/hm2899/grokcli-2api/internal/modelhealth"
 	"github.com/hm2899/grokcli-2api/internal/models"
-	"github.com/hm2899/grokcli-2api/internal/provider"
 	"github.com/hm2899/grokcli-2api/internal/pool"
 	"github.com/hm2899/grokcli-2api/internal/protocol/anthropic"
 	"github.com/hm2899/grokcli-2api/internal/protocol/historycompact"
 	"github.com/hm2899/grokcli-2api/internal/protocol/reasoning"
 	"github.com/hm2899/grokcli-2api/internal/protocol/responses"
 	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
+	"github.com/hm2899/grokcli-2api/internal/provider"
 	"github.com/hm2899/grokcli-2api/internal/proxy"
 	"github.com/hm2899/grokcli-2api/internal/quota"
 	regclient "github.com/hm2899/grokcli-2api/internal/registration/client"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/store/redis"
 	"github.com/hm2899/grokcli-2api/internal/upstream/console"
-	"github.com/hm2899/grokcli-2api/internal/upstream/web"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
+	"github.com/hm2899/grokcli-2api/internal/upstream/web"
 )
 
 type Options struct {
@@ -642,6 +642,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		return
 	}
 	chatReq.UserAgent = r.UserAgent()
+	authSurface := modelCatalog(options).ResolveRoute(chatReq.Model).Auth
 
 	// Codex shell schema uses "cmd"; remember preferred keys from the client tools
 	// so outbound tool_calls project command→cmd (or honor pure command-only schemas).
@@ -721,7 +722,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 					writeProxyError(w, err)
 					return
 				}
-				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, lastModel)
+				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, authSurface, lastModel)
 				if attempt+1 >= maxOpenAttempts || !isRetryableUpstreamOpenErr(err) {
 					recordChatUsage(r, options, apiKey, lastAccount, chatReq.Model, chatReq.Stream, false, http.StatusBadGateway, started, nil, err, 0, chatReq.Raw)
 					writeProxyError(w, err)
@@ -758,7 +759,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 			ok := err == nil || errors.Is(err, r.Context().Err())
 			// Headers commit on first stream write; only rotate when nothing was delivered.
 			if !ok && stats.FirstTokenMS == 0 && isRetryableUpstreamOpenErr(err) && attempt+1 < maxOpenAttempts {
-				reportChatPool(r, options, opened.AccountID, false, err, http.StatusBadGateway, opened.Model)
+				reportChatPool(r, options, opened.AccountID, false, err, http.StatusBadGateway, authSurface, opened.Model)
 				lastAccount = opened.AccountID
 				lastModel = opened.Model
 				continue
@@ -768,7 +769,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 				status = http.StatusBadGateway
 			}
 			recordChatUsageWithHint(r, options, apiKey, opened.AccountID, chatReq.Model, chatReq.Stream, ok, status, started, stats.Usage, err, stats.FirstTokenMS, chatReq.Raw, stats.CompletionHint)
-			reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
+			reportChatPool(r, options, opened.AccountID, ok, err, status, authSurface, opened.Model)
 			return
 		}
 		if err == nil {
@@ -796,7 +797,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		projectChatPayloadShellArgs(result.Payload, nil)
 	}
 	recordChatUsage(r, options, apiKey, result.AccountID, chatReq.Model, chatReq.Stream, true, http.StatusOK, started, result.Usage, nil, 0, chatReq.Raw)
-	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, result.Model)
+	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, authSurface, result.Model)
 	setProtocolObservationHeaders(w, protocolObservation{
 		Protocol: "openai_chat", AccountID: result.AccountID, PreferAccount: result.PreferAccount,
 		Failover: result.Failover, Fingerprint: result.Fingerprint, Accounts: result.Accounts, Prep: result.Prep,
@@ -1372,7 +1373,7 @@ func recordChatUsageWithHint(r *http.Request, options Options, apiKey *auth.APIK
 	}()
 }
 
-func reportChatPool(r *http.Request, options Options, accountID string, ok bool, cause error, status int, requestedModel ...string) {
+func reportChatPool(r *http.Request, options Options, accountID string, ok bool, cause error, status int, surface string, requestedModel ...string) {
 	if strings.TrimSpace(accountID) == "" {
 		return
 	}
@@ -1385,6 +1386,12 @@ func reportChatPool(r *http.Request, options Options, accountID string, ok bool,
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if ok {
+			if surface == provider.AuthSSO {
+				if options.Store != nil {
+					_ = options.Store.ReportSSORuntime(ctx, accountID, true, "")
+				}
+				return
+			}
 			if options.Store != nil {
 				// preserve still-active free-usage windows, but heal stale markers.
 				_ = options.Store.ReportPoolSuccess(ctx, accountID, false) /* success clears sticky cool */
@@ -1405,6 +1412,18 @@ func reportChatPool(r *http.Request, options Options, accountID string, ok bool,
 			if strings.TrimSpace(upstream.Body) != "" {
 				errText = upstream.Body
 			}
+		}
+		if surface == provider.AuthSSO {
+			if options.Store != nil {
+				_ = options.Store.ReportSSORuntime(ctx, accountID, false, errText)
+				if status == http.StatusUnauthorized || status == http.StatusForbidden {
+					_, _ = options.Store.SetAccountSurfaceEnabled(ctx, accountID, "sso", false)
+				}
+			}
+			return
+		}
+		if (status == http.StatusUnauthorized || status == http.StatusForbidden) && options.Store != nil {
+			_, _ = options.Store.SetAccountSurfaceEnabled(ctx, accountID, "oauth", false)
 		}
 		// Text-first classifier: free-usage / 额度用完 / rate-limit wording decides
 		// whether the account enters the cooldown pool (and optionally soft-blocks a model).
@@ -1482,12 +1501,12 @@ type chatPoolFailureReporter struct {
 	options Options
 }
 
-func (r chatPoolFailureReporter) ReportAccountFailure(accountID, model string, err error) {
+func (r chatPoolFailureReporter) ReportAccountFailure(accountID, model, surface string, err error) {
 	if err == nil || strings.TrimSpace(accountID) == "" {
 		return
 	}
 	status := http.StatusBadGateway
-	reportChatPool(nil, r.options, accountID, false, err, status, model)
+	reportChatPool(nil, r.options, accountID, false, err, status, surface, model)
 }
 
 func newChatService(options Options) proxy.ChatService {
@@ -1724,6 +1743,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	allowedTools := allowedAnthropicToolNames(body)
 	chatReq := proxy.ChatRequest{Model: model, Stream: false, Raw: body, UserAgent: r.UserAgent()}
+	authSurface := modelCatalog(options).ResolveRoute(chatReq.Model).Auth
 	// Also inject pck into chatReq for affinity fingerprint when only raw had session metadata.
 	if pck != "" {
 		if chatReq.Raw == nil {
@@ -1806,7 +1826,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 					return
 				}
 				// Open-time empty/5xx: report + try another window if attempts remain.
-				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, lastModel)
+				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, authSurface, lastModel)
 				if attempt+1 >= maxOpenAttempts || !isRetryableUpstreamOpenErr(err) {
 					recordAnthropicUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
 					writeAnthropicProxyError(w, err)
@@ -1850,7 +1870,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 			}
 			// Empty with no TTFT: headers likely uncommitted → try another account.
 			if !ok && firstTokenMS == 0 && isRetryableUpstreamOpenErr(err) && attempt+1 < maxOpenAttempts {
-				reportChatPool(r, options, opened.AccountID, false, err, http.StatusBadGateway, opened.Model)
+				reportChatPool(r, options, opened.AccountID, false, err, http.StatusBadGateway, authSurface, opened.Model)
 				lastAccount = opened.AccountID
 				lastModel = opened.Model
 				continue
@@ -1860,7 +1880,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 				status = http.StatusBadGateway
 			}
 			recordAnthropicUsage(r, options, apiKey, opened.AccountID, opened.Model, true, ok, status, started, usage, err, firstTokenMS, raw)
-			reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
+			reportChatPool(r, options, opened.AccountID, ok, err, status, authSurface, opened.Model)
 			return
 		}
 		// Exhausted open attempts without streaming.
@@ -1882,7 +1902,7 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 		return
 	}
 	recordAnthropicUsage(r, options, apiKey, result.AccountID, result.Model, false, true, http.StatusOK, started, result.Usage, nil, 0, raw)
-	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, result.Model)
+	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, authSurface, result.Model)
 	content, reasoning, finish, usage, toolCalls := anthropicCompletionParts(result.Payload)
 	if maxTools > 0 && len(toolCalls) > maxTools {
 		toolCalls = toolCalls[:maxTools]
@@ -2218,6 +2238,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		return
 	}
 	chatReq := proxy.ChatRequest{Model: model, Stream: stream, Raw: body, UserAgent: r.UserAgent()}
+	authSurface := modelCatalog(options).ResolveRoute(chatReq.Model).Auth
 	// Sticky keys for Codex multi-turn: prompt_cache_key first, then previous_response_id chain.
 	// CRITICAL: never mint a *new* pck each turn from previous_response_id — that kills upstream
 	// prompt cache. Always recover the same pck that produced the previous response when possible.
@@ -2335,7 +2356,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 					writeOpenAIProxyError(w, err)
 					return
 				}
-				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, lastModel)
+				reportChatPool(r, options, lastAccount, false, err, http.StatusBadGateway, authSurface, lastModel)
 				if attempt+1 >= maxOpenAttempts || !isRetryableUpstreamOpenErr(err) {
 					recordResponsesUsage(r, options, apiKey, lastAccount, model, true, false, http.StatusBadGateway, started, nil, err, 0, raw)
 					writeOpenAIProxyError(w, err)
@@ -2425,7 +2446,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		// stream function (ClientDeliveryOK). Zero usage tokens alone are not a
 		// failure — xAI often omits usage on short tool turns.
 		recordResponsesUsage(r, options, apiKey, opened.AccountID, model, true, ok, status, started, usage, err, firstTokenMS, raw)
-		reportChatPool(r, options, opened.AccountID, ok, err, status, opened.Model)
+		reportChatPool(r, options, opened.AccountID, ok, err, status, authSurface, opened.Model)
 		return
 	}
 	chatReq.Stream = false
@@ -2440,7 +2461,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		return
 	}
 	recordResponsesUsage(r, options, apiKey, result.AccountID, model, false, true, http.StatusOK, started, result.Usage, nil, 0, raw)
-	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, result.Model)
+	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, authSurface, result.Model)
 	content, reasoning, _, _, toolCalls := anthropicCompletionParts(result.Payload)
 	bindResponseAffinity(r.Context(), options, responseID, result.AccountID, result.Model, pck)
 	setProtocolObservationHeaders(w, protocolObservation{
@@ -4412,9 +4433,10 @@ func serveAdminAccounts(w http.ResponseWriter, r *http.Request, options Options)
 	page := intQuery(query.Get("page"), 1)
 	pageSize := intQuery(query.Get("page_size"), 25)
 	filter := postgres.AccountListFilter{
-		Query:  query.Get("q"),
-		Sort:   query.Get("sort"),
-		Status: query.Get("status"),
+		Query:   query.Get("q"),
+		Sort:    query.Get("sort"),
+		Status:  query.Get("status"),
+		Surface: query.Get("surface"),
 	}
 	if raw := strings.TrimSpace(strings.ToLower(query.Get("has_sso"))); raw != "" {
 		v := raw == "1" || raw == "true" || raw == "yes" || raw == "on"
@@ -4455,6 +4477,7 @@ func serveAdminAccounts(w http.ResponseWriter, r *http.Request, options Options)
 		"q":              result.Query,
 		"sort":           result.Sort,
 		"status":         result.Status,
+		"surface":        result.Surface,
 		"store_source":   result.StoreSource,
 		"store_backend":  result.StoreBackend,
 		"auth_file_role": result.AuthFileRole,
@@ -6671,7 +6694,12 @@ func serveAdminSetAccountEnabled(w http.ResponseWriter, r *http.Request, options
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "enabled bool required"})
 		return
 	}
-	rec, err := options.Store.SetAccountEnabled(r.Context(), r.PathValue("account_id"), enabled)
+	surface := strings.ToLower(strings.TrimSpace(stringValue(body["surface"])))
+	if surface != "oauth" && surface != "sso" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "surface must be oauth or sso"})
+		return
+	}
+	rec, err := options.Store.SetAccountSurfaceEnabled(r.Context(), r.PathValue("account_id"), surface, enabled)
 	if err != nil {
 		if postgres.IsAccountNotFound(err) {
 			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "Account not found"})
@@ -6873,6 +6901,22 @@ func stringSlice(value any) []string {
 	}
 }
 
+func ssoProbePoolView(result map[string]any) map[string]any {
+	ok := result["available"] == true || result["ok"] == true
+	probeStatus := "fail"
+	if ok {
+		probeStatus = "ok"
+	}
+	view := map[string]any{
+		"last_probe": result, "last_probe_status": probeStatus,
+	}
+	if result["auto_disabled"] == true {
+		view["enabled"] = false
+		view["pool_status"] = "disabled"
+	}
+	return view
+}
+
 func serveAdminProbeBatch(w http.ResponseWriter, r *http.Request, options Options) {
 	if !requireAdminReadWrite(w, r, options, true) {
 		return
@@ -6897,20 +6941,29 @@ func serveAdminProbeBatch(w http.ResponseWriter, r *http.Request, options Option
 	if v, ok := body["auto_disable"].(bool); ok {
 		autoDisable = v
 	}
-	results := options.ModelHealth.ProbeIDs(r.Context(), ids, model, autoDisable, "manual")
+	surface := strings.ToLower(strings.TrimSpace(stringValue(body["surface"])))
+	if surface != "sso" {
+		surface = "oauth"
+	}
+	results := options.ModelHealth.ProbeIDsSurface(r.Context(), ids, model, autoDisable, "manual", surface)
 	// attach pool views
 	out := make([]map[string]any, 0, len(results))
 	for _, item := range results {
 		aid := stringValue(item["account_id"])
-		if pool, err := options.Store.GetAccountPoolView(r.Context(), aid); err == nil {
+		if surface == "sso" {
+			if result, _ := item["result"].(map[string]any); result != nil {
+				item["pool"] = ssoProbePoolView(result)
+			}
+		} else if pool, err := options.Store.GetAccountPoolView(r.Context(), aid); err == nil {
 			item["pool"] = pool
 		}
 		out = append(out, item)
 	}
-	// 新账号批量测活：对尚无 last_quota 的账号补拉类型 + 额度（最多 25，落库）。
-	attachQuotasAfterProbeBatch(r.Context(), options, out)
+	if surface != "sso" {
+		attachQuotasAfterProbeBatch(r.Context(), options, out)
+	}
 	// Quota fetch can race-mark free exhaust and cool; undo for probes that passed.
-	if options.Store != nil {
+	if surface != "sso" && options.Store != nil {
 		for _, item := range out {
 			if item == nil {
 				continue
@@ -9080,8 +9133,14 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 	if v, ok := body["auto_disable"].(bool); ok {
 		autoDisable = v
 	}
+	surface := strings.ToLower(strings.TrimSpace(stringValue(body["surface"])))
+	if surface != "sso" {
+		surface = "oauth"
+	} else {
+		model = "console/grok-4.3"
+	}
 	if options.ModelHealth != nil {
-		results := options.ModelHealth.ProbeIDs(r.Context(), []string{accountID}, model, autoDisable, "manual")
+		results := options.ModelHealth.ProbeIDsSurface(r.Context(), []string{accountID}, model, autoDisable, "manual", surface)
 		if len(results) == 0 {
 			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
 			return
@@ -9130,14 +9189,21 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 				poolView["pool_status"] = "disabled"
 			}
 		}
-		if dbPool, perr := options.Store.GetAccountPoolView(r.Context(), aid); perr == nil && dbPool != nil {
-			// Merge durable fields without overwriting live last_probe snapshot.
-			for k, v := range dbPool {
-				if k == "last_probe" {
-					continue
-				}
-				if _, has := poolView[k]; !has || poolView[k] == nil {
-					poolView[k] = v
+		if surface == "sso" {
+			poolView = ssoProbePoolView(result)
+			poolView["id"] = aid
+			poolView["account_id"] = aid
+		}
+		if surface != "sso" {
+			if dbPool, perr := options.Store.GetAccountPoolView(r.Context(), aid); perr == nil && dbPool != nil {
+				// Merge durable fields without overwriting live last_probe snapshot.
+				for k, v := range dbPool {
+					if k == "last_probe" {
+						continue
+					}
+					if _, has := poolView[k]; !has || poolView[k] == nil {
+						poolView[k] = v
+					}
 				}
 			}
 		}
@@ -9155,14 +9221,19 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 			}
 		}
 		errText := stringValue(result["error"])
-		if ok {
-			touchRedisPool(options, aid, true, "", nil, statusCode)
-		} else {
-			touchRedisPool(options, aid, false, errText, nil, statusCode)
+		if surface != "sso" {
+			if ok {
+				touchRedisPool(options, aid, true, "", nil, statusCode)
+			} else {
+				touchRedisPool(options, aid, false, errText, nil, statusCode)
+			}
 		}
 		// 测活同时拉账号类型 + 额度使用，写入 last_quota 并回传给管理台。
 		// 新导入账号常无额度缓存；这里补齐 Free/SuperGrok 与 token/美元用量。
-		quotaSnap := attachQuotaAfterProbe(r.Context(), options, aid, poolView)
+		var quotaSnap map[string]any
+		if surface != "sso" {
+			quotaSnap = attachQuotaAfterProbe(r.Context(), options, aid, poolView)
+		}
 		resp := map[string]any{
 			"ok": ok, "account_id": aid, "email": email,
 			"result": result, "pool": poolView,
@@ -9181,6 +9252,10 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 		return
 	}
 	// Fallback when ModelHealth is not wired (tests / degraded): still persist last_probe.
+	if surface == "sso" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "SSO model health unavailable"})
+		return
+	}
 	auth, err := options.Store.GetAccountAuth(r.Context(), accountID)
 	if err != nil || auth == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found or has no token"})
@@ -9719,6 +9794,10 @@ func serveAdminPage(w http.ResponseWriter, r *http.Request, staticDir, page stri
 		// Alias: menu meta key is "overview", file is admin/index.html.
 		name = "index"
 	}
+	if name == "accounts-sso" {
+		// OAuth and SSO pages share markup; core.js selects the credential surface by URL.
+		name = "accounts"
+	}
 	if !allowedAdminPage(name) {
 		http.NotFound(w, r)
 		return
@@ -9729,7 +9808,7 @@ func serveAdminPage(w http.ResponseWriter, r *http.Request, staticDir, page stri
 func allowedAdminPage(name string) bool {
 	switch name {
 	// Keep in sync with static/js PAGE_HREF / PAGE_META and static/admin/*.html.
-	case "index", "login", "keys", "accounts", "models", "guide", "settings", "logs", "usage":
+	case "index", "login", "keys", "accounts", "accounts-sso", "models", "guide", "settings", "logs", "usage":
 		return true
 	default:
 		return false

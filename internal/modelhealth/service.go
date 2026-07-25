@@ -18,6 +18,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/pool"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/store/redis"
+	"github.com/hm2899/grokcli-2api/internal/upstream/console"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 )
 
@@ -1222,6 +1223,10 @@ func (s *Service) ProbeAccount(ctx context.Context, auth postgres.AccountAuth, m
 }
 
 func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, model, source string, autoDisable bool, deferSave bool) map[string]any {
+	return s.probeAccountSurface(ctx, auth, model, source, autoDisable, deferSave, "oauth")
+}
+
+func (s *Service) probeAccountSurface(ctx context.Context, auth postgres.AccountAuth, model, source string, autoDisable bool, deferSave bool, surface string) map[string]any {
 	if model == "" {
 		model = firstModel(s.configuredModels())
 	}
@@ -1231,13 +1236,30 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 		"account_id": auth.ID, "email": auth.Email, "model": model,
 		"probed_at": started.Unix(), "source": source,
 	}
-	// Reuse shared transport; per-call Timeout is already on the client.
-	client := &grok.Client{BaseURL: s.Upstream, HTTP: s.probeHTTP()}
 	body := map[string]any{
 		"model": model, "stream": true, "max_tokens": 8,
 		"messages": []any{map[string]any{"role": "user", "content": "ping"}},
 	}
-	resp, err := client.Open(ctx, grok.Account{ID: auth.ID, Token: auth.Token}, model, body)
+	var resp *http.Response
+	var err error
+	if surface == "sso" {
+		base["model"] = "console/grok-4.3"
+		base["auth_surface"] = "sso"
+		if strings.TrimSpace(auth.SSO) == "" {
+			err = errors.New("account has no SSO")
+		} else {
+			client := &console.Client{HTTP: s.probeHTTP()}
+			resp, err = client.Open(ctx, pool.ConsoleAccount{ID: auth.ID, SSO: auth.SSO, Cookies: auth.Cookies}, "grok-4.3", body)
+		}
+	} else {
+		base["auth_surface"] = "oauth"
+		if strings.TrimSpace(auth.Token) == "" {
+			err = errors.New("account has no access token")
+		} else {
+			client := &grok.Client{BaseURL: s.Upstream, HTTP: s.probeHTTP()}
+			resp, err = client.Open(ctx, grok.Account{ID: auth.ID, Token: auth.Token}, model, body)
+		}
+	}
 	if err != nil {
 		status := 0
 		errText := err.Error()
@@ -1264,70 +1286,80 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 		srcLower := strings.ToLower(strings.TrimSpace(source))
 		skipMutate := srcLower == "register" || srcLower == "import" || srcLower == "registration" || srcLower == "sso_import"
 		if autoDisable && s.Store != nil && !skipMutate {
-
-			switch {
-			case status == 401 || status == 403:
-				if _, e := s.Store.SetAccountEnabled(ctx, auth.ID, false); e == nil {
-					base["auto_disabled"] = true
-				}
-			case isFreeUsageExhausted(errText) || status == 429:
-				// Classify: free-usage -> account cool only; bare 429 -> short cool.
-				// Free-usage must NOT write blocked_models (cool only; keep other models usable).
-				decision := pool.ClassifyUpstreamFailure(status, errText, model)
-				until := time.Now().Add(10 * time.Minute)
-				if decision.Until != nil {
-					until = *decision.Until
-				} else if decision.Class == pool.ClassFreeUsage {
-					until = time.Now().Add(2 * time.Hour)
-				}
-				// Cap cool window so probe storms cannot pin an account for days.
-				maxUntil := time.Now().Add(6 * time.Hour)
-				if until.After(maxUntil) {
-					until = maxUntil
-				}
-				// Only soft-block model when classifier explicitly asks AND this is NOT free-usage.
-				if decision.BlockModel && decision.Class != pool.ClassFreeUsage {
-					blockModel := model
-					if decision.Model != "" {
-						blockModel = decision.Model
+			if surface == "sso" {
+				// SSO health only controls SSO. Never write OAuth quota/cooldown/model blocks.
+				if status == 401 || status == 403 {
+					if _, e := s.Store.SetAccountSurfaceEnabled(ctx, auth.ID, "sso", false); e == nil {
+						base["auto_disabled"] = true
+						base["disabled_surface"] = "sso"
 					}
-					if blockModel != "" {
-						if e := s.Store.BlockPoolModel(ctx, auth.ID, blockModel, &until); e == nil {
-							base["model_blocked"] = true
-							base["blocked_model"] = blockModel
+				}
+			} else {
+				switch {
+				case status == 401 || status == 403:
+					if _, e := s.Store.SetAccountSurfaceEnabled(ctx, auth.ID, surface, false); e == nil {
+						base["auto_disabled"] = true
+						base["disabled_surface"] = surface
+					}
+				case isFreeUsageExhausted(errText) || status == 429:
+					// Classify: free-usage -> account cool only; bare 429 -> short cool.
+					// Free-usage must NOT write blocked_models (cool only; keep other models usable).
+					decision := pool.ClassifyUpstreamFailure(status, errText, model)
+					until := time.Now().Add(10 * time.Minute)
+					if decision.Until != nil {
+						until = *decision.Until
+					} else if decision.Class == pool.ClassFreeUsage {
+						until = time.Now().Add(2 * time.Hour)
+					}
+					// Cap cool window so probe storms cannot pin an account for days.
+					maxUntil := time.Now().Add(6 * time.Hour)
+					if until.After(maxUntil) {
+						until = maxUntil
+					}
+					// Only soft-block model when classifier explicitly asks AND this is NOT free-usage.
+					if decision.BlockModel && decision.Class != pool.ClassFreeUsage {
+						blockModel := model
+						if decision.Model != "" {
+							blockModel = decision.Model
+						}
+						if blockModel != "" {
+							if e := s.Store.BlockPoolModel(ctx, auth.ID, blockModel, &until); e == nil {
+								base["model_blocked"] = true
+								base["blocked_model"] = blockModel
+							}
 						}
 					}
-				}
-				sec := until.Sub(time.Now()).Seconds()
-				if sec < 60 {
-					sec = 60
-				}
-				if sec > 6*3600 {
-					sec = 6 * 3600
-				}
-				// Prefer classifier code in reason so KickFromPool clears free-usage model blocks.
-				kickReason := errText
-				if decision.Code != "" && !strings.Contains(strings.ToLower(errText), strings.ToLower(decision.Code)) {
-					kickReason = decision.Code + ": " + errText
-				}
-				if _, e2 := s.Store.KickFromPool(ctx, auth.ID, kickReason, &sec); e2 == nil {
-					base["kicked_cooldown"] = true
-					base["cooldown_code"] = decision.Code
-					base["failure_class"] = string(decision.Class)
-				}
-				// Free-usage: ensure no leftover model soft-block from older probes.
-				if decision.Class == pool.ClassFreeUsage {
-					_ = s.Store.UnblockPoolModel(ctx, auth.ID, "")
-				}
-			case status >= 500:
-				sec := 300.0
-				if _, e := s.Store.KickFromPool(ctx, auth.ID, errText, &sec); e == nil {
-					base["kicked_cooldown"] = true
+					sec := until.Sub(time.Now()).Seconds()
+					if sec < 60 {
+						sec = 60
+					}
+					if sec > 6*3600 {
+						sec = 6 * 3600
+					}
+					// Prefer classifier code in reason so KickFromPool clears free-usage model blocks.
+					kickReason := errText
+					if decision.Code != "" && !strings.Contains(strings.ToLower(errText), strings.ToLower(decision.Code)) {
+						kickReason = decision.Code + ": " + errText
+					}
+					if _, e2 := s.Store.KickFromPool(ctx, auth.ID, kickReason, &sec); e2 == nil {
+						base["kicked_cooldown"] = true
+						base["cooldown_code"] = decision.Code
+						base["failure_class"] = string(decision.Class)
+					}
+					// Free-usage: ensure no leftover model soft-block from older probes.
+					if decision.Class == pool.ClassFreeUsage {
+						_ = s.Store.UnblockPoolModel(ctx, auth.ID, "")
+					}
+				case status >= 500:
+					sec := 300.0
+					if _, e := s.Store.KickFromPool(ctx, auth.ID, errText, &sec); e == nil {
+						base["kicked_cooldown"] = true
+					}
 				}
 			}
 		}
 		if s.Store != nil && !deferSave {
-			_ = s.Store.SaveLastProbe(ctx, auth.ID, base)
+			_ = s.Store.SaveSurfaceProbe(ctx, auth.ID, surface, base)
 		}
 		return base
 	}
@@ -1338,7 +1370,7 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 		base["error"] = "empty model output"
 		base["latency_ms"] = time.Since(started).Milliseconds()
 		if s.Store != nil && !deferSave {
-			_ = s.Store.SaveLastProbe(ctx, auth.ID, base)
+			_ = s.Store.SaveSurfaceProbe(ctx, auth.ID, surface, base)
 		}
 		return base
 	}
@@ -1347,25 +1379,35 @@ func (s *Service) probeAccount(ctx context.Context, auth postgres.AccountAuth, m
 	base["status_code"] = resp.StatusCode
 	base["latency_ms"] = time.Since(started).Milliseconds()
 	if s.Store != nil {
-		// Clearing cooldown is still immediate so recovered accounts re-enter rotation
-		// even when last_probe is deferred to the batch flush.
-		if _, err := s.Store.ClearAccountCooldown(ctx, auth.ID); err == nil {
-			base["recovered"] = true
-		}
-		// Successful probe for this model clears its soft/hard block (Python parity).
-		if model != "" {
-			if err := s.Store.UnblockPoolModel(ctx, auth.ID, model); err == nil {
-				base["unblocked_model"] = model
+		if surface != "sso" {
+			// Clearing cooldown is still immediate so recovered accounts re-enter rotation
+			// even when last_probe is deferred to the batch flush.
+			if _, err := s.Store.ClearAccountCooldown(ctx, auth.ID); err == nil {
+				base["recovered"] = true
+			}
+			// Successful probe for this model clears its soft/hard block (Python parity).
+			if model != "" {
+				if err := s.Store.UnblockPoolModel(ctx, auth.ID, model); err == nil {
+					base["unblocked_model"] = model
+				}
 			}
 		}
 		if !deferSave {
-			_ = s.Store.SaveLastProbe(ctx, auth.ID, base)
+			_ = s.Store.SaveSurfaceProbe(ctx, auth.ID, surface, base)
 		}
 	}
 	return base
 }
 
+func (s *Service) ProbeIDsSurface(ctx context.Context, ids []string, model string, autoDisable bool, source, surface string) []map[string]any {
+	return s.probeIDs(ctx, ids, model, autoDisable, source, surface)
+}
+
 func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, autoDisable bool, source string) []map[string]any {
+	return s.probeIDs(ctx, ids, model, autoDisable, source, "oauth")
+}
+
+func (s *Service) probeIDs(ctx context.Context, ids []string, model string, autoDisable bool, source, surface string) []map[string]any {
 	out := make([]map[string]any, 0, len(ids))
 	if len(ids) == 0 {
 		return out
@@ -1406,7 +1448,7 @@ func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, auto
 			}
 			// deferSave=true: return probe results first; last_probe flushed async below.
 			// Kick/Clear/Block still apply immediately during probe.
-			probe := s.probeAccount(ctx, *r.auth, probeModel, source, autoDisable, true)
+			probe := s.probeAccountSurface(ctx, *r.auth, probeModel, source, autoDisable, true, surface)
 			ok := probe["available"] == true
 			results[i] = map[string]any{"ok": ok, "account_id": r.auth.ID, "email": r.auth.Email, "result": probe}
 		}
@@ -1434,16 +1476,23 @@ func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, auto
 			batch = append(batch, res)
 		}
 		if len(batch) > 0 {
-			go func(batch []map[string]any) {
+			go func(batch []map[string]any, surface string) {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
+				if surface == "sso" {
+					for _, p := range batch {
+						aid, _ := p["account_id"].(string)
+						_ = s.Store.SaveSurfaceProbe(ctx, aid, surface, p)
+					}
+					return
+				}
 				if _, err := s.Store.SaveLastProbesBatch(ctx, batch); err != nil {
 					for _, p := range batch {
 						aid, _ := p["account_id"].(string)
-						_ = s.Store.SaveLastProbe(ctx, aid, p)
+						_ = s.Store.SaveSurfaceProbe(ctx, aid, surface, p)
 					}
 				}
-			}(batch)
+			}(batch, surface)
 		}
 	}
 
@@ -1465,18 +1514,20 @@ func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, auto
 			}
 		}
 	}
-	s.mu.Lock()
-	s.last = map[string]any{
-		"ok": true, "source": source, "implementation": "go", "at": time.Now().Unix(),
-		"probed": len(ids), "count": len(ids),
-		"available": available, "available_count": available,
-		"failed": len(ids) - available, "unavailable_count": len(ids) - available,
-		"auto_action_count": kickCooldown + kickDisabled + modelBlocks,
-		"kick_cooldown":     kickCooldown, "kick_disabled": kickDisabled, "model_blocked_count": modelBlocks,
-		"model": probeModel, "models": []string{probeModel},
-		"workers": workers,
+	if surface != "sso" {
+		s.mu.Lock()
+		s.last = map[string]any{
+			"ok": true, "source": source, "implementation": "go", "at": time.Now().Unix(),
+			"probed": len(ids), "count": len(ids),
+			"available": available, "available_count": available,
+			"failed": len(ids) - available, "unavailable_count": len(ids) - available,
+			"auto_action_count": kickCooldown + kickDisabled + modelBlocks,
+			"kick_cooldown":     kickCooldown, "kick_disabled": kickDisabled, "model_blocked_count": modelBlocks,
+			"model": probeModel, "models": []string{probeModel},
+			"workers": workers,
+		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
 	return out
 }
 

@@ -14,13 +14,15 @@ var ErrNoEligibleAccounts = errors.New("no eligible accounts")
 type Candidate struct {
 	ID               string
 	Token            string
-	SSO              string // xAI SSO cookie for web/console
+	SSO              string            // xAI SSO cookie for web/console
 	Cookies          map[string]string // optional CF edge cookies for console/web
 	Email            string
 	UserID           string
 	TeamID           string
 	ExpiresAt        *time.Time
 	Enabled          bool
+	OAuthDisabled    bool
+	SSODisabled      bool
 	DisabledForQuota bool
 	CooldownUntil    *time.Time
 	BlockedModels    map[string]any
@@ -53,9 +55,9 @@ func (c Candidate) Eligible(model string, now time.Time) bool {
 func (c Candidate) AuthEligible(auth string) bool {
 	switch strings.ToLower(strings.TrimSpace(auth)) {
 	case "sso":
-		return strings.TrimSpace(c.SSO) != ""
+		return !c.SSODisabled && strings.TrimSpace(c.SSO) != ""
 	default: // token / build
-		return strings.TrimSpace(c.Token) != ""
+		return c.Enabled && !c.OAuthDisabled && strings.TrimSpace(c.Token) != ""
 	}
 }
 
@@ -204,11 +206,21 @@ func numericBlockActive(v, nowUnix float64) bool {
 
 // FilterByAuth keeps candidates that can satisfy the required auth surface.
 func FilterByAuth(candidates []Candidate, auth string) []Candidate {
+	surface := strings.ToLower(strings.TrimSpace(auth))
 	out := make([]Candidate, 0, len(candidates))
 	for _, c := range candidates {
-		if c.AuthEligible(auth) {
-			out = append(out, c)
+		if !c.AuthEligible(surface) {
+			continue
 		}
+		if surface == "sso" {
+			// OAuth state must not remove a valid SSO candidate.
+			c.Enabled = true
+			c.DisabledForQuota = false
+			c.CooldownUntil = nil
+			c.BlockedModels = nil
+			c.ExpiresAt = nil
+		}
+		out = append(out, c)
 	}
 	return out
 }

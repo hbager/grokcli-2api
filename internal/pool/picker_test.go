@@ -73,6 +73,25 @@ func TestModelBlockedObjectUntil(t *testing.T) {
 	}
 }
 
+func TestFilterByAuthKeepsSSOIndependentFromOAuthState(t *testing.T) {
+	now := time.Unix(1000, 0)
+	past := now.Add(-time.Minute)
+	future := now.Add(time.Minute)
+	candidate := Candidate{
+		ID: "both", Token: "token", SSO: "sso", Enabled: false,
+		DisabledForQuota: true, ExpiresAt: &past, CooldownUntil: &future,
+		BlockedModels: map[string]any{"grok-4.3": true},
+	}
+	sso := Chain(FilterByAuth([]Candidate{candidate}, "sso"), "grok-4.3", "round_robin", now, 1)
+	if len(sso) != 1 || sso[0].ID != candidate.ID {
+		t.Fatalf("SSO should ignore OAuth state: %#v", sso)
+	}
+	token := Chain(FilterByAuth([]Candidate{candidate}, "token"), "grok-4.3", "round_robin", now, 1)
+	if len(token) != 0 {
+		t.Fatalf("OAuth-disabled candidate should not enter token chain: %#v", token)
+	}
+}
+
 func TestAuthEligible(t *testing.T) {
 	tok := Candidate{ID: "a", Token: "t", Enabled: true}
 	sso := Candidate{ID: "b", SSO: "s", Enabled: true}

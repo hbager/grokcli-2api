@@ -20,8 +20,8 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
 	"github.com/hm2899/grokcli-2api/internal/provider"
 	"github.com/hm2899/grokcli-2api/internal/upstream/console"
-	"github.com/hm2899/grokcli-2api/internal/upstream/web"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
+	"github.com/hm2899/grokcli-2api/internal/upstream/web"
 )
 
 // AccountFailureReporter is notified for every upstream account attempt that
@@ -29,7 +29,7 @@ import (
 // classify free-usage / 额度用完 bodies and kick accounts into the cooldown pool
 // even when a later account eventually succeeds the request.
 type AccountFailureReporter interface {
-	ReportAccountFailure(accountID, model string, err error)
+	ReportAccountFailure(accountID, model, surface string, err error)
 }
 
 type ChatService struct {
@@ -185,7 +185,7 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		if err != nil {
 			// Intermediate + final losers: report so free-usage / 额度用完 bodies
 			// enter the cooldown pool even when a later account succeeds.
-			s.reportAccountFailure(accountID, model, err)
+			s.reportAccountFailure(accountID, model, route.Auth, err)
 			s.releasePick(ctx, accountID)
 			lastFailAccountID = accountID
 			if stickyFirst && i == 0 && shouldDropStickyPin(err) {
@@ -205,7 +205,7 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		readErr := grok.ReadSSE(rc, collector.feed)
 		_ = rc.Close()
 		if readErr != nil {
-			s.reportAccountFailure(accountID, model, readErr)
+			s.reportAccountFailure(accountID, model, route.Auth, readErr)
 			s.releasePick(ctx, accountID)
 			return ChatResult{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, readErr
 		}
@@ -224,7 +224,7 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 			}, nil
 		}
 		lastEmpty = &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
-		s.reportAccountFailure(accountID, model, lastEmpty)
+		s.reportAccountFailure(accountID, model, route.Auth, lastEmpty)
 		s.releasePick(ctx, accountID)
 		lastFailAccountID = accountID
 		if stickyFirst && i == 0 {
@@ -309,14 +309,14 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 		s.markAttempt(ctx, candidate.ID)
 		accountID, rc, err := s.openAccountAttempt(ctx, candidate, route, body)
 		if err != nil {
-			s.reportAccountFailure(accountID, model, err)
+			s.reportAccountFailure(accountID, model, route.Auth, err)
 			s.releasePick(ctx, accountID)
 			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, false, err
 		}
 		guarded, empty, err := guardStreamAgainstEmpty(rc)
 		if err != nil {
 			_ = rc.Close()
-			s.reportAccountFailure(accountID, model, err)
+			s.reportAccountFailure(accountID, model, route.Auth, err)
 			s.releasePick(ctx, accountID)
 			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, false, err
 		}
@@ -324,7 +324,7 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 			_ = guarded.Close()
 			s.releasePick(ctx, accountID)
 			emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
-			s.reportAccountFailure(accountID, model, emptyErr)
+			s.reportAccountFailure(accountID, model, route.Auth, emptyErr)
 			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, false, emptyErr
 		}
 		// Silence-pass may still hollow-end empty (Claude high-effort). Confirm briefly
@@ -334,7 +334,7 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 			if guarded != nil {
 				_ = guarded.Close()
 			}
-			s.reportAccountFailure(accountID, model, err)
+			s.reportAccountFailure(accountID, model, route.Auth, err)
 			s.releasePick(ctx, accountID)
 			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, false, err
 		}
@@ -344,7 +344,7 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 			}
 			s.releasePick(ctx, accountID)
 			emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
-			s.reportAccountFailure(accountID, model, emptyErr)
+			s.reportAccountFailure(accountID, model, route.Auth, emptyErr)
 			return StreamOpen{PreferAccount: prefer, FirstAccount: first, Fingerprint: fingerprint, Accounts: len(chain), Prep: prep, AccountID: accountID}, false, emptyErr
 		}
 		failover := first != "" && accountID != first
@@ -591,7 +591,7 @@ func (s *ChatService) parallelFirstByteOpen(
 		attempt, err := OpenWithFailover(attemptCtx, client, []grok.Account{account}, model, body, &CommitState{})
 		if err != nil {
 			if attemptCtx.Err() == nil {
-				s.reportAccountFailure(account.ID, model, err)
+				s.reportAccountFailure(account.ID, model, provider.AuthToken, err)
 			}
 			result.err = err
 			return result
@@ -608,7 +608,7 @@ func (s *ChatService) parallelFirstByteOpen(
 		if err != nil {
 			_ = attempt.Body.Close()
 			if attemptCtx.Err() == nil {
-				s.reportAccountFailure(account.ID, model, err)
+				s.reportAccountFailure(account.ID, model, provider.AuthToken, err)
 			}
 			result.err = err
 			return result
@@ -617,7 +617,7 @@ func (s *ChatService) parallelFirstByteOpen(
 			_ = guarded.Close()
 			emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
 			if attemptCtx.Err() == nil {
-				s.reportAccountFailure(account.ID, model, emptyErr)
+				s.reportAccountFailure(account.ID, model, provider.AuthToken, emptyErr)
 			}
 			result.err = emptyErr
 			return result
@@ -631,7 +631,7 @@ func (s *ChatService) parallelFirstByteOpen(
 				_ = guarded.Close()
 			}
 			if attemptCtx.Err() == nil {
-				s.reportAccountFailure(account.ID, model, err)
+				s.reportAccountFailure(account.ID, model, provider.AuthToken, err)
 			}
 			result.err = err
 			return result
@@ -642,7 +642,7 @@ func (s *ChatService) parallelFirstByteOpen(
 			}
 			emptyErr := &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
 			if attemptCtx.Err() == nil {
-				s.reportAccountFailure(account.ID, model, emptyErr)
+				s.reportAccountFailure(account.ID, model, provider.AuthToken, emptyErr)
 			}
 			result.err = emptyErr
 			return result
@@ -2666,7 +2666,7 @@ func (m *multiClose) Close() error {
 // reportAccountFailure notifies the optional FailureReporter about a failed
 // attempt. Used for intermediate failover losers so free-usage / 额度用完 bodies
 // still kick the account into the cooldown pool even when another account wins.
-func (s *ChatService) reportAccountFailure(accountID, model string, err error) {
+func (s *ChatService) reportAccountFailure(accountID, model, surface string, err error) {
 	if s == nil || s.FailureReporter == nil || err == nil {
 		return
 	}
@@ -2674,7 +2674,7 @@ func (s *ChatService) reportAccountFailure(accountID, model string, err error) {
 	if accountID == "" {
 		return
 	}
-	s.FailureReporter.ReportAccountFailure(accountID, model, err)
+	s.FailureReporter.ReportAccountFailure(accountID, model, surface, err)
 }
 
 func (s *ChatService) markAttempt(ctx context.Context, accountID string) {

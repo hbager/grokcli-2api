@@ -44,21 +44,24 @@ func (c *Connector) GetPoolCandidate(ctx context.Context, accountID string) (*po
 		SELECT a.id, a.payload, a.email, a.user_id, a.team_id, a.expires_at,
 		       COALESCE(ap.enabled, true), COALESCE(ap.disabled_for_quota, false),
 		       ap.cooldown_until, COALESCE(ap.blocked_models, '{}'::jsonb),
-		       COALESCE(ap.request_count, 0), COALESCE(ap.weight, 1)
+		       COALESCE(ap.request_count, 0), COALESCE(ap.weight, 1), COALESCE(ap.extra, '{}'::jsonb)
 		FROM accounts a
 		LEFT JOIN account_pool ap ON ap.account_id = a.id
 		WHERE a.id = $1
 		LIMIT 1`, accountID)
 	var candidate pool.Candidate
-	var payloadBytes, blockedBytes []byte
+	var payloadBytes, blockedBytes, extraBytes []byte
 	var email, userID, teamID *string
 	var expiresAt, cooldownUntil *time.Time
-	if err := row.Scan(&candidate.ID, &payloadBytes, &email, &userID, &teamID, &expiresAt, &candidate.Enabled, &candidate.DisabledForQuota, &cooldownUntil, &blockedBytes, &candidate.RequestCount, &candidate.Weight); err != nil {
+	if err := row.Scan(&candidate.ID, &payloadBytes, &email, &userID, &teamID, &expiresAt, &candidate.Enabled, &candidate.DisabledForQuota, &cooldownUntil, &blockedBytes, &candidate.RequestCount, &candidate.Weight, &extraBytes); err != nil {
 		return nil, err
 	}
 	payload := decodeMap(payloadBytes)
-	candidate.Token, _ = firstString(payload, "key", "access_token", "token")
+	extra := decodeMap(extraBytes)
+	candidate.Token = payloadAccessToken(payload)
 	candidate.SSO = accounts.GetSSOValue(payload)
+	candidate.OAuthDisabled = !surfaceEnabled(extra, "oauth", candidate.Enabled)
+	candidate.SSODisabled = !surfaceEnabled(extra, "sso", true)
 	candidate.Cookies = accounts.GetCloudflareCookies(payload)
 	candidate.Email = stringValue(email, stringFromMap(payload, "email"))
 	candidate.UserID = stringValue(userID, firstMapString(payload, "user_id", "principal_id"))
@@ -95,27 +98,49 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 		candidateCacheMu.Unlock()
 
 		rows, err := c.Pool.Query(ctx, `
+			WITH candidate_ids AS (
+				(SELECT a.id
+				 FROM accounts a LEFT JOIN account_pool ap ON ap.account_id = a.id
+				 WHERE COALESCE((ap.extra->>'oauth_enabled')::boolean, COALESCE(ap.enabled, true)) = true
+				   AND COALESCE(ap.disabled_for_quota, false) = false
+				   AND (ap.cooldown_until IS NULL OR ap.cooldown_until <= now())
+				   AND (a.expires_at IS NULL OR a.expires_at > now())
+				   AND (
+				        (NULLIF(btrim(COALESCE(a.payload->>'key','')), '') IS NOT NULL AND lower(a.payload->>'key') NOT LIKE 'sso-pending:%' AND lower(a.payload->>'key') NOT LIKE 'sso_pending:%')
+				     OR (NULLIF(btrim(COALESCE(a.payload->>'access_token','')), '') IS NOT NULL AND lower(a.payload->>'access_token') NOT LIKE 'sso-pending:%' AND lower(a.payload->>'access_token') NOT LIKE 'sso_pending:%')
+				     OR (NULLIF(btrim(COALESCE(a.payload->>'token','')), '') IS NOT NULL AND lower(a.payload->>'token') NOT LIKE 'sso-pending:%' AND lower(a.payload->>'token') NOT LIKE 'sso_pending:%')
+				   )
+				 ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.fail_count, 0) ASC, COALESCE(ap.request_count, 0) ASC, a.id ASC
+				 LIMIT 48)
+				UNION
+				(SELECT a.id
+				 FROM accounts a LEFT JOIN account_pool ap ON ap.account_id = a.id
+				 WHERE COALESCE((ap.extra->>'sso_enabled')::boolean, true) = true
+				   AND (
+				        NULLIF(btrim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL
+				     OR NULLIF(btrim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL
+				     OR NULLIF(btrim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL
+				     OR NULLIF(btrim(COALESCE(a.payload#>>'{session_cookies,sso}','')), '') IS NOT NULL
+				     OR NULLIF(btrim(COALESCE(a.payload#>>'{session_cookies,sso-rw}','')), '') IS NOT NULL
+				     OR NULLIF(btrim(COALESCE(a.payload#>>'{cookies,sso}','')), '') IS NOT NULL
+				     OR NULLIF(btrim(COALESCE(a.payload#>>'{cookies,sso-rw}','')), '') IS NOT NULL
+				     OR COALESCE(a.payload->>'cookie','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*='
+				     OR COALESCE(a.payload->>'cookies','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*='
+				     OR COALESCE(a.payload->>'set_cookie','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*='
+				     OR COALESCE(a.payload->>'set-cookie','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*='
+				     OR COALESCE(a.payload->>'set_cookies','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*='
+				   )
+				 ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.request_count, 0) ASC, a.id ASC
+				 LIMIT 48)
+			)
 			SELECT a.id, a.payload, a.email, a.user_id, a.team_id, a.expires_at,
 			       COALESCE(ap.enabled, true), COALESCE(ap.disabled_for_quota, false),
 			       ap.cooldown_until, COALESCE(ap.blocked_models, '{}'::jsonb),
-			       COALESCE(ap.request_count, 0), COALESCE(ap.weight, 1)
-			FROM accounts a
+			       COALESCE(ap.request_count, 0), COALESCE(ap.weight, 1), COALESCE(ap.extra, '{}'::jsonb)
+			FROM candidate_ids ci
+			JOIN accounts a ON a.id = ci.id
 			LEFT JOIN account_pool ap ON ap.account_id = a.id
-			WHERE COALESCE(ap.enabled, true) = true
-			  AND COALESCE(ap.disabled_for_quota, false) = false
-			  AND (ap.cooldown_until IS NULL OR ap.cooldown_until <= now())
-			  AND (a.expires_at IS NULL OR a.expires_at > now())
-			  AND (
-			        COALESCE(a.payload->>'key', '') <> ''
-			     OR COALESCE(a.payload->>'access_token', '') <> ''
-			     OR COALESCE(a.payload->>'token', '') <> ''
-			     OR NULLIF(btrim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL
-			     OR NULLIF(btrim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL
-			     OR NULLIF(btrim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL
-			     OR NULLIF(btrim(COALESCE(a.payload#>>'{session_cookies,sso}','')), '') IS NOT NULL
-			  )
-			ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.fail_count, 0) ASC, COALESCE(ap.request_count, 0) ASC, a.id ASC
-			LIMIT 48`)
+			ORDER BY COALESCE(ap.weight, 1) DESC, COALESCE(ap.request_count, 0) ASC, a.id ASC`)
 		if err != nil {
 			return nil, err
 		}
@@ -123,16 +148,19 @@ func (c *Connector) ListPoolCandidates(ctx context.Context) ([]pool.Candidate, e
 		out := []pool.Candidate{}
 		for rows.Next() {
 			var candidate pool.Candidate
-			var payloadBytes, blockedBytes []byte
+			var payloadBytes, blockedBytes, extraBytes []byte
 			var email, userID, teamID *string
 			var expiresAt, cooldownUntil *time.Time
-			if err := rows.Scan(&candidate.ID, &payloadBytes, &email, &userID, &teamID, &expiresAt, &candidate.Enabled, &candidate.DisabledForQuota, &cooldownUntil, &blockedBytes, &candidate.RequestCount, &candidate.Weight); err != nil {
+			if err := rows.Scan(&candidate.ID, &payloadBytes, &email, &userID, &teamID, &expiresAt, &candidate.Enabled, &candidate.DisabledForQuota, &cooldownUntil, &blockedBytes, &candidate.RequestCount, &candidate.Weight, &extraBytes); err != nil {
 				return nil, err
 			}
 			payload := decodeMap(payloadBytes)
-			candidate.Token, _ = firstString(payload, "key", "access_token", "token")
+			extra := decodeMap(extraBytes)
+			candidate.Token = payloadAccessToken(payload)
 			candidate.SSO = accounts.GetSSOValue(payload)
-	candidate.Cookies = accounts.GetCloudflareCookies(payload)
+			candidate.OAuthDisabled = !surfaceEnabled(extra, "oauth", candidate.Enabled)
+			candidate.SSODisabled = !surfaceEnabled(extra, "sso", true)
+			candidate.Cookies = accounts.GetCloudflareCookies(payload)
 			candidate.Email = stringValue(email, stringFromMap(payload, "email"))
 			candidate.UserID = stringValue(userID, firstMapString(payload, "user_id", "principal_id"))
 			candidate.TeamID = stringValue(teamID, stringFromMap(payload, "team_id"))
@@ -461,6 +489,68 @@ func stringValue(ptr *string, fallback string) string {
 	return fallback
 }
 
+// SetAccountSurfaceEnabled toggles OAuth/build and SSO/console independently.
+// Flags live in account_pool.extra so no schema migration is needed.
+func (c *Connector) SetAccountSurfaceEnabled(ctx context.Context, accountID, surface string, enabled bool) (map[string]any, error) {
+	c.InvalidateCandidateCache()
+	accountID = strings.TrimSpace(accountID)
+	surface = strings.ToLower(strings.TrimSpace(surface))
+	if accountID == "" {
+		return nil, errors.New("account id required")
+	}
+	if surface != "oauth" && surface != "sso" {
+		return nil, errors.New("surface must be oauth or sso")
+	}
+	if err := c.ensureAccountExists(ctx, accountID); err != nil {
+		return nil, err
+	}
+	globalEnabled := true
+	var extraBytes, payloadBytes []byte
+	_ = c.Pool.QueryRow(ctx, `
+		SELECT COALESCE(ap.enabled, true), COALESCE(ap.extra, '{}'::jsonb), a.payload
+		FROM accounts a LEFT JOIN account_pool ap ON ap.account_id = a.id
+		WHERE a.id = $1`, accountID).Scan(&globalEnabled, &extraBytes, &payloadBytes)
+	extra := decodeMap(extraBytes)
+	payload := decodeMap(payloadBytes)
+	oauthEnabled := surfaceEnabled(extra, "oauth", globalEnabled) && payloadAccessToken(payload) != ""
+	ssoEnabled := surfaceEnabled(extra, "sso", true) && hasSSO(payload)
+	if surface == "oauth" {
+		oauthEnabled = enabled && payloadAccessToken(payload) != ""
+	} else {
+		ssoEnabled = enabled && hasSSO(payload)
+	}
+	extra["oauth_enabled"] = oauthEnabled
+	extra["sso_enabled"] = ssoEnabled
+	encoded, err := json.Marshal(extra)
+	if err != nil {
+		return nil, err
+	}
+	anyEnabled := oauthEnabled || ssoEnabled
+	status := "disabled"
+	if anyEnabled {
+		status = "normal"
+	}
+	_, err = c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (account_id, enabled, pool_status, extra, updated_at)
+		VALUES ($1, $2, $3, $4::jsonb, now())
+		ON CONFLICT (account_id) DO UPDATE SET
+			enabled = EXCLUDED.enabled,
+			pool_status = CASE
+				WHEN EXCLUDED.enabled = false THEN 'disabled'
+				WHEN account_pool.disabled_for_quota = true THEN 'quota_disabled'
+				WHEN account_pool.cooldown_until IS NOT NULL AND account_pool.cooldown_until > now() THEN 'cooldown'
+				WHEN COALESCE(account_pool.blocked_models, '{}'::jsonb) <> '{}'::jsonb THEN 'model_blocked'
+				ELSE 'normal'
+			END,
+			extra = EXCLUDED.extra,
+			updated_at = now()`, accountID, anyEnabled, status, encoded)
+	if err != nil {
+		return nil, err
+	}
+	c.InvalidatePoolSummaryCache()
+	return c.GetAccountPoolView(ctx, accountID)
+}
+
 // SetAccountEnabled toggles pool enabled flag. Re-enable clears cooldown/quota/model blocks.
 func (c *Connector) SetAccountEnabled(ctx context.Context, accountID string, enabled bool) (map[string]any, error) {
 	c.InvalidateCandidateCache()
@@ -491,8 +581,8 @@ func (c *Connector) SetAccountEnabled(ctx context.Context, accountID string, ena
 				cooldown_count = 0,
 				last_error = NULL,
 				pool_status = 'normal',
-				extra = (COALESCE(account_pool.extra, '{}'::jsonb) - 'status_stack' - 'cooldown_count')
-					|| jsonb_build_object('consecutive_fails', 0),
+				extra = ((COALESCE(account_pool.extra, '{}'::jsonb) - 'status_stack' - 'cooldown_count')
+					|| jsonb_build_object('consecutive_fails', 0, 'oauth_enabled', true, 'sso_enabled', true)),
 				updated_at = now()
 		`, accountID)
 		if err != nil {
@@ -501,10 +591,12 @@ func (c *Connector) SetAccountEnabled(ctx context.Context, accountID string, ena
 	} else {
 		_, err := c.Pool.Exec(ctx, `
 			INSERT INTO account_pool (account_id, enabled, pool_status, extra, updated_at)
-			VALUES ($1, false, 'disabled', '{}'::jsonb, now())
+			VALUES ($1, false, 'disabled', jsonb_build_object('oauth_enabled', false, 'sso_enabled', false), now())
 			ON CONFLICT (account_id) DO UPDATE SET
 				enabled = false,
 				pool_status = 'disabled',
+				extra = COALESCE(account_pool.extra, '{}'::jsonb)
+					|| jsonb_build_object('oauth_enabled', false, 'sso_enabled', false),
 				updated_at = now()
 		`, accountID)
 		if err != nil {
@@ -994,6 +1086,8 @@ func (c *Connector) GetAccountPoolView(ctx context.Context, accountID string) (m
 		"user_id":                stringPtr(userID),
 		"team_id":                stringPtr(teamID),
 		"enabled":                enabled,
+		"oauth_enabled":          surfaceEnabled(extra, "oauth", enabled),
+		"sso_enabled":            surfaceEnabled(extra, "sso", true),
 		"weight":                 weight,
 		"request_count":          requestCount,
 		"success_count":          successCount,

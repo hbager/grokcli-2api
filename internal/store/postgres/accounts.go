@@ -26,6 +26,7 @@ type AccountList struct {
 	Sort       string           `json:"sort"`
 	Status     string           `json:"status,omitempty"`
 	HasSSO     *bool            `json:"has_sso,omitempty"`
+	Surface    string           `json:"surface,omitempty"`
 	// Pool is the mutually-exclusive DB account_pool summary (same as /status pool).
 	Pool         *PoolSummary `json:"pool,omitempty"`
 	StoreSource  string       `json:"store_source,omitempty"`
@@ -39,7 +40,8 @@ type AccountListFilter struct {
 	Sort    string
 	Status  string // "", live, cooldown, disabled, quota_disabled, model_blocked, expired, normal
 	HasSSO  *bool
-	IDsOnly bool // when true, return only matching ids (for "筛选全选")
+	Surface string // "", oauth, sso
+	IDsOnly bool   // when true, return only matching ids (for "筛选全选")
 }
 
 func (c *Connector) ListAccountSummaries(ctx context.Context, page, pageSize int, query, sort string) (AccountList, error) {
@@ -51,6 +53,7 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 	orderBy := accountOrderSQL(sort)
 	query := strings.TrimSpace(strings.ToLower(filter.Query))
 	status := normalizeAccountStatusFilter(filter.Status)
+	selectedSurface := strings.ToLower(strings.TrimSpace(filter.Surface))
 	if page < 1 {
 		page = 1
 	}
@@ -64,7 +67,7 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 		pageSize = 20000
 	}
 
-	where, args := buildAccountListWhere(query, status, filter.HasSSO)
+	where, args := buildAccountListWhere(query, status, filter.HasSSO, filter.Surface)
 
 	var total int64
 	countSQL := "SELECT COUNT(*) FROM accounts a LEFT JOIN account_pool ap ON ap.account_id = a.id " + where
@@ -137,7 +140,7 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 		}
 		payload := decodeMap(payloadBytes)
 		extra := decodeMap(extraBytes)
-		token, _ := firstString(payload, "key", "access_token", "token")
+		token := payloadAccessToken(payload)
 		expired := expiresAt != nil && now.After(*expiresAt)
 		poolEnabled := true
 		if enabled != nil {
@@ -218,6 +221,40 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 			"last_renew_status":      stringFromMap(extra, "last_renew_status"),
 			"last_renew_source":      stringFromMap(extra, "last_renew_source"),
 		}
+		if selectedSurface == "sso" {
+			probe := mapFromAny(extra["sso_last_probe"])
+			probeStatus := ""
+			if len(probe) > 0 {
+				if available, _ := probe["available"].(bool); available {
+					probeStatus = "ok"
+				} else {
+					probeStatus = "fail"
+				}
+			} else {
+				probe = nil
+			}
+			pool["enabled"] = surfaceEnabled(extra, "sso", true)
+			pool["request_count"] = intFromMap(extra, "sso_request_count")
+			pool["success_count"] = intFromMap(extra, "sso_success_count")
+			pool["fail_count"] = intFromMap(extra, "sso_fail_count")
+			pool["last_used_at"] = extra["sso_last_used_at"]
+			pool["last_error"] = stringFromMap(extra, "sso_last_error")
+			pool["last_probe"] = probe
+			pool["last_probe_status"] = probeStatus
+			pool["cooldown_until"] = nil
+			pool["cooldown_remaining_sec"] = 0
+			pool["in_cooldown"] = false
+			pool["disabled_for_quota"] = false
+			pool["blocked_models"] = map[string]any{}
+			pool["blocked_model_ids"] = []string{}
+			if pool["enabled"] == true {
+				pool["pool_status"] = "normal"
+			} else {
+				pool["pool_status"] = "disabled"
+			}
+		} else {
+			pool["enabled"] = surfaceEnabled(extra, "oauth", poolEnabled)
+		}
 		// Promote durable plan/type from last_quota so UI/API consumers see it
 		// even without digging into _pool (survives refresh from DB).
 		lastQuotaMap := SanitizeLastQuotaForAPI(decodeMap(lastQuota))
@@ -243,7 +280,10 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 			"expires_at":        unixOrNil(expiresAt),
 			"expired":           expired,
 			"has_refresh_token": strings.TrimSpace(stringFromMap(payload, "refresh_token")) != "",
+			"has_access_token":  token != "",
 			"has_sso":           hasSSO(payload),
+			"oauth_enabled":     surfaceEnabled(extra, "oauth", poolEnabled),
+			"sso_enabled":       surfaceEnabled(extra, "sso", true),
 			"token_hint":        tokenHint(token),
 			"first_name":        payload["first_name"],
 			"last_name":         payload["last_name"],
@@ -261,6 +301,7 @@ func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, page
 	out := AccountList{
 		Accounts: accounts, Total: total, Page: pageOut, PageSize: pageSizeOut,
 		TotalPages: totalPages, Query: query, Sort: sort, Status: status, HasSSO: filter.HasSSO,
+		Surface:     selectedSurface,
 		StoreSource: "postgres", StoreBackend: "postgres", AuthFileRole: "mirror",
 	}
 	// Always attach DB pool counters so admin chips/overview stay in sync with list filters.
@@ -306,7 +347,11 @@ func normalizeAccountStatusFilter(status string) string {
 
 // buildAccountListWhere builds WHERE for accounts a LEFT JOIN account_pool ap.
 // Status filters mirror derivePoolStatus used by the UI.
-func buildAccountListWhere(query, status string, hasSSO *bool) (string, []any) {
+func buildAccountListWhere(query, status string, hasSSO *bool, surface ...string) (string, []any) {
+	selectedSurface := ""
+	if len(surface) > 0 {
+		selectedSurface = strings.ToLower(strings.TrimSpace(surface[0]))
+	}
 	clauses := make([]string, 0, 4)
 	args := make([]any, 0, 8)
 	next := 1
@@ -357,17 +402,52 @@ func buildAccountListWhere(query, status string, hasSSO *bool) (string, []any) {
 			clauses = append(clauses, "NOT "+ssoExpr)
 		}
 	}
+	if selectedSurface == "sso" {
+		clauses = append(clauses, `(
+			NULLIF(btrim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload#>>'{session_cookies,sso}','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload#>>'{session_cookies,sso-rw}','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload#>>'{cookies,sso}','')), '') IS NOT NULL OR
+			NULLIF(btrim(COALESCE(a.payload#>>'{cookies,sso-rw}','')), '') IS NOT NULL OR
+			COALESCE(a.payload->>'cookie','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*=' OR
+			COALESCE(a.payload->>'cookies','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*=' OR
+			COALESCE(a.payload->>'set_cookie','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*=' OR
+			COALESCE(a.payload->>'set-cookie','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*=' OR
+			COALESCE(a.payload->>'set_cookies','') ~* '(^|[;[:space:]])sso(-rw)?[[:space:]]*='
+		)`)
+	} else if selectedSurface == "oauth" {
+		clauses = append(clauses, `(
+			(NULLIF(btrim(COALESCE(a.payload->>'key','')), '') IS NOT NULL AND lower(a.payload->>'key') NOT LIKE 'sso-pending:%' AND lower(a.payload->>'key') NOT LIKE 'sso_pending:%') OR
+			(NULLIF(btrim(COALESCE(a.payload->>'access_token','')), '') IS NOT NULL AND lower(a.payload->>'access_token') NOT LIKE 'sso-pending:%' AND lower(a.payload->>'access_token') NOT LIKE 'sso_pending:%') OR
+			(NULLIF(btrim(COALESCE(a.payload->>'token','')), '') IS NOT NULL AND lower(a.payload->>'token') NOT LIKE 'sso-pending:%' AND lower(a.payload->>'token') NOT LIKE 'sso_pending:%')
+		)`)
+	}
 	if status != "" {
-		expiredExpr := `((a.expires_at IS NOT NULL AND a.expires_at <= now()) OR COALESCE(ap.pool_status,'') = 'expired')`
-		quotaExpr := `(COALESCE(ap.disabled_for_quota, false) = true OR COALESCE(ap.pool_status,'') = 'quota_disabled')`
-		disabledExpr := `(COALESCE(ap.enabled, true) = false OR COALESCE(ap.pool_status,'') = 'disabled')`
-		// Sticky cool filter: pool_status='cooldown' OR wall-clock until still active.
-		// cooldown_count / status_stack are stack depth (叠加×N) for UI tip only —
-		// they must NOT put recovered accounts back into the cooldown bucket.
-		cooldownExpr := `(COALESCE(ap.pool_status, '') = 'cooldown' OR (ap.cooldown_until IS NOT NULL AND ap.cooldown_until > now()))`
-		// Active model block: non-empty blocked_models with at least one entry that is
-		// permanent (true/object without expired until) or until > now().
-		modelBlockExpr := `(
+		if selectedSurface == "sso" {
+			ssoEnabledExpr := `COALESCE((ap.extra->>'sso_enabled')::boolean, true) = true`
+			switch status {
+			case "live", "normal":
+				clauses = append(clauses, ssoEnabledExpr)
+			case "disabled":
+				clauses = append(clauses, `NOT (`+ssoEnabledExpr+`)`)
+			}
+		} else {
+			surfaceEnabledExpr := `COALESCE(ap.enabled, true) = true`
+			if selectedSurface == "oauth" {
+				surfaceEnabledExpr = `COALESCE((ap.extra->>'oauth_enabled')::boolean, COALESCE(ap.enabled, true)) = true`
+			}
+			expiredExpr := `((a.expires_at IS NOT NULL AND a.expires_at <= now()) OR COALESCE(ap.pool_status,'') = 'expired')`
+			quotaExpr := `(COALESCE(ap.disabled_for_quota, false) = true OR COALESCE(ap.pool_status,'') = 'quota_disabled')`
+			disabledExpr := `(NOT ` + surfaceEnabledExpr + `)`
+			// Sticky cool filter: pool_status='cooldown' OR wall-clock until still active.
+			// cooldown_count / status_stack are stack depth (叠加×N) for UI tip only —
+			// they must NOT put recovered accounts back into the cooldown bucket.
+			cooldownExpr := `(COALESCE(ap.pool_status, '') = 'cooldown' OR (ap.cooldown_until IS NOT NULL AND ap.cooldown_until > now()))`
+			// Active model block: non-empty blocked_models with at least one entry that is
+			// permanent (true/object without expired until) or until > now().
+			modelBlockExpr := `(
 			EXISTS (
 				SELECT 1
 				FROM jsonb_each(COALESCE(ap.blocked_models, '{}'::jsonb)) AS e(model, value)
@@ -394,33 +474,34 @@ func buildAccountListWhere(query, status string, hasSSO *bool) (string, []any) {
 			)
 			OR COALESCE(ap.pool_status,'') = 'model_blocked'
 		)`
-		liveExpr := `(COALESCE(ap.enabled, true) = true
+			liveExpr := `(` + surfaceEnabledExpr + `
 			AND COALESCE(ap.disabled_for_quota, false) = false
 			AND NOT ` + expiredExpr + `
 			AND NOT ` + cooldownExpr + `
 			AND NOT ` + modelBlockExpr + `
 			AND COALESCE(ap.pool_status,'normal') NOT IN ('expired','disabled','quota_disabled','cooldown','model_blocked'))`
-		switch status {
-		case "live":
-			clauses = append(clauses, liveExpr)
-		case "normal":
-			clauses = append(clauses, `(COALESCE(ap.enabled, true) = true
+			switch status {
+			case "live":
+				clauses = append(clauses, liveExpr)
+			case "normal":
+				clauses = append(clauses, `(`+surfaceEnabledExpr+`
 				AND COALESCE(ap.disabled_for_quota, false) = false
 				AND NOT `+cooldownExpr+`
 				AND NOT `+expiredExpr+`
 				AND NOT `+modelBlockExpr+`
 				AND COALESCE(ap.pool_status,'normal') = 'normal')`)
-		case "cooldown":
-			clauses = append(clauses, `(NOT `+expiredExpr+` AND NOT `+quotaExpr+` AND COALESCE(ap.enabled, true) = true AND `+cooldownExpr+` AND NOT `+modelBlockExpr+`)`)
-		case "disabled":
-			clauses = append(clauses, `(NOT `+quotaExpr+` AND `+disabledExpr+`)`)
-		case "quota_disabled":
-			clauses = append(clauses, quotaExpr)
-		case "model_blocked":
-			// model soft-block wins over residual cooldown so empty-output rows appear here.
-			clauses = append(clauses, `(NOT `+expiredExpr+` AND NOT `+quotaExpr+` AND COALESCE(ap.enabled, true) = true AND `+modelBlockExpr+`)`)
-		case "expired":
-			clauses = append(clauses, expiredExpr)
+			case "cooldown":
+				clauses = append(clauses, `(NOT `+expiredExpr+` AND NOT `+quotaExpr+` AND `+surfaceEnabledExpr+` AND `+cooldownExpr+` AND NOT `+modelBlockExpr+`)`)
+			case "disabled":
+				clauses = append(clauses, `(NOT `+quotaExpr+` AND `+disabledExpr+`)`)
+			case "quota_disabled":
+				clauses = append(clauses, quotaExpr)
+			case "model_blocked":
+				// model soft-block wins over residual cooldown so empty-output rows appear here.
+				clauses = append(clauses, `(NOT `+expiredExpr+` AND NOT `+quotaExpr+` AND `+surfaceEnabledExpr+` AND `+modelBlockExpr+`)`)
+			case "expired":
+				clauses = append(clauses, expiredExpr)
+			}
 		}
 	}
 	if len(clauses) == 0 {
@@ -502,6 +583,18 @@ func firstString(m map[string]any, keys ...string) (string, bool) {
 	return "", false
 }
 
+// payloadAccessToken returns a real OAuth/build token, never an SSO placeholder.
+func payloadAccessToken(payload map[string]any) string {
+	for _, key := range []string{"key", "access_token", "token"} {
+		token := stringFromMap(payload, key)
+		low := strings.ToLower(token)
+		if token != "" && !strings.HasPrefix(low, "sso-pending:") && !strings.HasPrefix(low, "sso_pending:") {
+			return token
+		}
+	}
+	return ""
+}
+
 func firstMapString(m map[string]any, keys ...string) string {
 	s, _ := firstString(m, keys...)
 	return s
@@ -576,6 +669,13 @@ func normalizeExportPayload(payload map[string]any, id string, email *string) ma
 		payload["register_password"] = stringFromMap(payload, "password")
 	}
 	return payload
+}
+
+func surfaceEnabled(extra map[string]any, surface string, fallback bool) bool {
+	if value, ok := extra[surface+"_enabled"].(bool); ok {
+		return value
+	}
+	return fallback
 }
 
 func hasSSO(payload map[string]any) bool {
@@ -799,9 +899,11 @@ func itoaSQL(value int) string {
 }
 
 type AccountAuth struct {
-	ID    string
-	Email string
-	Token string
+	ID      string
+	Email   string
+	Token   string
+	SSO     string
+	Cookies map[string]string
 }
 
 // GetAccountRefreshRow loads one account payload for manual token renew.
@@ -841,11 +943,12 @@ func (c *Connector) GetAccountAuth(ctx context.Context, accountID string) (*Acco
 		return nil, err
 	}
 	payload := decodeMap(payloadBytes)
-	token, _ := firstString(payload, "key", "access_token", "token")
-	if strings.TrimSpace(token) == "" {
-		return nil, errors.New("account has no access token")
+	token := payloadAccessToken(payload)
+	sso := accounts.GetSSOValue(payload)
+	if token == "" && sso == "" {
+		return nil, errors.New("account has no access token or SSO")
 	}
-	out := &AccountAuth{ID: id, Token: token}
+	out := &AccountAuth{ID: id, Token: token, SSO: sso, Cookies: accounts.GetCloudflareCookies(payload)}
 	if email != nil {
 		out.Email = *email
 	} else {
@@ -1606,7 +1709,8 @@ func (c *Connector) ListRefreshableAccounts(ctx context.Context, limit int) ([]A
 		SELECT a.id, a.email, a.payload
 		FROM accounts a
 		LEFT JOIN account_pool ap ON ap.account_id = a.id
-		WHERE (
+		WHERE COALESCE((ap.extra->>'oauth_enabled')::boolean, COALESCE(ap.enabled, true)) = true
+		  AND (
 		        COALESCE(a.payload->>'refresh_token', '') <> ''
 		     OR (a.expires_at IS NOT NULL AND a.expires_at <= now() + interval '2 hours')
 		  )
@@ -1670,7 +1774,7 @@ func (c *Connector) ListAccountAuths(ctx context.Context, limit int, onlyEnabled
 		LEFT JOIN account_pool ap ON ap.account_id = a.id
 	`
 	if onlyEnabled {
-		sql += ` WHERE COALESCE(ap.enabled, true) = true AND COALESCE(ap.disabled_for_quota, false) = false `
+		sql += ` WHERE COALESCE((ap.extra->>'oauth_enabled')::boolean, COALESCE(ap.enabled, true)) = true AND COALESCE(ap.disabled_for_quota, false) = false `
 	}
 	sql += ` ORDER BY a.updated_at DESC LIMIT $1`
 	rows, err := c.Pool.Query(ctx, sql, limit)
@@ -1687,11 +1791,11 @@ func (c *Connector) ListAccountAuths(ctx context.Context, limit int, onlyEnabled
 			return nil, err
 		}
 		payload := decodeMap(payloadBytes)
-		token, _ := firstString(payload, "key", "access_token", "token")
-		if strings.TrimSpace(token) == "" {
+		token := payloadAccessToken(payload)
+		if token == "" {
 			continue
 		}
-		item := AccountAuth{ID: id, Token: token}
+		item := AccountAuth{ID: id, Token: token, SSO: accounts.GetSSOValue(payload)}
 		if email != nil {
 			item.Email = *email
 		} else {
@@ -1709,7 +1813,7 @@ func (c *Connector) ListAccountAuths(ctx context.Context, limit int, onlyEnabled
 // pool_status=cooldown alone (until elapsed) is intentionally included so "全部模型探测"
 // can clear sticky cool by a successful probe.
 const probeableAccountSQL = `
-		COALESCE(ap.enabled, true) = true
+		COALESCE((ap.extra->>'oauth_enabled')::boolean, COALESCE(ap.enabled, true)) = true
 		  AND COALESCE(ap.disabled_for_quota, false) = false
 		  AND (ap.cooldown_until IS NULL OR ap.cooldown_until <= now())
 		  AND COALESCE(ap.pool_status, 'normal') NOT IN ('expired', 'disabled', 'quota_disabled')
@@ -1803,11 +1907,11 @@ func (c *Connector) ListAccountAuthsForProbe(ctx context.Context, limit int, exc
 			return nil, err
 		}
 		payload := decodeMap(payloadBytes)
-		token, _ := firstString(payload, "key", "access_token", "token")
-		if strings.TrimSpace(token) == "" {
+		token := payloadAccessToken(payload)
+		if token == "" {
 			continue
 		}
-		item := AccountAuth{ID: id, Token: token}
+		item := AccountAuth{ID: id, Token: token, SSO: accounts.GetSSOValue(payload)}
 		if email != nil {
 			item.Email = *email
 		} else {
@@ -1899,6 +2003,55 @@ func (c *Connector) saveLastProbesChunk(ctx context.Context, probes []map[string
 		return n, err
 	}
 	return len(ids), nil
+}
+
+func (c *Connector) ReportSSORuntime(ctx context.Context, accountID string, ok bool, errText string) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil
+	}
+	_, err := c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (account_id, extra, updated_at)
+		VALUES ($1, jsonb_build_object(
+			'sso_request_count', 1,
+			'sso_success_count', CASE WHEN $2 THEN 1 ELSE 0 END,
+			'sso_fail_count', CASE WHEN $2 THEN 0 ELSE 1 END,
+			'sso_last_used_at', extract(epoch from now())::bigint,
+			'sso_last_error', CASE WHEN $2 THEN '' ELSE $3 END
+		), now())
+		ON CONFLICT (account_id) DO UPDATE SET
+			extra = COALESCE(account_pool.extra, '{}'::jsonb) || jsonb_build_object(
+				'sso_request_count', COALESCE((account_pool.extra->>'sso_request_count')::bigint, 0) + 1,
+				'sso_success_count', COALESCE((account_pool.extra->>'sso_success_count')::bigint, 0) + CASE WHEN $2 THEN 1 ELSE 0 END,
+				'sso_fail_count', COALESCE((account_pool.extra->>'sso_fail_count')::bigint, 0) + CASE WHEN $2 THEN 0 ELSE 1 END,
+				'sso_last_used_at', extract(epoch from now())::bigint,
+				'sso_last_error', CASE WHEN $2 THEN '' ELSE $3 END
+			),
+			updated_at = now()
+	`, accountID, ok, strings.TrimSpace(errText))
+	return err
+}
+
+func (c *Connector) SaveSurfaceProbe(ctx context.Context, accountID, surface string, probe map[string]any) error {
+	if strings.ToLower(strings.TrimSpace(surface)) != "sso" {
+		return c.SaveLastProbe(ctx, accountID, probe)
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil
+	}
+	payload, err := json.Marshal(probe)
+	if err != nil {
+		return err
+	}
+	_, err = c.Pool.Exec(ctx, `
+		INSERT INTO account_pool (account_id, extra, updated_at)
+		VALUES ($1, jsonb_build_object('sso_last_probe', $2::jsonb), now())
+		ON CONFLICT (account_id) DO UPDATE SET
+			extra = COALESCE(account_pool.extra, '{}'::jsonb) || EXCLUDED.extra,
+			updated_at = now()
+	`, accountID, payload)
+	return err
 }
 
 func (c *Connector) SaveLastProbe(ctx context.Context, accountID string, probe map[string]any) error {
