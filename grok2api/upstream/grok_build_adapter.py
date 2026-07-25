@@ -31,118 +31,11 @@ ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
 DATA_DIR = ROOT / "data"
 REGISTER_SSO_DIR = DATA_DIR / "register_sso"
-ADAPTER_BUILD = "v1.9.105-sso-invalid-grant-defer"
+ADAPTER_BUILD = "v1.9.106-sso-immediate-convert"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "5") or 5
 )
-
-
-def _sso_defer_sec() -> float:
-    """Seconds to wait before deferred OAuth convert after invalid_grant.
-
-    Env GROK2API_SSO_DEFER_SEC (default 900 = 15 min). Clamped to 60..7200.
-    New xAI accounts often block OIDC device-code grant (invalid_grant /
-    Access denied) for a cooldown window; soft-save SSO and retry later.
-    """
-    try:
-        raw = float(os.environ.get("GROK2API_SSO_DEFER_SEC", "900") or 900)
-    except (TypeError, ValueError):
-        raw = 900.0
-    return max(60.0, min(7200.0, raw))
-
-
-def _schedule_deferred_oauth_convert(
-    *,
-    sso: str,
-    email: str,
-    sid: str = "",
-    password: str = "",
-    batch_id: str | None = None,
-    reason: str = "invalid_grant",
-) -> None:
-    """Daemon: wait GROK2API_SSO_DEFER_SEC then re-run sso_to_token + import."""
-    sso_cookie = str(sso or "").strip()
-    if not sso_cookie:
-        return
-    defer = _sso_defer_sec()
-    email_s = str(email or "").strip()
-    reason_s = str(reason or "invalid_grant").strip() or "invalid_grant"
-
-    def _worker() -> None:
-        try:
-            print(
-                f"[grok-build-auth] deferred OAuth convert sleeping {defer:.0f}s "
-                f"for {email_s or '?'} reason={reason_s} [{ADAPTER_BUILD}]"
-            )
-            time.sleep(defer)
-            import scripts.sso_to_auth_json as sso_import
-            from grok2api.pool import accounts
-
-            token = sso_import.sso_to_token(sso_cookie, quiet=True)
-            if not token or not token.get("access_token"):
-                err = None
-                try:
-                    err = sso_import.get_last_sso_token_error()
-                except Exception:
-                    err = None
-                print(
-                    f"[grok-build-auth] deferred OAuth convert fail for "
-                    f"{email_s or '?'}: {err or 'no token'} [{ADAPTER_BUILD}]"
-                )
-                return
-            _key, entry = sso_import.token_to_auth_entry(token, email=email_s)
-            import_payload: dict[str, Any] = {
-                "key": entry["key"],
-                "auth_mode": entry.get("auth_mode", "oidc"),
-                "email": entry.get("email") or email_s,
-                "refresh_token": entry.get("refresh_token", ""),
-                "expires_at": entry.get("expires_at"),
-                "oidc_issuer": entry.get("oidc_issuer", "https://auth.x.ai"),
-                "oidc_client_id": entry.get("oidc_client_id", ""),
-                "source": "register-email-deferred",
-                "registration_session_id": sid,
-                "sso": sso_cookie,
-                "sso_cookie": sso_cookie,
-                "sso_token": sso_cookie,
-                "session_cookies": {"sso": sso_cookie, "sso-rw": sso_cookie},
-                "cookie": f"sso={sso_cookie}",
-                "needs_sso_convert": False,
-            }
-            if batch_id:
-                import_payload["registration_batch_id"] = batch_id
-            reg_password = str(password or "").strip()
-            if reg_password:
-                import_payload["password"] = reg_password
-                import_payload["register_password"] = reg_password
-            try:
-                from grok2api.pool.accounts import merge_durable_account_fields as _mdf
-
-                _mdf(import_payload, None)
-            except Exception:
-                pass
-            result = accounts.import_auth_payload(import_payload, merge=True)
-            if result.get("ok"):
-                print(
-                    f"[grok-build-auth] deferred OAuth convert ok for "
-                    f"{email_s or '?'} [{ADAPTER_BUILD}]"
-                )
-            else:
-                print(
-                    f"[grok-build-auth] deferred OAuth convert import fail for "
-                    f"{email_s or '?'}: {result.get('error')} [{ADAPTER_BUILD}]"
-                )
-        except Exception as e:  # noqa: BLE001
-            print(
-                f"[grok-build-auth] deferred OAuth convert error for "
-                f"{email_s or '?'}: {e} [{ADAPTER_BUILD}]"
-            )
-
-    threading.Thread(
-        target=_worker,
-        daemon=True,
-        name=f"gba-oauth-defer-{(email_s or sid or 'x')[-12:]}",
-    ).start()
 
 YESCAPTCHA_KEY = (
     os.environ.get("GROK2API_YESCAPTCHA_KEY")
@@ -4017,30 +3910,28 @@ def _run_registration(
                 token_err_desc = sso_import.get_last_sso_token_error_desc()
             except Exception:
                 token_err = None
-            is_invalid_grant = str(token_err or "") == "invalid_grant"
-            if not is_invalid_grant:
-                _note_reg_pressure("device-flow conversion failed", pause_sec=6)
+            _note_reg_pressure("device-flow conversion failed", pause_sec=6)
             # Soft-success path: account + SSO are real. Persist SSO now so
             # admin can re-run SSO import later without re-registering. Do not
             # hard-fail the whole registration after create_account already
             # succeeded (mailbox/email already burned).
-            if is_invalid_grant:
-                defer_msg = (
+            # Immediate convert already ran above; no deferred auto-retry.
+            if str(token_err or "") == "invalid_grant":
+                fail_msg = (
                     f"new-account OIDC grant blocked (invalid_grant); "
-                    f"SSO saved, deferred convert in {_sso_defer_sec():.0f}s "
-                    f"[{ADAPTER_BUILD}]"
+                    f"importing SSO-only account for later convert [{ADAPTER_BUILD}]"
                 )
             elif str(token_err or "") in ("rate_limited", "transport"):
-                defer_msg = (
+                fail_msg = (
                     f"device-flow {token_err}; importing SSO-only account for later convert "
                     f"[{ADAPTER_BUILD}]"
                 )
             else:
-                defer_msg = (
+                fail_msg = (
                     f"device-flow failed ({token_err or 'unknown'}); "
                     f"importing SSO-only account for later convert [{ADAPTER_BUILD}]"
                 )
-            update("importing", defer_msg)
+            update("importing", fail_msg)
             sso_cookie = str(sso or "").strip()
             reg_password = str(password or sess.get("password") or "").strip()
             try:
@@ -4093,30 +3984,9 @@ def _run_registration(
                     x for x in (import_result.get("imported") or []) if isinstance(x, dict)
                 ]
                 imported_ids = [str(x.get("id")) for x in imported_rows if x.get("id")]
-                # Schedule deferred OAuth convert once per session for invalid_grant
-                # (new-account cooldown).
-                if is_invalid_grant and not sess.get("oauth_deferred"):
-                    try:
-                        sess["oauth_deferred"] = True
-                    except Exception:
-                        pass
-                    _schedule_deferred_oauth_convert(
-                        sso=sso_cookie,
-                        email=str(email or ""),
-                        sid=str(sid or ""),
-                        password=reg_password,
-                        batch_id=str(sess.get("batch_id") or "") or None,
-                        reason="invalid_grant",
-                    )
-                status_msg = (
-                    f"SSO saved (new-account OIDC cooldown; auto-convert in "
-                    f"{_sso_defer_sec():.0f}s) [{ADAPTER_BUILD}]"
-                    if is_invalid_grant
-                    else f"SSO saved (device-flow deferred); re-convert later via import-sso [{ADAPTER_BUILD}]"
-                )
                 update(
                     "imported",
-                    status_msg,
+                    f"SSO saved (device-flow deferred); re-convert later via import-sso [{ADAPTER_BUILD}]",
                     sso=sso_cookie,
                     imported_account_ids=imported_ids,
                     imported_accounts=[
@@ -4129,10 +3999,8 @@ def _run_registration(
                         "path": "sso_pending",
                         "email": email,
                         "error": token_err or "empty",
-                        "deferred": bool(is_invalid_grant),
                     },
                     device_flow_deferred=True,
-                    oauth_deferred=bool(is_invalid_grant),
                 )
                 if admission_flag is not None:
                     _release_reg_admission_once(admission_flag)

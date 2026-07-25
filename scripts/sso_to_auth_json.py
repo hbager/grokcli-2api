@@ -19,8 +19,8 @@
   GROK2API_AUTH_FILE  - 导入目标 auth.json（默认项目 data/auth.json）
   GROK2API_PROXY      - 代理地址，例如 http://127.0.0.1:7890
   GROK2API_SSO_POLL_TIMEOUT - token 轮询超时秒数（默认 30）
-  # invalid_grant (new-account OIDC grant block) exits immediately; adapter
-  # schedules deferred re-convert via GROK2API_SSO_DEFER_SEC (default 900).
+  # invalid_grant (new-account OIDC grant block) exits immediately so callers
+  # can soft-save SSO without burning more device-flow retries.
 """
 from __future__ import annotations
 
@@ -622,7 +622,7 @@ def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
 
     On xAI new-account OIDC grant block (token invalid_grant / Access denied),
     aborts the proxy/retry loop immediately and sets get_last_sso_token_error()
-    to invalid_grant so callers can soft-save SSO and defer convert.
+    to invalid_grant so callers can soft-save SSO for later manual convert.
     """
     _set_last_sso_token_error(None)
     log = (lambda *a, **k: None) if quiet else print
@@ -802,7 +802,7 @@ def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
                 desc = str(token.get("_error_description") or "Access denied")
                 log(
                     "  ⏳ token Access denied "
-                    "(new-account OIDC grant blocked; defer convert)"
+                    "(new-account OIDC grant blocked; stop retries)"
                 )
                 _set_last_sso_token_error("invalid_grant", desc)
                 return None
