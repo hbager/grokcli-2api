@@ -5,10 +5,12 @@ Kept intentionally small: only the pieces used by ``grok_build_adapter``
 ``email_registration`` flow was removed in favor of grok-build-auth.
 
 Providers:
-  - moemail  — beilunyang/moemail style API (``/api/emails/...``)
-  - yyds     — vip.215.im / maliapi.215.im YYDS Mail (``/v1/accounts`` …)
-  - gptmail  — mail.chatgpt.org.uk GPTMail (``/api/generate-email`` …)
-  - cfmail   — dreamhunter2333/cloudflare_temp_email (``/api/new_address`` …)
+  - moemail    — beilunyang/moemail style API (/api/emails/...)
+  - yyds       — vip.215.im / maliapi.215.im YYDS Mail (/v1/accounts …)
+  - gptmail    — mail.chatgpt.org.uk GPTMail (/api/generate-email …)
+  - cfmail     — dreamhunter2333/cloudflare_temp_email (/api/new_address …)
+  - tempmail   — TempMail.lol (/v2/inbox/create …)
+  - cloudmail  — SkyMail / CloudMail (doc.skymail.ink /api/public/...)
 """
 from __future__ import annotations
 
@@ -99,6 +101,15 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         return "tempmail"
     if p in {"tempmail", "tempmail.lol", "tempmaillol", "tempmail_lol", "lol", "tmlol"}:
         return "tempmail"
+    if p in {
+        "cloudmail",
+        "cloud-mail",
+        "cloud_mail",
+        "skymail",
+        "sky-mail",
+        "cmail",
+    }:
+        return "cloudmail"
     if p in {"moemail", "moe", "moe-mail"}:
         return "moemail"
     base = (base_url or "").strip().lower()
@@ -127,6 +138,18 @@ def normalize_mail_provider(provider: str | None, *, base_url: str | None = None
         return "cfmail"
     if any(x in base for x in ("tempmail.lol", "api.tempmail.lol")):
         return "tempmail"
+    if any(
+        x in base
+        for x in (
+            "skymail",
+            "cloudmail",
+            "cmail.",
+            "/api/public/emailList",
+            "/api/public/addUser",
+            "doc.skymail",
+        )
+    ):
+        return "cloudmail"
     return "moemail"
 
 
@@ -1798,6 +1821,72 @@ def tempmail_list_domains(
     return []
 
 
+
+
+def cloudmail_list_domains(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> list[str]:
+    from grok2api.upstream.cloudmail_provider import cloudmail_list_domains as _impl
+
+    return _impl(api_key=api_key, base_url=base_url)
+
+
+def normalize_cloudmail_base_url(base_url: str | None = None) -> str:
+    from grok2api.upstream.cloudmail_provider import normalize_cloudmail_base_url as _impl
+
+    return _impl(base_url)
+
+
+def cloudmail_create_mailbox(
+    *,
+    name: str | None = None,
+    domain: str | None = None,
+    expiry_ms: int | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+) -> dict[str, Any]:
+    from grok2api.upstream.cloudmail_provider import cloudmail_create_mailbox as _impl
+
+    return _impl(
+        name=name,
+        domain=domain,
+        expiry_ms=expiry_ms,
+        api_key=api_key,
+        base_url=base_url,
+        proxy=proxy,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
+        pick_domain_from_list=pick_domain_from_list,
+    )
+
+
+def cloudmail_fetch_messages(
+    email_id: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    include_details: bool = True,
+    address: str | None = None,
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    from grok2api.upstream.cloudmail_provider import cloudmail_fetch_messages as _impl
+
+    return _impl(
+        email_id,
+        api_key=api_key,
+        base_url=base_url,
+        include_details=include_details,
+        address=address,
+        token=token,
+        extract_codes_and_links=_extract_codes_and_links,
+    )
+
+
 def create_mailbox(
     *,
     provider: str | None = None,
@@ -1847,6 +1936,17 @@ def create_mailbox(
         )
     if prov == "tempmail":
         return tempmail_create_mailbox(
+            name=name,
+            domain=domain,
+            expiry_ms=expiry_ms,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        )
+    if prov == "cloudmail":
+        return cloudmail_create_mailbox(
             name=name,
             domain=domain,
             expiry_ms=expiry_ms,
@@ -1912,6 +2012,15 @@ def fetch_messages(
         )
     if prov == "tempmail":
         return tempmail_fetch_messages(
+            email_id,
+            api_key=api_key,
+            base_url=base_url,
+            include_details=include_details,
+            address=address,
+            token=token,
+        )
+    if prov == "cloudmail":
+        return cloudmail_fetch_messages(
             email_id,
             api_key=api_key,
             base_url=base_url,

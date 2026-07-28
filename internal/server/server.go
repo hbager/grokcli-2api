@@ -4906,9 +4906,10 @@ var registrationSecretKeys = map[string]struct{}{
 	"moemail_api_key":  {},
 	"yyds_api_key":     {},
 	"gptmail_api_key":  {},
-	"cfmail_api_key":   {},
-	"tempmail_api_key": {},
-	"yescaptcha_key":   {},
+	"cfmail_api_key":     {},
+	"tempmail_api_key":   {},
+	"cloudmail_api_key":  {},
+	"yescaptcha_key":     {},
 	"proxy_password":   {},
 }
 
@@ -4957,9 +4958,9 @@ func loadRegistrationConfig(ctx context.Context, options Options, includeSecrets
 	sanitizeRegistrationMailSecrets(cfg)
 	// Always expose per-provider slots so the admin form can bind each service.
 	for _, k := range []string{
-		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
-		"moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
-		"moemail_base_url", "cfmail_base_url",
+		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key", "cloudmail_api_key",
+		"moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "cloudmail_domain",
+		"moemail_base_url", "cfmail_base_url", "cloudmail_base_url",
 	} {
 		if _, ok := cfg[k]; !ok || cfg[k] == nil {
 			cfg[k] = ""
@@ -4997,8 +4998,8 @@ func saveRegistrationConfig(ctx context.Context, options Options, patch map[stri
 	// UI can restore each service independently after switch.
 	for _, k := range []string{
 		"mail_provider",
-		"domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
-		"base_url", "moemail_base_url", "cfmail_base_url",
+		"domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "cloudmail_domain",
+		"base_url", "moemail_base_url", "cfmail_base_url", "cloudmail_base_url",
 	} {
 		if _, ok := current[k]; !ok {
 			current[k] = ""
@@ -5010,7 +5011,7 @@ func saveRegistrationConfig(ctx context.Context, options Options, patch map[stri
 	}
 	// Dedicated API key slots always present in DB (independent per provider).
 	for _, k := range []string{
-		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
+		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key", "cloudmail_api_key",
 	} {
 		if _, ok := current[k]; !ok || current[k] == nil {
 			current[k] = ""
@@ -5210,6 +5211,12 @@ func mailSecretFitsSlot(key, value string) bool {
 			return false
 		}
 		return true
+	case "cloudmail_api_key":
+		// Opaque UUID/token; reject MoeMail/YYDS/GPTMail shapes.
+		if strings.HasPrefix(v, "mk_") || strings.HasPrefix(v, "AC-") || strings.HasPrefix(strings.ToLower(v), "sk-") {
+			return false
+		}
+		return true
 	case "api_key":
 		// Generic active mirror — accept anything; sanitizeRegistrationMailSecrets
 		// rewrites it from the active provider slot.
@@ -5230,6 +5237,7 @@ func sanitizeRegistrationMailSecrets(cfg map[string]any) {
 	yk := strings.TrimSpace(stringValue(cfg["yyds_api_key"]))
 	gk := strings.TrimSpace(stringValue(cfg["gptmail_api_key"]))
 	ck := strings.TrimSpace(stringValue(cfg["cfmail_api_key"]))
+	cmk := strings.TrimSpace(stringValue(cfg["cloudmail_api_key"]))
 
 	// Rescue: polluted MoeMail slot holding YYDS key → move into yyds if empty.
 	if strings.HasPrefix(mk, "AC-") {
@@ -5315,6 +5323,14 @@ func sanitizeRegistrationMailSecrets(cfg map[string]any) {
 			cfg["tempmail_domain"] = d
 		}
 		cfg["base_url"] = ""
+	case "cloudmail":
+		cfg["api_key"] = cmk
+		if d := strings.TrimSpace(stringValue(cfg["cloudmail_domain"])); d != "" {
+			cfg["domain"] = d
+		}
+		if u := strings.TrimSpace(stringValue(cfg["cloudmail_base_url"])); u != "" {
+			cfg["base_url"] = u
+		}
 	default: // moemail
 		cfg["api_key"] = mk
 		if d := strings.TrimSpace(stringValue(cfg["moemail_domain"])); d != "" {
@@ -5332,11 +5348,21 @@ func sanitizeRegistrationMailSecrets(cfg map[string]any) {
 	if _, ok := cfg["tempmail_domain"]; !ok {
 		cfg["tempmail_domain"] = stringValue(cfg["tempmail_domain"])
 	}
+	if _, ok := cfg["cloudmail_api_key"]; !ok {
+		cfg["cloudmail_api_key"] = cmk
+	}
+	if _, ok := cfg["cloudmail_domain"]; !ok {
+		cfg["cloudmail_domain"] = stringValue(cfg["cloudmail_domain"])
+	}
+	if _, ok := cfg["cloudmail_base_url"]; !ok {
+		cfg["cloudmail_base_url"] = stringValue(cfg["cloudmail_base_url"])
+	}
 	_ = mk
 	_ = yk
 	_ = gk
 	_ = ck
 	_ = tk
+	_ = cmk
 }
 
 // registrationConfigPatchForPersist builds a DB-safe patch from a start request.
@@ -5351,7 +5377,7 @@ func registrationConfigPatchForPersist(req, merged map[string]any) map[string]an
 	}
 	applyRegistrationSecretClearFlags(out, req)
 	for _, key := range []string{
-		"api_key", "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
+		"api_key", "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key", "cloudmail_api_key",
 		"yescaptcha_key", "proxy_password",
 	} {
 		if req == nil {
@@ -5373,13 +5399,13 @@ func registrationConfigPatchForPersist(req, merged map[string]any) map[string]an
 	}
 	// Restore durable host fields that merge may have cleared for non-MoeMail runs.
 	if req != nil {
-		for _, k := range []string{"moemail_base_url", "cfmail_base_url", "base_url"} {
+		for _, k := range []string{"moemail_base_url", "cfmail_base_url", "cloudmail_base_url", "base_url"} {
 			if s := strings.TrimSpace(stringValue(req[k])); s != "" {
 				out[k] = s
 			}
 		}
 		// Dedicated domains always from request when non-empty.
-		for _, k := range []string{"moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "domain"} {
+		for _, k := range []string{"moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "cloudmail_domain", "domain"} {
 			if _, ok := req[k]; ok {
 				// Allow explicit empty to clear.
 				out[k] = strings.TrimSpace(stringValue(req[k]))
@@ -5403,7 +5429,7 @@ func registrationConfigPatchForPersist(req, merged map[string]any) map[string]an
 		if strings.TrimSpace(stringValue(out["moemail_base_url"])) == "" {
 			delete(out, "moemail_base_url")
 		}
-		if provider != "cfmail" && strings.TrimSpace(stringValue(out["base_url"])) == "" {
+		if provider != "cfmail" && provider != "cloudmail" && strings.TrimSpace(stringValue(out["base_url"])) == "" {
 			delete(out, "base_url")
 		}
 	} else {
@@ -5460,8 +5486,8 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 			// the active provider is tempmail and body sent tempmail_domain/domain empty.
 			if strings.TrimSpace(vv) == "" {
 				switch k {
-				case "tempmail_domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain",
-					"moemail_base_url", "cfmail_base_url", "tempmail_api_key":
+				case "tempmail_domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "cloudmail_domain",
+					"moemail_base_url", "cfmail_base_url", "cloudmail_base_url", "tempmail_api_key":
 					// Dedicated per-provider slots: empty means clear this service only.
 					out[k] = ""
 				case "domain", "base_url":
@@ -5481,7 +5507,7 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 	// Normalize mail_provider first.
 	provider := strings.ToLower(strings.TrimSpace(stringValue(out["mail_provider"])))
 	switch provider {
-	case "yyds", "gptmail", "cfmail", "tempmail", "moemail":
+	case "yyds", "gptmail", "cfmail", "tempmail", "cloudmail", "moemail":
 		// ok
 	default:
 		provider = "moemail"
@@ -5504,6 +5530,14 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 		case "cfmail":
 			if strings.TrimSpace(stringValue(out["cfmail_api_key"])) == "" {
 				out["cfmail_api_key"] = apiKey
+			}
+		case "cloudmail":
+			if strings.TrimSpace(stringValue(out["cloudmail_api_key"])) == "" && mailSecretFitsSlot("cloudmail_api_key", apiKey) {
+				out["cloudmail_api_key"] = apiKey
+			}
+		case "tempmail":
+			if strings.TrimSpace(stringValue(out["tempmail_api_key"])) == "" && mailSecretFitsSlot("tempmail_api_key", apiKey) {
+				out["tempmail_api_key"] = apiKey
 			}
 		default: // moemail
 			if strings.TrimSpace(stringValue(out["moemail_api_key"])) == "" && mailSecretFitsSlot("moemail_api_key", apiKey) {
@@ -5541,6 +5575,12 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 			activeDomain = ""
 		}
 		out["tempmail_domain"] = activeDomain
+		out["domain"] = activeDomain
+	case "cloudmail":
+		if d := strings.TrimSpace(stringValue(out["cloudmail_domain"])); d != "" {
+			activeDomain = d
+		}
+		out["cloudmail_domain"] = activeDomain
 		out["domain"] = activeDomain
 	default:
 		if d := strings.TrimSpace(stringValue(out["moemail_domain"])); d != "" {
@@ -5601,6 +5641,18 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 		}
 		out["moemail_base_url"] = ""
 		out["base_url"] = ""
+	case "cloudmail":
+		if k := strings.TrimSpace(stringValue(out["cloudmail_api_key"])); k != "" {
+			out["moemail_api_key"] = k
+			out["api_key"] = k
+		}
+		if u := strings.TrimSpace(stringValue(out["cloudmail_base_url"])); u != "" {
+			out["moemail_base_url"] = u
+			out["base_url"] = u
+		} else if u := strings.TrimSpace(stringValue(out["base_url"])); u != "" {
+			out["moemail_base_url"] = u
+			out["cloudmail_base_url"] = u
+		}
 	default: // moemail
 		if k := strings.TrimSpace(stringValue(out["moemail_api_key"])); k != "" {
 			// Drop foreign shapes that slipped past load sanitize.
@@ -5646,6 +5698,8 @@ func normalizeRegistrationConfig(raw map[string]any) map[string]any {
 		cfg["mail_provider"] = "cfmail"
 	case "tempmail", "tempmail.lol", "tempmaillol", "tempmail_lol", "lol", "tmlol":
 		cfg["mail_provider"] = "tempmail"
+	case "cloudmail", "cloud-mail", "cloud_mail", "skymail", "sky-mail", "cmail":
+		cfg["mail_provider"] = "cloudmail"
 	case "moemail", "moe", "moe-mail":
 		cfg["mail_provider"] = "moemail"
 	}

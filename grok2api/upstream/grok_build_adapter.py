@@ -408,6 +408,11 @@ def _resolve_mail_credentials(
         if cfg.get("tempmail_domain") not in (None, ""):
             dom = str(cfg.get("tempmail_domain") or "").strip()
         base = ""  # fixed https://api.tempmail.lol
+    elif prov == "cloudmail":
+        key = str(cfg.get("cloudmail_api_key") or key).strip()
+        if cfg.get("cloudmail_domain") not in (None, ""):
+            dom = str(cfg.get("cloudmail_domain") or "").strip()
+        base = str(cfg.get("cloudmail_base_url") or base).strip()
     else:
         if cfg.get("moemail_domain") not in (None, ""):
             dom = str(cfg.get("moemail_domain") or "").strip()
@@ -1418,7 +1423,7 @@ def _make_email_receiver(
     else:
         # YYDS/GPTMail/CFMail: empty domain means provider-side auto/random pick.
         # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
-        if prov in {"yyds", "gptmail", "cfmail", "tempmail"}:
+        if prov in {"yyds", "gptmail", "cfmail", "tempmail", "cloudmail"}:
             dom = ""
         else:
             dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
@@ -1462,6 +1467,8 @@ def _make_email_receiver(
                 default_base = "https://temp-email-api.awsl.uk"
             elif provider == "tempmail":
                 default_base = "https://api.tempmail.lol"
+            elif provider == "cloudmail":
+                default_base = ""
             else:
                 default_base = "https://moemail.521884.xyz"
             self.base_url = base_url or default_base

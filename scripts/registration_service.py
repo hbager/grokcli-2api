@@ -158,7 +158,13 @@ async def list_mail_domains(request: Request) -> dict[str, Any]:
 
     prov = mail.normalize_mail_provider(
         body.get("mail_provider") or body.get("provider"),
-        base_url=str(body.get("base_url") or body.get("moemail_base_url") or body.get("cfmail_base_url") or ""),
+        base_url=str(
+            body.get("base_url")
+            or body.get("moemail_base_url")
+            or body.get("cfmail_base_url")
+            or body.get("cloudmail_base_url")
+            or ""
+        ),
     )
     key = str(
         body.get("api_key")
@@ -167,12 +173,14 @@ async def list_mail_domains(request: Request) -> dict[str, Any]:
         or body.get("gptmail_api_key")
         or body.get("cfmail_api_key")
         or body.get("tempmail_api_key")
+        or body.get("cloudmail_api_key")
         or ""
     ).strip()
     base = str(
         body.get("base_url")
         or body.get("moemail_base_url")
         or body.get("cfmail_base_url")
+        or body.get("cloudmail_base_url")
         or ""
     ).strip()
     domains: list[str] = []
@@ -195,6 +203,19 @@ async def list_mail_domains(request: Request) -> dict[str, Any]:
             domains = mail.tempmail_list_domains(api_key=key or None, base_url=base or None)
             note = "TempMail.lol free: random domain (no catalog)"
             base_out = mail.normalize_tempmail_base_url(base or None)
+        elif prov == "cloudmail":
+            domains = mail.cloudmail_list_domains(api_key=key or None, base_url=base or None)
+            configured = mail.parse_domain_list(
+                str(body.get("domain") or body.get("cloudmail_domain") or "")
+            )
+            if configured:
+                seen = set(domains)
+                for d in configured:
+                    if d not in seen:
+                        domains.append(d)
+                        seen.add(d)
+            note = "CloudMail GET /api/setting/websiteConfig domainList"
+            base_out = mail.normalize_cloudmail_base_url(base or None)
         else:
             # MoeMail has no universal public catalog; return configured domain list.
             domains = mail.parse_domain_list(str(body.get("domain") or body.get("moemail_domain") or ""))
@@ -254,12 +275,15 @@ async def start_job(
             "gptmail_api_key",
             "cfmail_api_key",
             "tempmail_api_key",
+            "cloudmail_api_key",
             "yyds_domain",
             "gptmail_domain",
             "cfmail_domain",
             "tempmail_domain",
+            "cloudmail_domain",
             "moemail_domain",
             "cfmail_base_url",
+            "cloudmail_base_url",
             "api_key",
             "base_url",
         )
@@ -331,6 +355,33 @@ async def start_job(
         kwargs["moemail_api_key"] = key
         kwargs["moemail_base_url"] = ""
         kwargs["domain"] = dom
+    elif prov == "cloudmail":
+        dom = str(kwargs.get("cloudmail_domain") or dom).strip()
+        key = str(
+            kwargs.get("cloudmail_api_key")
+            or kwargs.get("api_key")
+            or kwargs.get("moemail_api_key")
+            or ""
+        ).strip()
+        base = str(
+            kwargs.get("cloudmail_base_url")
+            or kwargs.get("base_url")
+            or kwargs.get("moemail_base_url")
+            or ""
+        ).strip()
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = base
+        kwargs["domain"] = dom  # may be empty → provider auto domainList
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="CloudMail Token missing. Save Authorization token in 协议注册 → CloudMail.",
+            )
+        if not base:
+            raise HTTPException(
+                status_code=400,
+                detail="CloudMail Base URL missing. Save Base URL in 协议注册 → CloudMail.",
+            )
     else:
         key = str(kwargs.get("moemail_api_key") or kwargs.get("api_key") or "").strip()
         base = str(kwargs.get("moemail_base_url") or kwargs.get("base_url") or "").strip()
@@ -357,9 +408,9 @@ async def start_job(
             )
     # Drop non-adapter kwargs
     for drop in (
-        "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
-        "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "moemail_domain",
-        "cfmail_base_url", "api_key", "base_url",
+        "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key", "cloudmail_api_key",
+        "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "cloudmail_domain", "moemail_domain",
+        "cfmail_base_url", "cloudmail_base_url", "api_key", "base_url",
     ):
         kwargs.pop(drop, None)
     result = adapter.start_registration(**kwargs)

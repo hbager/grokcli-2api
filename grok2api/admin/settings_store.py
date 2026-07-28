@@ -1756,6 +1756,7 @@ _REG_CONFIG_KEYS = (
     # Per-provider base URLs for self-hosted services (do not share one field).
     "moemail_base_url",
     "cfmail_base_url",
+    "cloudmail_base_url",
     # Active key (derived from selected provider). Kept for adapter/env compat.
     "api_key",
     # Per-provider secrets — all persist in DB so switching provider keeps keys.
@@ -1763,12 +1764,14 @@ _REG_CONFIG_KEYS = (
     "yyds_api_key",
     "gptmail_api_key",
     "cfmail_api_key",
+    "cloudmail_api_key",
     # Active domain + per-provider domains (same pattern as keys).
     "domain",
     "moemail_domain",
     "yyds_domain",
     "gptmail_domain",
     "cfmail_domain",
+    "cloudmail_domain",
     "prefix",
     "expiry_ms",
     "captcha_provider",
@@ -1791,6 +1794,7 @@ _REG_SECRET_KEYS = frozenset(
         "yyds_api_key",
         "gptmail_api_key",
         "cfmail_api_key",
+        "cloudmail_api_key",
         "yescaptcha_key",
         "proxy_password",
     }
@@ -1801,6 +1805,7 @@ _MAIL_PROVIDER_KEY_FIELDS = {
     "yyds": "yyds_api_key",
     "gptmail": "gptmail_api_key",
     "cfmail": "cfmail_api_key",
+    "cloudmail": "cloudmail_api_key",
 }
 
 _MAIL_PROVIDER_DOMAIN_FIELDS = {
@@ -1808,6 +1813,7 @@ _MAIL_PROVIDER_DOMAIN_FIELDS = {
     "yyds": "yyds_domain",
     "gptmail": "gptmail_domain",
     "cfmail": "cfmail_domain",
+    "cloudmail": "cloudmail_domain",
 }
 
 # Self-hosted providers keep independent base URLs so switching never overwrites
@@ -1815,6 +1821,7 @@ _MAIL_PROVIDER_DOMAIN_FIELDS = {
 _MAIL_PROVIDER_BASE_URL_FIELDS = {
     "moemail": "moemail_base_url",
     "cfmail": "cfmail_base_url",
+    "cloudmail": "cloudmail_base_url",
 }
 
 
@@ -1906,6 +1913,28 @@ def _env_registration_defaults() -> dict[str, Any]:
         if cf_base:
             # Dedicated CF host only — never overwrite MoeMail base_url.
             out["cfmail_base_url"] = cf_base
+        cloud_key = (
+            os.environ.get("GROK2API_CLOUDMAIL_API_KEY")
+            or os.environ.get("CLOUDMAIL_API_KEY")
+            or os.environ.get("CLOUDMAIL_TOKEN")
+            or ""
+        ).strip()
+        if cloud_key:
+            out["cloudmail_api_key"] = cloud_key
+        cloud_dom = (
+            os.environ.get("GROK2API_CLOUDMAIL_DOMAIN")
+            or os.environ.get("CLOUDMAIL_DOMAIN")
+            or ""
+        ).strip().lstrip("@").strip(".")
+        if cloud_dom:
+            out["cloudmail_domain"] = cloud_dom
+        cloud_base = (
+            os.environ.get("GROK2API_CLOUDMAIL_BASE_URL")
+            or os.environ.get("CLOUDMAIL_BASE_URL")
+            or ""
+        ).strip()
+        if cloud_base:
+            out["cloudmail_base_url"] = cloud_base
         # Prefer multi-line pool env when present; keep single-proxy fallback.
         pool_env = (
             os.environ.get("GROK2API_XAI_PROXY_POOL")
@@ -2001,11 +2030,13 @@ def _normalize_registration_config(
     legacy_base_url = _pick_str("base_url", 256)
     cfg["moemail_base_url"] = _pick_str("moemail_base_url", 256)
     cfg["cfmail_base_url"] = _pick_str("cfmail_base_url", 256)
+    cfg["cloudmail_base_url"] = _pick_str("cloudmail_base_url", 256)
     legacy_api_key = _pick_str("api_key", 512)
     cfg["moemail_api_key"] = _pick_str("moemail_api_key", 512)
     cfg["yyds_api_key"] = _pick_str("yyds_api_key", 512)
     cfg["gptmail_api_key"] = _pick_str("gptmail_api_key", 512)
     cfg["cfmail_api_key"] = _pick_str("cfmail_api_key", 512)
+    cfg["cloudmail_api_key"] = _pick_str("cloudmail_api_key", 512)
     # Do NOT env-fill legacy domain into every provider — only use explicit src.
     if "domain" in src:
         legacy_domain = str(src.get("domain") or "").strip().lstrip("@").strip(".")[:128]
@@ -2015,6 +2046,7 @@ def _normalize_registration_config(
     cfg["yyds_domain"] = _pick_domain("yyds_domain")
     cfg["gptmail_domain"] = _pick_domain("gptmail_domain")
     cfg["cfmail_domain"] = _pick_domain("cfmail_domain")
+    cfg["cloudmail_domain"] = _pick_domain("cloudmail_domain")
     cfg["prefix"] = _pick_str("prefix", 64)
     try:
         from grok2api.upstream.moemail import (
@@ -2046,10 +2078,14 @@ def _normalize_registration_config(
             cfg["mail_provider"] = "gptmail"
         elif mail_raw in {"cfmail", "cloudflare", "cloudflare_temp_email", "awsl"}:
             cfg["mail_provider"] = "cfmail"
+        elif mail_raw in {"cloudmail", "skymail", "cmail"}:
+            cfg["mail_provider"] = "cloudmail"
+        elif mail_raw in {"tempmail", "tempmail.lol", "lol"}:
+            cfg["mail_provider"] = "tempmail"
         else:
             cfg["mail_provider"] = (
                 mail_raw
-                if mail_raw in {"moemail", "yyds", "gptmail", "cfmail"}
+                if mail_raw in {"moemail", "yyds", "gptmail", "cfmail", "tempmail", "cloudmail"}
                 else "moemail"
             )
 
@@ -2127,6 +2163,12 @@ def _normalize_registration_config(
             else (str(raw_base).strip() or "https://temp-email-api.awsl.uk")
         )
         cfg["base_url"] = cfg["cfmail_base_url"]
+    elif cfg["mail_provider"] == "cloudmail":
+        raw_base = str(cfg.get("cloudmail_base_url") or "").strip().rstrip("/")
+        cfg["cloudmail_base_url"] = raw_base
+        cfg["base_url"] = raw_base
+    elif cfg["mail_provider"] == "tempmail":
+        cfg["base_url"] = "https://api.tempmail.lol"
     else:
         # MoeMail: active base_url mirrors moemail_base_url.
         cfg["base_url"] = str(cfg.get("moemail_base_url") or "").strip()

@@ -275,6 +275,9 @@ func TestMailSecretFitsSlot(t *testing.T) {
 		{name: "TempMail paid", slot: "tempmail_api_key", key: "some-paid-bearer-token", fits: true},
 		{name: "TempMail rejects MoeMail", slot: "tempmail_api_key", key: "mk_moe"},
 		{name: "TempMail rejects YYDS", slot: "tempmail_api_key", key: "AC-yyds"},
+		{name: "CloudMail", slot: "cloudmail_api_key", key: "00000000-1111-2222-3333-444444444444", fits: true},
+		{name: "CloudMail rejects MoeMail", slot: "cloudmail_api_key", key: "mk_moe"},
+		{name: "CloudMail rejects YYDS", slot: "cloudmail_api_key", key: "AC-yyds"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -372,6 +375,10 @@ func TestMergeRegistrationStartBodyProviderIsolation(t *testing.T) {
 			"cfmail_base_url": "https://cfmail.example.com",
 		}, wantKey: "cf-token", wantURL: "https://cfmail.example.com"},
 		{name: "TempMail", provider: "tempmail", body: map[string]any{"tempmail_api_key": "paid-token"}, wantKey: "paid-token"},
+		{name: "CloudMail", provider: "cloudmail", body: map[string]any{
+			"cloudmail_api_key":  "cm-token",
+			"cloudmail_base_url": "https://cmail.example.com",
+		}, wantKey: "cm-token", wantURL: "https://cmail.example.com"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -404,6 +411,8 @@ func TestNormalizeRegistrationConfigMailAliases(t *testing.T) {
 		"cloudflare":   "cfmail",
 		"tempmail.lol": "tempmail",
 		"lol":          "tempmail",
+		"skymail":      "cloudmail",
+		"cmail":        "cloudmail",
 	}
 	for alias, want := range tests {
 		t.Run(alias, func(t *testing.T) {
