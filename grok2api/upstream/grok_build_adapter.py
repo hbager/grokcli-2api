@@ -31,10 +31,10 @@ ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
 DATA_DIR = ROOT / "data"
 REGISTER_SSO_DIR = DATA_DIR / "register_sso"
-ADAPTER_BUILD = "v1.9.107-same-session-primary+ui-log"
+ADAPTER_BUILD = "v1.9.108-reg-speed-defaults"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
-    os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "5") or 5
+    os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "2") or 2
 )
 
 YESCAPTCHA_KEY = (

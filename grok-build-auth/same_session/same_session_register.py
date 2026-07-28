@@ -73,32 +73,32 @@ def _browser_pool_enabled() -> bool:
 
 
 def _pool_max_uses() -> int:
-    """单 browser 最多服务几号；默认 2。达上限先关再冷启。"""
+    """单 browser 最多服务几号；默认 4。达上限先关再冷启。"""
     try:
         n = int(
             (
                 os.getenv("GROK_SAME_SESSION_BROWSER_POOL_MAX_USES")
                 or os.getenv("GROK_SS_POOL_MAX_USES")
-                or "2"
+                or "4"
             ).strip()
-            or "2"
+            or "4"
         )
     except ValueError:
-        n = 2
+        n = 4
     return max(1, min(8, n))
 
 
 def _pool_force_cold_prob() -> float:
-    """强制换新概率（关旧再启）。默认 0.35。"""
+    """强制换新概率（关旧再启）。默认 0.12（降冷启 thrash）。"""
     raw = (
         os.getenv("GROK_SAME_SESSION_BROWSER_POOL_COLD_PROB")
         or os.getenv("GROK_SS_POOL_COLD_PROB")
-        or "0.35"
+        or "0.12"
     ).strip()
     try:
         p = float(raw)
     except ValueError:
-        p = 0.35
+        p = 0.12
     return max(0.0, min(1.0, p))
 
 
@@ -956,27 +956,27 @@ def _env_bool(name: str, default: Optional[bool] = None) -> Optional[bool]:
 def _parse_timing_profile(raw: Optional[str] = None) -> dict[str, Any]:
     """
     时序档位（影响 castle 采样窗口 / 行为节奏）:
-      fast | normal | slow | human | random
-    默认 fast（压空等）；GROK_SAME_SESSION_TIMING 可覆盖。
+      turbo | fast | normal | slow | human | random
+    默认 turbo（压空等）；GROK_SAME_SESSION_TIMING 可覆盖。
     """
-    name = (raw or os.getenv("GROK_SAME_SESSION_TIMING") or "fast").strip().lower()
+    name = (raw or os.getenv("GROK_SAME_SESSION_TIMING") or "turbo").strip().lower()
     if name in ("rand", "random", "rotate"):
         name = random.choice(["fast", "normal", "slow", "human"])
     presets = {
         # 压秒但仍等 CastleProvider：仅 hasReact 就 mint 会 len=0
         "turbo": {
-            "pre_mint_ms": (80, 220),
-            "post_react_ms": (60, 180),
-            "between_mint_ms": (200, 450),
-            "pre_code_ms": (0, 20),
-            "pre_verify_ms": (0, 20),
-            "pre_turnstile_ms": (0, 20),
-            "pre_signup_ms": (0, 40),
-            "mint_attempts": 5,
-            "networkidle_ms": 1500,
-            "react_poll_ms": 150,
-            "react_max_waits": 40,  # ~6s，慢代理/慢水合仍等 fiber
-            "react_fallback_ms": 1200,
+            "pre_mint_ms": (40, 120),
+            "post_react_ms": (0, 80),
+            "between_mint_ms": (120, 280),
+            "pre_code_ms": (0, 10),
+            "pre_verify_ms": (0, 10),
+            "pre_turnstile_ms": (0, 10),
+            "pre_signup_ms": (0, 20),
+            "mint_attempts": 4,
+            "networkidle_ms": 800,
+            "react_poll_ms": 120,
+            "react_max_waits": 35,  # ~4s，慢代理/慢水合仍等 fiber
+            "react_fallback_ms": 800,
             "require_fiber_token": True,
         },
         # 量产默认：等 createRequestToken 再 mint；Turnstile 并行
@@ -1041,13 +1041,13 @@ def _parse_timing_profile(raw: Optional[str] = None) -> dict[str, Any]:
             "require_fiber_token": True,
         },
     }
-    base = presets.get(name, presets["fast"])
+    base = presets.get(name, presets["turbo"])
     # env 可单独压 networkidle（毫秒）；0 = 跳过
     ni_env = (os.getenv("GROK_SAME_SESSION_NETWORKIDLE_MS") or "").strip()
     if ni_env.isdigit():
         base = {**base, "networkidle_ms": max(0, int(ni_env))}
     return {
-        "name": name if name in presets else "fast",
+        "name": name if name in presets else "turbo",
         **base,
     }
 
@@ -1228,9 +1228,10 @@ def same_session_register(
     else:
         fp_os_val = "windows"
 
-    humanize_val = humanize if humanize is not None else _env_bool("GROK_SAME_SESSION_HUMANIZE", True)
+    # humanize 会拖慢 page 行为；量产默认关，需更「真人」再 GROK_SAME_SESSION_HUMANIZE=1
+    humanize_val = humanize if humanize is not None else _env_bool("GROK_SAME_SESSION_HUMANIZE", False)
     if humanize_val is None:
-        humanize_val = True
+        humanize_val = False
     vp = viewport or _rand_viewport()
 
     out: dict[str, Any] = {
