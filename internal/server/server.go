@@ -4902,15 +4902,15 @@ func serveRegistrationProxyTest(w http.ResponseWriter, r *http.Request, options 
 }
 
 var registrationSecretKeys = map[string]struct{}{
-	"api_key":          {},
-	"moemail_api_key":  {},
-	"yyds_api_key":     {},
-	"gptmail_api_key":  {},
-	"cfmail_api_key":     {},
-	"tempmail_api_key":   {},
-	"cloudmail_api_key":  {},
-	"yescaptcha_key":     {},
-	"proxy_password":   {},
+	"api_key":           {},
+	"moemail_api_key":   {},
+	"yyds_api_key":      {},
+	"gptmail_api_key":   {},
+	"cfmail_api_key":    {},
+	"tempmail_api_key":  {},
+	"cloudmail_api_key": {},
+	"yescaptcha_key":    {},
+	"proxy_password":    {},
 }
 
 func loadRegistrationConfig(ctx context.Context, options Options, includeSecrets bool) (map[string]any, string) {

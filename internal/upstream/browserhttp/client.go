@@ -29,9 +29,9 @@ type Client struct {
 	// Proxy optional dynamic resolver (std net/http signature).
 	Proxy func(*http.Request) (*url.URL, error)
 
-	mu     sync.Mutex
-	inner  tls_client.HttpClient
-	curPx  string
+	mu       sync.Mutex
+	inner    tls_client.HttpClient
+	curPx    string
 	initOnce sync.Once
 	initErr  error
 }

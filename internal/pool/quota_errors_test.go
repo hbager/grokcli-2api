@@ -265,7 +265,6 @@ func TestClassifyEdgeBlockNotAuth(t *testing.T) {
 	}
 }
 
-
 func TestClassifyPlain403AuthStillAuth(t *testing.T) {
 	d := ClassifyUpstreamFailure(403, `{"error":"forbidden"}`, "grok-4.5")
 	if d.Class != ClassAuth && d.Class != ClassEgress {

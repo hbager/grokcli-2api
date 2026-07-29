@@ -90,7 +90,6 @@ func (c *Client) transport() doer {
 	return c.browser
 }
 
-
 // Open converts a chat-style body to Responses, POSTs to Console, and bridges
 // SSE back to chat.completion.chunk so proxy/chat can stay unchanged.
 func (c *Client) Open(ctx context.Context, account pool.ConsoleAccount, model string, body map[string]any, fixedEffort ...string) (*http.Response, error) {

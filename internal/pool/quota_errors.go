@@ -14,10 +14,10 @@ import (
 type FailureClass string
 
 const (
-	ClassNone          FailureClass = ""
-	ClassFreeUsage     FailureClass = "subscription:free-usage-exhausted"
-	ClassRateLimit     FailureClass = "rate_limit"
-	ClassAuth          FailureClass = "auth_error"
+	ClassNone      FailureClass = ""
+	ClassFreeUsage FailureClass = "subscription:free-usage-exhausted"
+	ClassRateLimit FailureClass = "rate_limit"
+	ClassAuth      FailureClass = "auth_error"
 	// ClassEgress is Cloudflare/WAF/edge block — not a dead SSO/token.
 	ClassEgress        FailureClass = "egress_blocked"
 	ClassServer        FailureClass = "server_error"
@@ -517,7 +517,6 @@ func isEdgeBlockText(low string) bool {
 		strings.Contains(low, "403 forbidden") ||
 		strings.Contains(low, "http 403")
 }
-
 
 func looksLikeHTMLBlock(text string) bool {
 	low := strings.ToLower(text)

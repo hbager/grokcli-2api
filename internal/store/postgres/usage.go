@@ -1016,7 +1016,6 @@ func clamp(value, min, max, fallback int) int {
 	return value
 }
 
-
 func nullIfEmpty(s string) any {
 	if strings.TrimSpace(s) == "" {
 		return nil
