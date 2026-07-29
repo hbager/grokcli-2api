@@ -68,7 +68,8 @@ _CAMOUFOX_GEN: dict[int, int] = {}
 
 
 def _browser_pool_enabled() -> bool:
-    raw = (os.getenv("GROK_SAME_SESSION_BROWSER_POOL") or "1").strip().lower()
+    # Playwright Sync drivers are thread-affine and cannot be closed safely after workers exit.
+    raw = (os.getenv("GROK_SAME_SESSION_BROWSER_POOL") or "0").strip().lower()
     return raw not in ("0", "false", "off", "no")
 
 
@@ -143,11 +144,11 @@ def _close_pool_entry(ent: Optional[dict[str, Any]], log_fn=None, reason: str = 
         return
     try:
         cm.__exit__(None, None, None)
-    except Exception as e:
+    except BaseException as e:
         if log_fn:
             try:
                 log_fn(f"camoufox 关闭异常 · {_compact_log(e, 60)}")
-            except Exception:
+            except BaseException:
                 pass
     finally:
         # 关键驱动后清 loop，下一号才能安全冷启
@@ -155,7 +156,7 @@ def _close_pool_entry(ent: Optional[dict[str, Any]], log_fn=None, reason: str = 
         if log_fn and reason:
             try:
                 log_fn(f"camoufox 已关闭 · {reason}")
-            except Exception:
+            except BaseException:
                 pass
 
 
@@ -182,13 +183,11 @@ def _drop_thread_pool(log_fn=None, reason: str = "") -> None:
 
 
 def shutdown_camoufox_pool() -> None:
-    """进程退出 / 批末释放所有线程池内的 Camoufox。"""
+    """释放调用线程创建的 Camoufox；Playwright Sync 禁止跨线程关闭。"""
+    tid = threading.get_ident()
+    _drop_thread_pool(reason="shutdown")
     with _CAMOUFOX_POOL_LOCK:
-        items = [e for e in _CAMOUFOX_POOLS.values() if e]
-        _CAMOUFOX_POOLS.clear()
-        _CAMOUFOX_GEN.clear()
-    for ent in items:
-        _close_pool_entry(ent, reason="")
+        _CAMOUFOX_GEN.pop(tid, None)
 
 
 def _next_gen(tid: int) -> int:
@@ -270,10 +269,15 @@ def _acquire_camoufox_pooled(
                     f"{fp_os_val}/{locale} · #{uses_now}/{max_uses} · {launch_s}s"
                 )
                 return None, ctx, page, True, launch_s
-        except Exception as e:
-            log_fn(f"camoufox 池失效 · {_compact_log(e, 80)}")
-            _drop_thread_pool(log_fn, reason="复用失败")
+        except BaseException as e:
+            try:
+                _drop_thread_pool(log_fn, reason="复用失败")
+            except BaseException:
+                pass
             ent = None
+            if not isinstance(e, Exception):
+                raise
+            log_fn(f"camoufox 池失效 · {_compact_log(e, 80)}")
 
     # —— 冷启：先确保本线程没有残留 Sync 驱动 ——
     if _get_thread_ent() is not None:
@@ -321,20 +325,21 @@ def _acquire_camoufox_pooled(
         except BaseException as e:
             last_err = e
             msg = str(e)
+            try:
+                if camoufox_cm is not None:
+                    camoufox_cm.__exit__(None, None, None)
+            except BaseException:
+                pass
+            finally:
+                camoufox_cm = None
+                camoufox_browser = None
+                _clear_thread_event_loop()
             # 典型：旧 loop 没清干净 / 同线程双开
             if "asyncio loop" in msg or "Async API" in msg:
                 log_fn(
                     f"camoufox Sync/loop 冲突 try#{attempt} · 清 loop 重试 · "
                     f"{_compact_log(e, 80)}"
                 )
-                try:
-                    if camoufox_cm is not None:
-                        camoufox_cm.__exit__(None, None, None)
-                except Exception:
-                    pass
-                camoufox_cm = None
-                camoufox_browser = None
-                _clear_thread_event_loop()
                 time.sleep(0.15 * attempt)
                 continue
             raise
@@ -343,38 +348,57 @@ def _acquire_camoufox_pooled(
         raise last_err or RuntimeError("camoufox 启动失败")
 
     is_browser = hasattr(camoufox_browser, "new_context")
-    if is_browser:
-        ctx = camoufox_browser.new_context(
-            viewport={"width": int(vp["width"]), "height": int(vp["height"])},
-            locale=locale,
-            timezone_id=timezone_id,
-        )
-        page = ctx.new_page()
-    else:
-        ctx = camoufox_browser
-        page = ctx.new_page()
-    launch_s = round(time.time() - t_launch, 2)
-    log_fn(f"camoufox 就绪 · tid={tid} · gen={gen} · {launch_s}s")
+    ctx = None
+    try:
+        if is_browser:
+            ctx = camoufox_browser.new_context(
+                viewport={"width": int(vp["width"]), "height": int(vp["height"])},
+                locale=locale,
+                timezone_id=timezone_id,
+            )
+            page = ctx.new_page()
+        else:
+            ctx = camoufox_browser
+            page = ctx.new_page()
+        launch_s = round(time.time() - t_launch, 2)
+        log_fn(f"camoufox 就绪 · tid={tid} · gen={gen} · {launch_s}s")
 
-    if pool_on and is_browser:
-        _set_thread_ent(
-            {
-                "cm": camoufox_cm,
-                "browser": camoufox_browser,
-                "is_browser": True,
-                "uses": 1,
-                "owner_tid": tid,
-                "fp_os": fp_os_val,
-                "locale": loc_main,
-                "proxy": proxy_s,
-                "gen": gen,
-                "born": time.time(),
-            }
-        )
-        # 池接管生命周期；本号只关 ctx
-        return None, ctx, page, True, launch_s
+        if pool_on and is_browser:
+            _set_thread_ent(
+                {
+                    "cm": camoufox_cm,
+                    "browser": camoufox_browser,
+                    "is_browser": True,
+                    "uses": 1,
+                    "owner_tid": tid,
+                    "fp_os": fp_os_val,
+                    "locale": loc_main,
+                    "proxy": proxy_s,
+                    "gen": gen,
+                    "born": time.time(),
+                }
+            )
+            # 池接管生命周期；本号只关 ctx
+            return None, ctx, page, True, launch_s
 
-    return camoufox_cm, ctx, page, False, launch_s
+        return camoufox_cm, ctx, page, False, launch_s
+    except BaseException:
+        try:
+            if ctx is not None:
+                ctx.close()
+        except BaseException:
+            pass
+        try:
+            ent_now = _get_thread_ent()
+            if ent_now is not None and ent_now.get("cm") is camoufox_cm:
+                _drop_thread_pool(log_fn, reason="交接失败")
+            else:
+                camoufox_cm.__exit__(None, None, None)
+        except BaseException:
+            pass
+        finally:
+            _clear_thread_event_loop()
+        raise
 
 
 def _compact_log(msg: Any, max_len: int = 160) -> str:
@@ -1312,6 +1336,33 @@ def same_session_register(
     camoufox_cm = None
     camoufox_browser = None
     from_pool = False
+
+    def _cleanup_browser(reason: str) -> None:
+        nonlocal ctx, camoufox_cm, from_pool
+        try:
+            if ctx is not None:
+                ctx.close()
+        except BaseException:
+            pass
+        finally:
+            ctx = None
+        try:
+            if from_pool:
+                _drop_thread_pool(_log, reason=reason)
+            elif camoufox_cm is not None:
+                camoufox_cm.__exit__(None, None, None)
+        except BaseException:
+            pass
+        finally:
+            camoufox_cm = None
+            from_pool = False
+        pw = out.pop("_pw", None)
+        if pw is not None:
+            try:
+                pw.stop()
+            except BaseException:
+                pass
+
     try:
         # ---------- 启动浏览器：Camoufox 真无头 or Chrome ----------
         if browser_engine == "camoufox":
@@ -2146,44 +2197,12 @@ def same_session_register(
             out["page_url"] = page_url
             _log(f"SSO 到手 · {len(sso)}")
         finally:
-            # 关 context；池化时不关 camoufox 进程
-            try:
-                if ctx is not None:
-                    ctx.close()
-            except Exception:
-                pass
-            if camoufox_cm is not None and not from_pool:
-                try:
-                    camoufox_cm.__exit__(None, None, None)
-                except Exception:
-                    pass
-            pw = out.pop("_pw", None)
-            if pw is not None:
-                try:
-                    pw.stop()
-                except Exception:
-                    pass
+            _cleanup_browser("注册结束")
     except Exception as e:
         out["error"] = f"same_session 异常: {e}"
         out["steps"].append(f"exc:{e}")
-        # 异常路径也尽量收尾浏览器资源
-        try:
-            if ctx is not None:
-                ctx.close()
-        except Exception:
-            pass
-        if camoufox_cm is not None and not from_pool:
-            try:
-                camoufox_cm.__exit__(None, None, None)
-            except Exception:
-                pass
-        pw = out.pop("_pw", None)
-        if pw is not None:
-            try:
-                pw.stop()
-            except Exception:
-                pass
     finally:
+        _cleanup_browser("注册收尾")
         out["elapsed_s"] = round(time.time() - t0, 2)
         # 恢复业务代理环境（多账号循环下一号还要读 GROK_PROXY）
         for k, v in (_saved_biz or {}).items():
