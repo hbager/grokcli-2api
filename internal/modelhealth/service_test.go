@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
+	"github.com/hm2899/grokcli-2api/internal/upstream/console"
 )
 
 func TestSetProxyConfiguresProbeTransport(t *testing.T) {
@@ -30,6 +31,50 @@ func TestSetProxyConfiguresProbeTransport(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("proxy calls=%d", calls.Load())
+	}
+}
+
+func TestConsoleClientReuseAndInjection(t *testing.T) {
+	service := New(nil, nil, "http://example.invalid", []string{"grok-4.5"})
+	fallback := service.probeConsole()
+	if fallback == nil || fallback != service.probeConsole() {
+		t.Fatal("lazy Console fallback was not reused")
+	}
+	if fallback.HTTP != service.probeHTTP() {
+		t.Fatal("lazy Console fallback does not use the shared probe HTTP client")
+	}
+
+	service.SetProxy(nil)
+	replacement := service.probeConsole()
+	if replacement == fallback || replacement.HTTP != service.probeHTTP() {
+		t.Fatal("SetProxy did not safely replace the lazy Console fallback")
+	}
+
+	injected := &console.Client{}
+	service.SetConsoleClient(injected)
+	service.SetProxy(nil)
+	if got := service.probeConsole(); got != injected {
+		t.Fatalf("Console client = %p, want injected %p", got, injected)
+	}
+}
+
+func TestShouldAutoDisableSSO(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		errText string
+		want    bool
+	}{
+		{name: "DPoP rejection", status: http.StatusForbidden, errText: `{"code":"unauthorized:dpop-required"}`},
+		{name: "invalid session", status: http.StatusUnauthorized, errText: "Failed to look up session ID", want: true},
+		{name: "generic forbidden", status: http.StatusForbidden, errText: "Forbidden", want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldAutoDisableSSO(test.status, test.errText); got != test.want {
+				t.Fatalf("shouldAutoDisableSSO(%d, %q) = %t, want %t", test.status, test.errText, got, test.want)
+			}
+		})
 	}
 }
 

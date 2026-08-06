@@ -18,6 +18,8 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/protocol/anthropic"
 	"github.com/hm2899/grokcli-2api/internal/proxy"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
+	"github.com/hm2899/grokcli-2api/internal/upstream/console"
+	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 )
 
 func TestRegistrationConfigLocalCacheExcludesSecrets(t *testing.T) {
@@ -156,6 +158,34 @@ func TestNewChatServiceUsesRuntimeFailoverLimit(t *testing.T) {
 	service := newChatService(Options{RuntimeConfig: runtime})
 	if service.MaxFailoverAttempts != 2 {
 		t.Fatalf("MaxFailoverAttempts=%d want 2", service.MaxFailoverAttempts)
+	}
+}
+
+func TestNewChatServiceSharesConsoleClientFromMuxOptions(t *testing.T) {
+	upstream := &grok.Client{HTTP: &http.Client{}}
+	options := withConsoleClient(Options{Upstream: upstream})
+
+	first := newChatService(options)
+	second := newChatService(options)
+	if first.Console == nil || first.Console != second.Console {
+		t.Fatalf("Console clients differ: first=%p second=%p", first.Console, second.Console)
+	}
+	if first.Console.HTTP != upstream.HTTP {
+		t.Fatal("fallback Console client did not preserve the shared upstream HTTP client")
+	}
+}
+
+func TestNewChatServicePrefersExplicitConsoleClient(t *testing.T) {
+	explicit := &console.Client{}
+	options := withConsoleClient(Options{
+		Upstream: &grok.Client{HTTP: &http.Client{}},
+		Console:  explicit,
+	})
+
+	first := newChatService(options)
+	second := newChatService(options)
+	if first.Console != explicit || second.Console != explicit {
+		t.Fatalf("explicit Console client not retained: first=%p second=%p want=%p", first.Console, second.Console, explicit)
 	}
 }
 

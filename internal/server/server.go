@@ -68,7 +68,9 @@ type Options struct {
 	AffinityStore proxy.AffinityStore
 	// Upstream is a shared Grok HTTP client (connection pool). Prefer this over
 	// constructing a new client on every request.
-	Upstream    *grok.Client
+	Upstream *grok.Client
+	// Console owns the shared Console transport and DPoP session cache.
+	Console     *console.Client
 	Redis       *redis.Client
 	Leader      *redis.Leader
 	Maintainer  *maintainer.Service
@@ -182,6 +184,7 @@ func NewMigrationMux(ready func() bool) http.Handler {
 }
 
 func NewMux(options Options) http.Handler {
+	options = withConsoleClient(options)
 	mux := http.NewServeMux()
 	staticDir := options.StaticDir
 	if strings.TrimSpace(staticDir) == "" {
@@ -1416,7 +1419,7 @@ func reportChatPool(r *http.Request, options Options, accountID string, ok bool,
 		if surface == provider.AuthSSO {
 			if options.Store != nil {
 				_ = options.Store.ReportSSORuntime(ctx, accountID, false, errText)
-				if status == http.StatusUnauthorized || status == http.StatusForbidden {
+				if shouldDisableSSOSurface(status, errText) {
 					_, _ = options.Store.SetAccountSurfaceEnabled(ctx, accountID, "sso", false)
 				}
 			}
@@ -1484,6 +1487,13 @@ func reportChatPool(r *http.Request, options Options, accountID string, ok bool,
 	}()
 }
 
+func shouldDisableSSOSurface(status int, errText string) bool {
+	if status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return false
+	}
+	return !console.IsDPoPProtocolRejection(errText)
+}
+
 // chatFailureCooldown is kept as a thin wrapper around pool.ClassifyUpstreamFailure
 // for unit tests and call sites that still use the old signature.
 func chatFailureCooldown(status int, errText string, requestedModel ...string) (until *time.Time, code, model string, tokensActual, tokensLimit *int64) {
@@ -1511,12 +1521,9 @@ func (r chatPoolFailureReporter) ReportAccountFailure(accountID, model, surface 
 
 func newChatService(options Options) proxy.ChatService {
 	up := upstreamClient(options)
-	consoleClient := &console.Client{}
-	if up != nil && up.HTTP != nil {
-		if tr, ok := up.HTTP.Transport.(*http.Transport); ok && tr.Proxy != nil {
-			consoleClient.Proxy = tr.Proxy
-		}
-		consoleClient.HTTP = up.HTTP
+	consoleClient := options.Console
+	if consoleClient == nil {
+		consoleClient = consoleClientFromUpstream(up)
 	}
 	return proxy.ChatService{
 		Catalog:               modelCatalog(options),
@@ -1530,6 +1537,24 @@ func newChatService(options Options) proxy.ChatService {
 		FirstByteProbeWorkers: options.runtimeConfig().FirstByteProbeWorkers,
 		MaxFailoverAttempts:   options.runtimeConfig().MaxFailoverAttempts,
 	}
+}
+
+func withConsoleClient(options Options) Options {
+	if options.Console == nil {
+		options.Console = consoleClientFromUpstream(upstreamClient(options))
+	}
+	return options
+}
+
+func consoleClientFromUpstream(up *grok.Client) *console.Client {
+	consoleClient := &console.Client{}
+	if up != nil && up.HTTP != nil {
+		if tr, ok := up.HTTP.Transport.(*http.Transport); ok && tr.Proxy != nil {
+			consoleClient.Proxy = tr.Proxy
+		}
+		consoleClient.HTTP = up.HTTP
+	}
+	return consoleClient
 }
 
 func extractGrokModelFromError(errText string) string {

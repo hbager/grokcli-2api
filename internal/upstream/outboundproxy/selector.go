@@ -16,6 +16,12 @@ import (
 
 type accountIDKey struct{}
 
+type pinnedProxyKey struct{}
+
+type pinnedProxy struct {
+	url *url.URL
+}
+
 func WithAccountID(ctx context.Context, accountID string) context.Context {
 	if strings.TrimSpace(accountID) == "" {
 		return ctx
@@ -29,6 +35,40 @@ func accountID(ctx context.Context) string {
 	}
 	value, _ := ctx.Value(accountIDKey{}).(string)
 	return strings.TrimSpace(value)
+}
+
+// WithPinnedProxy binds one proxy selection to ctx. A nil proxy is an
+// explicit direct connection, distinct from the absence of a binding.
+func WithPinnedProxy(ctx context.Context, proxyURL *url.URL) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, pinnedProxyKey{}, pinnedProxy{url: cloneURL(proxyURL)})
+}
+
+// PinnedProxy returns the proxy bound by WithPinnedProxy. The bool reports
+// whether a binding exists, including an explicit direct (nil) binding.
+func PinnedProxy(ctx context.Context) (*url.URL, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	binding, ok := ctx.Value(pinnedProxyKey{}).(pinnedProxy)
+	if !ok {
+		return nil, false
+	}
+	return cloneURL(binding.url), true
+}
+
+func cloneURL(value *url.URL) *url.URL {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	if value.User != nil {
+		user := *value.User
+		clone.User = &user
+	}
+	return &clone
 }
 
 type Selector struct {
@@ -46,6 +86,9 @@ func New(load func() config.Config) *Selector {
 func (s *Selector) Proxy(request *http.Request) (*url.URL, error) {
 	if s == nil || request == nil {
 		return nil, nil
+	}
+	if proxyURL, ok := PinnedProxy(request.Context()); ok {
+		return proxyURL, nil
 	}
 	cfg := s.load()
 	if !cfg.OutboundProxyConfigured {

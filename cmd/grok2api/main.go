@@ -23,6 +23,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/server"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/store/redis"
+	"github.com/hm2899/grokcli-2api/internal/upstream/console"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 	"github.com/hm2899/grokcli-2api/internal/upstream/oidc"
 	"github.com/hm2899/grokcli-2api/internal/upstream/outboundproxy"
@@ -116,6 +117,7 @@ func main() {
 	}
 	proxySelector := outboundproxy.New(runtimeCfg.Load)
 	chatClient := &grok.Client{BaseURL: cfg.UpstreamBase, HTTP: grok.NewHTTPClient(proxySelector.Proxy)}
+	consoleClient := &console.Client{HTTP: chatClient.HTTP, Proxy: proxySelector.Proxy}
 	quotaSvc := quota.New(store, cfg.UpstreamBase)
 	quotaSvc.SetProxy(proxySelector.Proxy)
 
@@ -126,6 +128,7 @@ func main() {
 		maintSvc = maintainer.New(store, redisClient, oidcClient)
 		healthSvc = modelhealth.New(store, redisClient, cfg.UpstreamBase, []string{runtimeCfg.Load().DefaultModel})
 		healthSvc.SetProxy(proxySelector.Proxy)
+		healthSvc.SetConsoleClient(consoleClient)
 		if bootSettings != nil {
 			var intervalSec float64
 			switch v := bootSettings["model_health_interval_sec"].(type) {
@@ -204,6 +207,7 @@ func main() {
 		PickObserver:      redis.NewPickObserver(redisClient),
 		AffinityStore:     redis.NewChatAffinity(redisClient, 24*time.Hour),
 		Upstream:          chatClient,
+		Console:           consoleClient,
 		Redis:             redisClient,
 		Leader:            leader,
 		Maintainer:        maintSvc,

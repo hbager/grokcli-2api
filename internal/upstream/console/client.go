@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/accounts"
@@ -37,7 +38,10 @@ type Client struct {
 	DisableBrowserTLS bool
 	UA                string
 
-	browser *browserhttp.Client
+	transportMu sync.Mutex
+	browser     *browserhttp.Client
+	plain       *http.Client
+	dpop        dpopSessionManager
 }
 
 func (c *Client) base() string {
@@ -56,38 +60,124 @@ func (c *Client) endpoint() string {
 	return b + "/v1/responses"
 }
 
+func (c *Client) dpopTokenEndpoint() string {
+	b := c.base()
+	if strings.HasSuffix(b, "/v1") {
+		return b + "/dpop/token"
+	}
+	return b + "/v1/dpop/token"
+}
+
 // doer is the minimal interface used by Open (stdlib or browser TLS).
 type doer interface {
 	Do(req *http.Request) (*http.Response, error)
+}
+
+func (c *Client) proxyResolver() func(*http.Request) (*url.URL, error) {
+	if c == nil {
+		return nil
+	}
+	if c.Proxy != nil {
+		return c.Proxy
+	}
+	if c.HTTP != nil {
+		if tr, ok := c.HTTP.Transport.(*http.Transport); ok {
+			return tr.Proxy
+		}
+	}
+	return nil
 }
 
 func (c *Client) transport() doer {
 	if c == nil {
 		return grok.NewHTTPClient(nil)
 	}
-	// Unit tests: httptest injects HTTP + DisableBrowserTLS.
+	proxyFn := c.proxyResolver()
+	// Unit tests: httptest injects HTTP + DisableBrowserTLS. A cloned client is
+	// needed when its transport has a proxy so an explicit direct binding also
+	// bypasses that proxy instead of falling back to the original resolver.
 	if c.DisableBrowserTLS {
-		if c.HTTP != nil {
+		if c.HTTP != nil && proxyFn == nil {
 			return c.HTTP
 		}
-		return grok.NewHTTPClient(c.Proxy)
-	}
-	// Production: Chrome TLS/HTTP2 fingerprint (plain Go net/http is CF-blocked).
-	if c.browser == nil {
-		proxyFn := c.Proxy
-		if proxyFn == nil && c.HTTP != nil {
-			if tr, ok := c.HTTP.Transport.(*http.Transport); ok && tr.Proxy != nil {
-				proxyFn = tr.Proxy
+		c.transportMu.Lock()
+		defer c.transportMu.Unlock()
+		if c.plain == nil {
+			if c.HTTP != nil {
+				clone := *c.HTTP
+				if tr, ok := c.HTTP.Transport.(*http.Transport); ok {
+					transport := tr.Clone()
+					transport.Proxy = pinnedProxyResolver(proxyFn)
+					clone.Transport = transport
+				}
+				c.plain = &clone
+			} else {
+				c.plain = grok.NewHTTPClient(pinnedProxyResolver(proxyFn))
 			}
 		}
+		return c.plain
+	}
+	c.transportMu.Lock()
+	defer c.transportMu.Unlock()
+	// Production: Chrome TLS/HTTP2 fingerprint (plain Go net/http is CF-blocked).
+	if c.browser == nil {
 		c.browser = &browserhttp.Client{
-			Profile:  "chrome_131",
-			Timeout:  120 * time.Second,
-			ProxyURL: c.ProxyURL,
-			Proxy:    proxyFn,
+			Profile: "chrome_131",
+			Timeout: 120 * time.Second,
+			Proxy:   pinnedProxyResolver(proxyFn),
 		}
 	}
 	return c.browser
+}
+
+func pinnedProxyResolver(fallback func(*http.Request) (*url.URL, error)) func(*http.Request) (*url.URL, error) {
+	return func(req *http.Request) (*url.URL, error) {
+		if req != nil {
+			if proxyURL, ok := outboundproxy.PinnedProxy(req.Context()); ok {
+				return proxyURL, nil
+			}
+		}
+		if fallback == nil {
+			return nil, nil
+		}
+		return fallback(req)
+	}
+}
+
+func (c *Client) pinEgress(ctx context.Context) (context.Context, string, error) {
+	probe, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base(), nil)
+	if err != nil {
+		return nil, "", err
+	}
+	var proxyURL *url.URL
+	if resolver := c.proxyResolver(); resolver != nil {
+		proxyURL, err = resolver(probe)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	if proxyURL == nil {
+		if raw := strings.TrimSpace(c.ProxyURL); raw != "" {
+			proxyURL, err = url.Parse(raw)
+			if err != nil {
+				return nil, "", fmt.Errorf("parse Console proxy URL: %w", err)
+			}
+		}
+	}
+	identity := "direct"
+	if proxyURL != nil {
+		identity = canonicalProxyIdentity(proxyURL)
+	}
+	return outboundproxy.WithPinnedProxy(ctx, proxyURL), identity, nil
+}
+
+func canonicalProxyIdentity(proxyURL *url.URL) string {
+	clone := *proxyURL
+	clone.Scheme = strings.ToLower(clone.Scheme)
+	clone.Host = strings.ToLower(clone.Host)
+	clone.Fragment = ""
+	clone.RawFragment = ""
+	return clone.String()
 }
 
 // Open converts a chat-style body to Responses, POSTs to Console, and bridges
@@ -97,6 +187,10 @@ func (c *Client) Open(ctx context.Context, account pool.ConsoleAccount, model st
 		return nil, &grok.UpstreamError{Status: 401, Body: "console requires SSO cookie"}
 	}
 	ctx = outboundproxy.WithAccountID(ctx, account.ID)
+	ctx, egressIdentity, err := c.pinEgress(ctx)
+	if err != nil {
+		return nil, err
+	}
 	effort := ""
 	if len(fixedEffort) > 0 {
 		effort = strings.TrimSpace(fixedEffort[0])
@@ -106,23 +200,44 @@ func (c *Client) Open(ctx context.Context, account pool.ConsoleAccount, model st
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), bytes.NewReader(encoded))
-	if err != nil {
-		return nil, err
-	}
-	for k, v := range c.headers(account.SSO, account.Cookies) {
-		req.Header.Set(k, v)
-	}
 	stream := true
 	if v, ok := payload["stream"].(bool); ok {
 		stream = v
 	}
-	if stream {
-		req.Header.Set("Accept", "text/event-stream")
-	}
-	resp, err := c.transport().Do(req)
-	if err != nil {
-		return nil, err
+	transport := c.transport()
+	cacheKey := c.dpopCacheKey(account, egressIdentity)
+	var resp *http.Response
+	for attempt := 0; attempt < 2; attempt++ {
+		session, sessionErr := c.dpop.get(ctx, cacheKey, func(loadCtx context.Context) (dpopSession, error) {
+			return c.mintDPoPSession(loadCtx, transport, account)
+		})
+		if sessionErr != nil {
+			return nil, sessionErr
+		}
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), bytes.NewReader(encoded))
+		if requestErr != nil {
+			return nil, requestErr
+		}
+		for k, v := range c.headers(account.SSO, account.Cookies) {
+			req.Header.Set(k, v)
+		}
+		req.Header.Set("x-cluster", "https://us-east-1.api.x.ai")
+		if stream {
+			req.Header.Set("Accept", "text/event-stream")
+		}
+		if requestErr = applyDPoPAuthorization(req, session); requestErr != nil {
+			return nil, requestErr
+		}
+		resp, requestErr = transport.Do(req)
+		if requestErr != nil {
+			return nil, requestErr
+		}
+		if resp.StatusCode != http.StatusUnauthorized || attempt == 1 {
+			break
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+		c.dpop.invalidate(cacheKey, session.accessToken)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
@@ -151,7 +266,6 @@ func (c *Client) headers(sso string, cfCookies map[string]string) map[string]str
 	return map[string]string{
 		"Accept":             "*/*",
 		"Accept-Language":    "en-US,en;q=0.9",
-		"Authorization":      "Bearer anonymous",
 		"Content-Type":       "application/json",
 		"Cookie":             accounts.BuildSSOCookieHeader(sso, cfCookies),
 		"Origin":             "https://console.x.ai",
@@ -163,7 +277,6 @@ func (c *Client) headers(sso string, cfCookies map[string]string) map[string]str
 		"Sec-Fetch-Mode":     "cors",
 		"Sec-Fetch-Site":     "same-origin",
 		"User-Agent":         ua,
-		"x-cluster":          "https://us-east-1.api.x.ai",
 	}
 }
 

@@ -45,6 +45,7 @@ const (
 type Service struct {
 	Store               *postgres.Connector
 	Redis               *redis.Client
+	Console             *console.Client
 	Upstream            string
 	Models              []string
 	Interval            time.Duration
@@ -65,8 +66,9 @@ type Service struct {
 	last    map[string]any
 	modelRR int
 
-	httpMu     sync.RWMutex
-	httpClient *http.Client
+	httpMu          sync.RWMutex
+	httpClient      *http.Client
+	consoleFallback bool
 
 	// Async manual_all job (admin "全部模型探测").
 	jobMu      sync.Mutex
@@ -230,6 +232,40 @@ func (s *Service) probeHTTP() *http.Client {
 	return s.httpClient
 }
 
+// SetConsoleClient installs the Console client shared with request handling.
+// Callers must use this setter instead of replacing Console while probes run.
+func (s *Service) SetConsoleClient(client *console.Client) {
+	if s == nil {
+		return
+	}
+	s.httpMu.Lock()
+	s.Console = client
+	s.consoleFallback = false
+	s.httpMu.Unlock()
+}
+
+func (s *Service) probeConsole() *console.Client {
+	if s == nil {
+		return &console.Client{HTTP: newProbeHTTPClient(nil)}
+	}
+	s.httpMu.RLock()
+	client := s.Console
+	s.httpMu.RUnlock()
+	if client != nil {
+		return client
+	}
+	s.httpMu.Lock()
+	defer s.httpMu.Unlock()
+	if s.Console == nil {
+		if s.httpClient == nil {
+			s.httpClient = newProbeHTTPClient(nil)
+		}
+		s.Console = &console.Client{HTTP: s.httpClient}
+		s.consoleFallback = true
+	}
+	return s.Console
+}
+
 // SetProxy atomically swaps the shared probe client used by future probes.
 func (s *Service) SetProxy(proxy func(*http.Request) (*url.URL, error)) {
 	if s == nil {
@@ -239,6 +275,9 @@ func (s *Service) SetProxy(proxy func(*http.Request) (*url.URL, error)) {
 	s.httpMu.Lock()
 	previous := s.httpClient
 	s.httpClient = next
+	if s.consoleFallback {
+		s.Console = &console.Client{HTTP: next}
+	}
 	s.httpMu.Unlock()
 	if previous != nil {
 		previous.CloseIdleConnections()
@@ -1248,7 +1287,7 @@ func (s *Service) probeAccountSurface(ctx context.Context, auth postgres.Account
 		if strings.TrimSpace(auth.SSO) == "" {
 			err = errors.New("account has no SSO")
 		} else {
-			client := &console.Client{HTTP: s.probeHTTP()}
+			client := s.probeConsole()
 			resp, err = client.Open(ctx, pool.ConsoleAccount{ID: auth.ID, SSO: auth.SSO, Cookies: auth.Cookies}, "grok-4.3", body)
 		}
 	} else {
@@ -1288,7 +1327,7 @@ func (s *Service) probeAccountSurface(ctx context.Context, auth postgres.Account
 		if autoDisable && s.Store != nil && !skipMutate {
 			if surface == "sso" {
 				// SSO health only controls SSO. Never write OAuth quota/cooldown/model blocks.
-				if status == 401 || status == 403 {
+				if shouldAutoDisableSSO(status, errText) {
 					if _, e := s.Store.SetAccountSurfaceEnabled(ctx, auth.ID, "sso", false); e == nil {
 						base["auto_disabled"] = true
 						base["disabled_surface"] = "sso"
@@ -1855,6 +1894,11 @@ func (s *Service) writeTaskLog(ctx context.Context, source string, result map[st
 
 func itoa(n int) string {
 	return strconv.Itoa(n)
+}
+
+func shouldAutoDisableSSO(status int, errText string) bool {
+	return (status == http.StatusUnauthorized || status == http.StatusForbidden) &&
+		!console.IsDPoPProtocolRejection(errText)
 }
 
 func isFreeUsageExhausted(errText string) bool {

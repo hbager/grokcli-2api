@@ -1,7 +1,9 @@
 package outboundproxy
 
 import (
+	"context"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/hm2899/grokcli-2api/internal/config"
@@ -47,6 +49,33 @@ func TestSelectorSupportsLegacyProxyFormats(t *testing.T) {
 	password, _ := proxyURL.User.Password()
 	if proxyURL.String() != "http://user:pass@proxy.example:8080" || password != "pass" {
 		t.Fatalf("proxy=%v", proxyURL)
+	}
+}
+
+func TestSelectorHonorsPinnedProxyIncludingDirect(t *testing.T) {
+	current := config.Config{
+		OutboundProxyConfigured: true,
+		OutboundProxyEnabled:    true,
+		OutboundProxy:           "http://proxy-a.example:8080\nhttp://proxy-b.example:8080",
+		OutboundProxyStrategy:   "random",
+	}
+	selector := New(func() config.Config { return current })
+	request := httptest.NewRequest("GET", "https://upstream.example/v1", nil)
+	pinned, err := url.Parse("http://user:secret@pinned.example:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request = request.WithContext(WithPinnedProxy(request.Context(), pinned))
+	for range 100 {
+		selected, err := selector.Proxy(request)
+		if err != nil || selected == nil || selected.String() != pinned.String() {
+			t.Fatalf("pinned proxy=%v err=%v", selected, err)
+		}
+	}
+	direct := request.WithContext(WithPinnedProxy(context.Background(), nil))
+	selected, err := selector.Proxy(direct)
+	if err != nil || selected != nil {
+		t.Fatalf("direct binding proxy=%v err=%v", selected, err)
 	}
 }
 
